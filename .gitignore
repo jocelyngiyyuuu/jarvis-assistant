@@ -3,3 +3,7 @@ __pycache__/
 .env
 venv/
 .venv/
+
+mcp_errors.log
+*_backup*.py
+test_*.py

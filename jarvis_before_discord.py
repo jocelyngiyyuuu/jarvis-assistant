@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
 
 import asyncio
-import json
-import os
 import re
 import subprocess
 from pathlib import Path
 from urllib.parse import quote_plus
 
-import discord
-from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
-VERSION = "1.0.7-video-display-fix"
-
-load_dotenv()
-
-discord_client = None
-discord_command_lock = asyncio.Lock()
-last_command_response = None
+VERSION = "0.9.8"
 
 PERSONAL_PROFILE = "Default"
 STUDY_PROFILE = "Profile 1"
@@ -43,7 +33,6 @@ youtube_page_id = None
 mcp_stdio_context = None
 mcp_session_context = None
 mcp_session = None
-mcp_errlog = None
 
 
 # ==========================================================
@@ -192,99 +181,87 @@ def find_video_by_title(videos, query):
 # LẤY DANH SÁCH VIDEO
 # ==========================================================
 
-def _json_from_mcp_result(result, default=None):
-    """Đọc JSON được trả về từ evaluate_script của Chrome DevTools MCP."""
-    text = result_to_text(result).strip()
-
-    if not text:
-        return default
-
-    candidates = [text]
-
-    fenced = re.search(
-        r"```(?:json)?\s*(.*?)```",
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if fenced:
-        candidates.insert(0, fenced.group(1).strip())
-
-    for left, right in (("[", "]"), ("{", "}")):
-        first = text.find(left)
-        last = text.rfind(right)
-        if first != -1 and last > first:
-            candidates.append(text[first:last + 1])
-
-    for candidate in candidates:
-        try:
-            return json.loads(candidate)
-        except (json.JSONDecodeError, TypeError):
-            continue
-
-    return default
-
-
-async def extract_videos_from_page(session, limit=10):
-    """Chỉ lấy link video thật (/watch?v=...), bỏ sidebar/kênh/menu."""
-    script = r'''() => {
-        const videos = new Map();
-        const anchors = document.querySelectorAll('a[href*="/watch?v="]');
-
-        for (const a of anchors) {
-            try {
-                const u = new URL(a.href, location.href);
-                const videoId = u.searchParams.get('v');
-                if (!videoId) continue;
-
-                const url = `https://www.youtube.com/watch?v=${videoId}`;
-                const title = (
-                    a.getAttribute('title') ||
-                    a.textContent ||
-                    a.getAttribute('aria-label') ||
-                    ''
-                ).replace(/\s+/g, ' ').trim();
-
-                if (!title || title.length < 2) continue;
-
-                const current = videos.get(url);
-                if (!current || title.length > current.title.length) {
-                    videos.set(url, {title, url});
-                }
-            } catch (_) {
-            }
-        }
-
-        return Array.from(videos.values());
-    }'''
-
-    result = await session.call_tool(
-        "evaluate_script",
-        arguments={"function": script},
-    )
-
-    raw_videos = _json_from_mcp_result(result, default=[])
-    if not isinstance(raw_videos, list):
-        return []
-
+def extract_videos(snapshot_text, limit=10):
     videos = []
     seen = set()
 
-    for item in raw_videos:
-        if not isinstance(item, dict):
+    pattern = re.compile(
+        r'uid=([^\s]+)\s+link\s+"([^"]+)"',
+        re.IGNORECASE,
+    )
+
+    ignored_exact = {
+        "youtube",
+        "home",
+        "trang chủ",
+        "shorts",
+        "subscriptions",
+        "kênh đăng ký",
+        "library",
+        "thư viện",
+        "history",
+        "video đã xem",
+        "sign in",
+        "đăng nhập",
+        "explore",
+        "khám phá",
+    }
+
+    for match in pattern.finditer(snapshot_text):
+
+        uid = match.group(1)
+
+        title = clean_title(
+            match.group(2)
+        )
+
+        if not title:
             continue
 
-        title = clean_title(str(item.get("title", "")))
-        url = str(item.get("url", "")).strip()
+        title_lower = title.lower()
 
-        if not title or not url or "/watch?v=" not in url:
+        # Menu chính
+        if title_lower in ignored_exact:
             continue
 
-        key = url.lower()
-        if key in seen:
+        # Trang chủ YouTube Premium
+        if title_lower.startswith(
+            "trang chủ youtube"
+        ):
             continue
 
-        seen.add(key)
-        videos.append({"title": title, "url": url})
+        if title_lower.startswith(
+            "youtube premium"
+        ):
+            continue
+
+        # Menu phụ
+        if title_lower.startswith(
+            "show more"
+        ):
+            continue
+
+        if title_lower.startswith(
+            "hiển thị thêm"
+        ):
+            continue
+
+        # Title quá ngắn
+        if len(title) < 5:
+            continue
+
+        # Trùng tên
+        if title_lower in seen:
+            continue
+
+        seen.add(title_lower)
+
+        videos.append(
+            {
+                "uid": uid,
+                "title": title,
+            }
+        )
 
         if len(videos) >= limit:
             break
@@ -313,7 +290,6 @@ async def get_mcp_session():
     global mcp_stdio_context
     global mcp_session_context
     global mcp_session
-    global mcp_errlog
 
     if mcp_session is not None:
         return mcp_session
@@ -324,20 +300,7 @@ async def get_mcp_session():
     server = create_mcp_server()
 
     try:
-        # chrome-devtools-mcp đôi khi ghi cảnh báo lặp lại vào stderr
-        # (ví dụ PerformanceIssue). Chuyển stderr sang file log để Terminal
-        # của Jarvis không bị spam, nhưng vẫn giữ log để kiểm tra khi cần.
-        mcp_errlog = open(
-            Path(__file__).resolve().parent / "mcp_errors.log",
-            "a",
-            encoding="utf-8",
-            buffering=1,
-        )
-
-        mcp_stdio_context = stdio_client(
-            server,
-            errlog=mcp_errlog,
-        )
+        mcp_stdio_context = stdio_client(server)
         read, write = await mcp_stdio_context.__aenter__()
 
         mcp_session_context = ClientSession(read, write)
@@ -358,16 +321,13 @@ async def close_mcp_session():
     global mcp_stdio_context
     global mcp_session_context
     global mcp_session
-    global mcp_errlog
 
     session_context = mcp_session_context
     stdio_context = mcp_stdio_context
-    errlog = mcp_errlog
 
     mcp_session = None
     mcp_session_context = None
     mcp_stdio_context = None
-    mcp_errlog = None
 
     if session_context is not None:
         try:
@@ -378,12 +338,6 @@ async def close_mcp_session():
     if stdio_context is not None:
         try:
             await stdio_context.__aexit__(None, None, None)
-        except Exception:
-            pass
-
-    if errlog is not None:
-        try:
-            errlog.close()
         except Exception:
             pass
 
@@ -467,10 +421,13 @@ async def read_youtube_videos(
                 },
             )
 
-            videos = await extract_videos_from_page(
-                session,
-                limit=10,
+            snapshot_result = await session.call_tool(
+                "take_snapshot",
+                arguments={"verbose": False},
             )
+
+            snapshot_text = result_to_text(snapshot_result)
+            videos = extract_videos(snapshot_text, limit=10)
 
             if videos:
                 break
@@ -504,13 +461,6 @@ async def read_youtube_videos(
         print("=" * 60)
         print('Jarvis: Dùng "mở video 3" hoặc "mở video <tên>"')
         print("=" * 60)
-
-        set_command_response(
-            format_youtube_list(
-                f"YOUTUBE - {profile_name.upper()}",
-                youtube_videos,
-            )
-        )
         return True
 
     except Exception as error:
@@ -596,10 +546,13 @@ async def get_current_youtube_videos(session, limit=20):
             },
         )
 
-    videos = await extract_videos_from_page(
-        session,
-        limit=limit,
+    snapshot_result = await session.call_tool(
+        "take_snapshot",
+        arguments={"verbose": False},
     )
+
+    snapshot_text = result_to_text(snapshot_result)
+    videos = extract_videos(snapshot_text, limit=limit)
 
     return youtube_page_id, videos
 
@@ -637,13 +590,6 @@ async def refresh_youtube_videos():
         print("=" * 60)
         print('Jarvis: Có thể dùng "mở video 3" hoặc "mở video <tên>".')
         print("=" * 60)
-
-        set_command_response(
-            format_youtube_list(
-                "YOUTUBE - DANH SÁCH MỚI",
-                youtube_videos,
-            )
-        )
         return True
 
     except Exception as error:
@@ -678,19 +624,22 @@ async def open_video(number):
 
     try:
         session = await get_mcp_session()
-        selected_url = selected_video.get("url")
+        _, current_videos = await get_current_youtube_videos(session, limit=30)
 
-        if not selected_url:
-            print("Jarvis: Video này chưa có URL hợp lệ.")
+        if not current_videos:
+            print("Jarvis: Không đọc được video trên tab YouTube hiện tại.")
+            return
+
+        current_video = find_video_by_title(current_videos, selected_title)
+
+        if current_video is None:
+            print("Jarvis: Video không còn xuất hiện trên trang hiện tại.")
             print('Jarvis: Dùng "làm mới youtube" để cập nhật danh sách.')
             return
 
         await session.call_tool(
-            "navigate_page",
-            arguments={
-                "type": "url",
-                "url": selected_url,
-            },
+            "click",
+            arguments={"uid": current_video["uid"]},
         )
         print("Jarvis: Đã mở video.")
 
@@ -727,17 +676,9 @@ async def open_video_by_name(query):
         print("Jarvis: Đã tìm thấy:")
         print(selected_video["title"])
 
-        selected_url = selected_video.get("url")
-        if not selected_url:
-            print("Jarvis: Video này chưa có URL hợp lệ.")
-            return
-
         await session.call_tool(
-            "navigate_page",
-            arguments={
-                "type": "url",
-                "url": selected_url,
-            },
+            "click",
+            arguments={"uid": selected_video["uid"]},
         )
         print("Jarvis: Đã mở video.")
 
@@ -751,33 +692,15 @@ async def open_video_by_name(query):
 # ==========================================================
 
 def extract_youtube_search_query(command):
-    """Hiểu cả: tìm youtube X, tìm video X và tìm X."""
-    command_clean = command.strip()
-
     patterns = [
         r"^(?:tìm|tim)\s+youtube\s+(.+)$",
         r"^youtube\s+(?:tìm|tim)\s+(.+)$",
-        r"^(?:tìm|tim)\s+video\s+(.+)$",
-        r"^(?:tìm|tim)\s+(.+)$",
     ]
 
     for pattern in patterns:
-        match = re.match(pattern, command_clean, re.IGNORECASE)
-
-        if not match:
-            continue
-
-        query = match.group(1).strip()
-        query_lower = query.lower()
-
-        # Các lệnh Google rõ ràng vẫn được dành cho Google Search.
-        if query_lower.startswith(("google ", "trên google ", "tren google ")):
-            return ""
-
-        if query_lower.startswith(("kiếm ", "kiem ")):
-            return ""
-
-        return query
+        match = re.match(pattern, command.strip(), re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
 
     return ""
 
@@ -885,210 +808,10 @@ async def search_youtube(command):
         print("=" * 60)
         print('Jarvis: Dùng "mở video 2" hoặc "mở video <tên>"')
         print("=" * 60)
-
-        set_command_response(
-            format_youtube_list(
-                f"KẾT QUẢ YOUTUBE: {query}",
-                youtube_videos,
-            )
-        )
         return True
 
     except Exception as error:
         print("Jarvis: Không thể tìm kiếm trên YouTube.")
-        print(f"Jarvis: Chi tiết: {error}")
-        return False
-
-
-# ==========================================================
-# HIỆN / QUAY LẠI TAB YOUTUBE HIỆN TẠI
-# ==========================================================
-
-async def show_youtube():
-    """Hiện lại Chrome và đưa đúng tab YouTube hiện tại lên trước."""
-    global youtube_page_id
-
-    print()
-    print("Jarvis: Đang quay lại YouTube...")
-
-    # 1. Thoát khỏi trạng thái Show Desktop để cửa sổ hiện lại.
-    try:
-        subprocess.run(
-            ["wmctrl", "-k", "off"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        await asyncio.sleep(0.3)
-
-    except FileNotFoundError:
-        # Nếu wmctrl không có, thử Super+D.
-        try:
-            subprocess.run(
-                ["xdotool", "key", "super+d"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            await asyncio.sleep(0.3)
-        except FileNotFoundError:
-            pass
-
-    # 2. Đưa đúng tab YouTube đang được Jarvis điều khiển lên trước.
-    try:
-        session = await get_mcp_session()
-
-        if youtube_page_id is None:
-            youtube_page_id = await find_youtube_page(session)
-
-        if youtube_page_id is None:
-            print("Jarvis: Không tìm thấy tab YouTube đang mở.")
-            print('Jarvis: Hãy dùng "mở youtube cá nhân" hoặc "mở youtube học" trước.')
-            return False
-
-        try:
-            await session.call_tool(
-                "select_page",
-                arguments={
-                    "pageId": youtube_page_id,
-                    "bringToFront": True,
-                },
-            )
-
-        except Exception:
-            # pageId cũ có thể đã hết hiệu lực nếu tab trước bị đóng.
-            youtube_page_id = await find_youtube_page(session)
-
-            if youtube_page_id is None:
-                print("Jarvis: Không tìm thấy tab YouTube đang mở.")
-                return False
-
-            await session.call_tool(
-                "select_page",
-                arguments={
-                    "pageId": youtube_page_id,
-                    "bringToFront": True,
-                },
-            )
-
-        print("Jarvis: Đã quay lại YouTube.")
-        return True
-
-    except Exception as error:
-        print("Jarvis: Không thể quay lại YouTube.")
-        print(f"Jarvis: Chi tiết: {error}")
-        return False
-
-
-# ==========================================================
-# TẮT / ĐÓNG TAB YOUTUBE - KHÔNG TẮT CHROME
-# ==========================================================
-
-async def close_youtube():
-    """
-    Đóng đúng tab YouTube mà Jarvis đang điều khiển.
-
-    - Nếu Chrome còn tab khác: chọn tab khác trước rồi đóng YouTube.
-    - Nếu YouTube là tab cuối cùng: đổi tab đó thành New Tab để giữ Chrome mở.
-    """
-    global youtube_videos
-    global youtube_profile
-    global youtube_profile_name
-    global youtube_page_id
-
-    print()
-    print("Jarvis: Đang tắt YouTube...")
-
-    try:
-        session = await get_mcp_session()
-
-        # Nếu page ID cũ chưa có hoặc tab cũ đã bị đóng,
-        # tìm lại tab YouTube đang mở.
-        if youtube_page_id is None:
-            youtube_page_id = await find_youtube_page(session)
-
-        if youtube_page_id is None:
-            print("Jarvis: Không tìm thấy tab YouTube đang mở.")
-            return False
-
-        # Lấy danh sách toàn bộ tab để biết YouTube có phải tab cuối hay không.
-        pages_result = await session.call_tool(
-            "list_pages",
-            arguments={},
-        )
-
-        pages_text = result_to_text(pages_result)
-        all_page_ids = []
-
-        for line in pages_text.splitlines():
-            page_id = extract_page_id(line)
-
-            if page_id is not None and page_id not in all_page_ids:
-                all_page_ids.append(page_id)
-
-        other_page_ids = [
-            page_id
-            for page_id in all_page_ids
-            if page_id != youtube_page_id
-        ]
-
-        if other_page_ids:
-            # Tránh để MCP đang chọn chính tab sắp đóng.
-            # Chuyển sang một tab khác trước.
-            try:
-                await session.call_tool(
-                    "select_page",
-                    arguments={
-                        "pageId": other_page_ids[-1],
-                        "bringToFront": True,
-                    },
-                )
-            except Exception:
-                pass
-
-            await session.call_tool(
-                "close_page",
-                arguments={
-                    "pageId": youtube_page_id,
-                },
-            )
-
-            print("Jarvis: Đã tắt tab YouTube. Chrome vẫn đang chạy.")
-
-        else:
-            # Chrome DevTools MCP không cho close_page() đóng tab cuối cùng.
-            # Vì vậy đổi tab YouTube cuối cùng thành New Tab,
-            # đạt mục tiêu rời YouTube nhưng vẫn giữ Chrome mở.
-            await session.call_tool(
-                "select_page",
-                arguments={
-                    "pageId": youtube_page_id,
-                    "bringToFront": True,
-                },
-            )
-
-            await session.call_tool(
-                "navigate_page",
-                arguments={
-                    "type": "url",
-                    "url": "chrome://newtab/",
-                },
-            )
-
-            print(
-                "Jarvis: YouTube là tab Chrome cuối cùng, "
-                "nên đã chuyển nó về New Tab."
-            )
-            print("Jarvis: Chrome vẫn đang chạy.")
-
-        # Xóa state cũ vì UID/video/page ID của YouTube không còn hợp lệ.
-        youtube_videos = []
-        youtube_page_id = None
-
-        return True
-
-    except Exception as error:
-        print("Jarvis: Không thể tắt YouTube.")
         print(f"Jarvis: Chi tiết: {error}")
         return False
 
@@ -1198,13 +921,6 @@ async def go_youtube_home():
         print("=" * 60)
         print('Jarvis: Dùng "mở video 2" hoặc "mở video <tên>"')
         print("=" * 60)
-
-        set_command_response(
-            format_youtube_list(
-                "YOUTUBE - TRANG CHỦ",
-                youtube_videos,
-            )
-        )
         return True
 
     except Exception as error:
@@ -1506,286 +1222,6 @@ def show_desktop():
     )
 
 
-
-# ==========================================================
-# PHẢN HỒI DÙNG CHUNG CHO DISCORD
-# ==========================================================
-
-def set_command_response(message):
-    """Lưu phản hồi cuối để Discord có thể gửi lại cho người dùng."""
-    global last_command_response
-    last_command_response = message
-
-
-def format_youtube_list(title, videos):
-    lines = [f"📺 **{title}**", ""]
-
-    for index, video in enumerate(videos, start=1):
-        lines.append(f"{index}. {video['title']}")
-
-    lines.extend([
-        "",
-        "Dùng `mở video 3` hoặc `mở video <tên>`.",
-    ])
-
-    return "\n".join(lines)
-
-
-# ==========================================================
-# ÂM LƯỢNG UBUNTU
-# ==========================================================
-
-def get_current_volume():
-    """Trả về mức âm lượng của output mặc định theo phần trăm."""
-    try:
-        result = subprocess.run(
-            ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        if result.returncode != 0:
-            return None
-
-        match = re.search(r"(\d+)%", result.stdout)
-
-        if not match:
-            return None
-
-        return int(match.group(1))
-
-    except FileNotFoundError:
-        return None
-
-
-def get_mute_state():
-    try:
-        result = subprocess.run(
-            ["pactl", "get-sink-mute", "@DEFAULT_SINK@"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        if result.returncode != 0:
-            return None
-
-        output = result.stdout.lower()
-
-        if "yes" in output:
-            return True
-
-        if "no" in output:
-            return False
-
-        return None
-
-    except FileNotFoundError:
-        return None
-
-
-def set_volume(value):
-    value = max(0, min(100, int(value)))
-
-    try:
-        result = subprocess.run(
-            [
-                "pactl",
-                "set-sink-volume",
-                "@DEFAULT_SINK@",
-                f"{value}%",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        if result.returncode != 0:
-            return None
-
-        # Đặt âm lượng cũng tự bật tiếng nếu trước đó đang mute.
-        subprocess.run(
-            ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-
-        return get_current_volume()
-
-    except FileNotFoundError:
-        return None
-
-
-def change_volume(delta):
-    current = get_current_volume()
-
-    if current is None:
-        return None, None
-
-    new_volume = max(0, min(100, current + int(delta)))
-    actual = set_volume(new_volume)
-
-    return current, actual
-
-
-def set_mute(muted):
-    try:
-        result = subprocess.run(
-            [
-                "pactl",
-                "set-sink-mute",
-                "@DEFAULT_SINK@",
-                "1" if muted else "0",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        return result.returncode == 0
-
-    except FileNotFoundError:
-        return False
-
-
-def handle_volume_command(command):
-    """
-    Xử lý lệnh âm lượng.
-    Trả True nếu command là lệnh âm lượng, False nếu không phải.
-    """
-    command_clean = command.strip()
-    command_lower = command_clean.lower()
-
-    # Xem âm lượng hiện tại
-    current_commands = {
-        "âm lượng",
-        "am luong",
-        "âm lượng hiện tại",
-        "am luong hien tai",
-        "mức âm lượng",
-        "muc am luong",
-        "volume",
-        "volume hiện tại",
-        "volume hien tai",
-        "current volume",
-        "cho tôi biết âm lượng",
-        "cho toi biet am luong",
-    }
-
-    if command_lower in current_commands:
-        volume = get_current_volume()
-
-        if volume is None:
-            message = (
-                "❌ Jarvis không đọc được âm lượng. "
-                "Hãy kiểm tra lệnh `pactl` trên Ubuntu."
-            )
-        else:
-            muted = get_mute_state()
-
-            if muted:
-                message = f"🔇 Âm lượng hiện tại: {volume}% (đang tắt tiếng)"
-            else:
-                message = f"🔊 Âm lượng hiện tại: {volume}%"
-
-        print(f"Jarvis: {message}")
-        set_command_response(message)
-        return True
-
-    # Đặt âm lượng trực tiếp: âm lượng 50 / đặt âm lượng 50
-    set_match = re.fullmatch(
-        r"(?:đặt\s+|dat\s+|set\s+)?(?:âm\s+lượng|am\s+luong|volume)\s+(\d{1,3})%?",
-        command_clean,
-        re.IGNORECASE,
-    )
-
-    if set_match:
-        requested = int(set_match.group(1))
-        requested = max(0, min(100, requested))
-        actual = set_volume(requested)
-
-        if actual is None:
-            message = "❌ Jarvis không thể đặt âm lượng."
-        else:
-            message = f"🔊 Đã đặt âm lượng: {actual}%"
-
-        print(f"Jarvis: {message}")
-        set_command_response(message)
-        return True
-
-    # Tăng âm lượng; mặc định +5%
-    increase_match = re.fullmatch(
-        r"(?:tăng\s+âm\s+lượng|tang\s+am\s+luong|volume\s+up)(?:\s+(\d{1,3})%?)?",
-        command_clean,
-        re.IGNORECASE,
-    )
-
-    if increase_match:
-        amount = int(increase_match.group(1) or 5)
-        before, after = change_volume(amount)
-
-        if after is None:
-            message = "❌ Jarvis không thể tăng âm lượng."
-        else:
-            message = f"🔊 Đã tăng âm lượng: {before}% → {after}%"
-
-        print(f"Jarvis: {message}")
-        set_command_response(message)
-        return True
-
-    # Giảm âm lượng; mặc định -5%
-    decrease_match = re.fullmatch(
-        r"(?:giảm\s+âm\s+lượng|giam\s+am\s+luong|volume\s+down)(?:\s+(\d{1,3})%?)?",
-        command_clean,
-        re.IGNORECASE,
-    )
-
-    if decrease_match:
-        amount = int(decrease_match.group(1) or 5)
-        before, after = change_volume(-amount)
-
-        if after is None:
-            message = "❌ Jarvis không thể giảm âm lượng."
-        else:
-            message = f"🔊 Đã giảm âm lượng: {before}% → {after}%"
-
-        print(f"Jarvis: {message}")
-        set_command_response(message)
-        return True
-
-    if command_lower in {
-        "tắt tiếng", "tat tieng", "mute",
-    }:
-        if set_mute(True):
-            message = "🔇 Đã tắt tiếng."
-        else:
-            message = "❌ Jarvis không thể tắt tiếng."
-
-        print(f"Jarvis: {message}")
-        set_command_response(message)
-        return True
-
-    if command_lower in {
-        "bật tiếng", "bat tieng", "unmute",
-    }:
-        if set_mute(False):
-            volume = get_current_volume()
-            if volume is None:
-                message = "🔊 Đã bật tiếng."
-            else:
-                message = f"🔊 Đã bật tiếng. Âm lượng hiện tại: {volume}%"
-        else:
-            message = "❌ Jarvis không thể bật tiếng."
-
-        print(f"Jarvis: {message}")
-        set_command_response(message)
-        return True
-
-    return False
-
-
 # ==========================================================
 # HELP
 # ==========================================================
@@ -1802,12 +1238,6 @@ def show_help():
     print("  mở video 2")
     print("  mở video sekiro")
     print("  làm mới youtube")
-    print("  quay lại youtube")
-    print("  hiện youtube")
-    print("  tắt youtube")
-    print("  đóng youtube")
-    print("  tìm sekiro")
-    print("  tìm video sekiro")
     print("  tìm youtube sekiro boss")
     print("  youtube tìm minecraft mod")
     print("  về trang chủ")
@@ -1831,16 +1261,6 @@ def show_help():
     print("  ra desktop")
     print("  hiện desktop")
     print()
-    print("  âm lượng")
-    print("  âm lượng hiện tại")
-    print("  âm lượng 50")
-    print("  tăng âm lượng")
-    print("  tăng âm lượng 10")
-    print("  giảm âm lượng")
-    print("  giảm âm lượng 10")
-    print("  tắt tiếng")
-    print("  bật tiếng")
-    print()
     print("  thoát")
     print()
 
@@ -1855,13 +1275,6 @@ async def route_command(command):
     command_lower = command.lower()
 
     if not command_lower:
-        return True
-
-    # ------------------------------------------------------
-    # ÂM LƯỢNG
-    # ------------------------------------------------------
-
-    if handle_volume_command(command):
         return True
 
 
@@ -1940,40 +1353,6 @@ async def route_command(command):
 
 
     # ------------------------------------------------------
-    # HIỆN / QUAY LẠI YOUTUBE
-    # ------------------------------------------------------
-
-    if command_lower in {
-        "quay lại youtube",
-        "quay lai youtube",
-        "hiện youtube",
-        "hien youtube",
-        "mở lại youtube",
-        "mo lai youtube",
-        "show youtube",
-    }:
-        await show_youtube()
-        return True
-
-
-    # ------------------------------------------------------
-    # TẮT / ĐÓNG YOUTUBE - KHÔNG TẮT CHROME
-    # ------------------------------------------------------
-
-    if command_lower in {
-        "tắt youtube",
-        "tat youtube",
-        "đóng youtube",
-        "dong youtube",
-        "đóng tab youtube",
-        "dong tab youtube",
-        "close youtube",
-    }:
-        await close_youtube()
-        return True
-
-
-    # ------------------------------------------------------
     # VỀ TRANG CHỦ YOUTUBE
     # ------------------------------------------------------
 
@@ -1995,26 +1374,9 @@ async def route_command(command):
     # TÌM KIẾM YOUTUBE
     # ------------------------------------------------------
 
-    explicit_youtube_search = (
+    if (
         re.match(r"^(?:tìm|tim)\s+youtube\s+.+", command, re.IGNORECASE)
         or re.match(r"^youtube\s+(?:tìm|tim)\s+.+", command, re.IGNORECASE)
-        or re.match(r"^(?:tìm|tim)\s+video\s+.+", command, re.IGNORECASE)
-    )
-
-    natural_youtube_search = re.match(
-        r"^(?:tìm|tim)\s+.+",
-        command,
-        re.IGNORECASE,
-    )
-
-    explicit_google_search = re.match(
-        r"^(?:tìm|tim)\s+(?:google|trên\s+google|tren\s+google|kiếm|kiem)\b",
-        command,
-        re.IGNORECASE,
-    )
-
-    if explicit_youtube_search or (
-        natural_youtube_search and not explicit_google_search
     ):
         await search_youtube(command)
         return True
@@ -2256,195 +1618,6 @@ async def route_command(command):
 
 
 # ==========================================================
-# DISCORD
-# ==========================================================
-
-def _env_int(name):
-    value = os.getenv(name, "").strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
-def _discord_command_needs_profile(command):
-    """Tránh Jarvis chờ input() trên Terminal khi lệnh đến từ Discord."""
-    command_lower = command.strip().lower()
-
-    profile_words = (
-        "cá nhân", "ca nhan", "personal",
-        "học", "hoc", "study", "chatgpt",
-    )
-
-    if any(word in command_lower for word in profile_words):
-        return False
-
-    if command_lower in {"youtube", "mở youtube", "mo youtube", "vào youtube", "vao youtube"}:
-        return True
-
-    youtube_search_prefixes = (
-        "tìm youtube ", "tim youtube ",
-        "youtube tìm ", "youtube tim ",
-        "tìm video ", "tim video ",
-    )
-
-    if command_lower.startswith(youtube_search_prefixes):
-        # Nếu chưa có tab YouTube, search_youtube() sẽ cần chọn profile.
-        return youtube_page_id is None
-
-    if command_lower.startswith(("tìm ", "tim ")):
-        google_search_prefixes = (
-            "tìm google ", "tim google ",
-            "tìm trên google ", "tim tren google ",
-            "tìm kiếm ", "tim kiem ",
-        )
-
-        if not command_lower.startswith(google_search_prefixes):
-            return youtube_page_id is None
-
-    if "github" in command_lower and (
-        command_lower.startswith("mở")
-        or command_lower.startswith("mo")
-        or command_lower == "github"
-    ):
-        return True
-
-    google_prefixes = (
-        "google", "tìm google", "tim google",
-        "tìm trên google", "tim tren google",
-        "tìm kiếm", "tim kiem", "search",
-    )
-    if command_lower.startswith(google_prefixes):
-        return True
-
-    return False
-
-
-async def start_discord_bot():
-    """Chạy Discord bot song song với giao diện Terminal của Jarvis."""
-    global discord_client
-
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    owner_id = _env_int("DISCORD_USER_ID")
-    channel_id = _env_int("DISCORD_CHANNEL_ID")
-
-    if not token:
-        print("Jarvis: Discord chưa chạy vì thiếu DISCORD_TOKEN trong .env.")
-        return
-
-    if owner_id is None:
-        print("Jarvis: Discord chưa chạy vì thiếu DISCORD_USER_ID trong .env.")
-        print("Jarvis: Thêm ID Discord của bạn để chỉ bạn có quyền điều khiển máy.")
-        return
-
-    intents = discord.Intents.default()
-    intents.message_content = True
-
-    client = discord.Client(
-        intents=intents,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-    discord_client = client
-
-    @client.event
-    async def on_ready():
-        print()
-        print(f"Jarvis: Discord đã kết nối: {client.user}")
-        print('Jarvis: Discord nhận lệnh trực tiếp, ví dụ: mở vscode')
-        if channel_id is not None:
-            print(f"Jarvis: Chỉ nhận lệnh trong channel ID {channel_id}.")
-
-    @client.event
-    async def on_message(message):
-        if message.author.bot:
-            return
-
-        if message.author.id != owner_id:
-            return
-
-        if channel_id is not None and message.channel.id != channel_id:
-            return
-
-        command = message.content.strip()
-
-        if not command:
-            return
-
-        if command.lower() in {
-            "thoát", "thoat", "exit", "quit", "bye",
-            "tạm biệt", "tam biet",
-        }:
-            await message.reply(
-                "Lệnh thoát từ Discord bị khóa. Hãy thoát Jarvis trực tiếp trên Ubuntu.",
-                mention_author=False,
-            )
-            return
-
-        if _discord_command_needs_profile(command):
-            await message.reply(
-                "Lệnh này cần chỉ rõ Chrome profile. Ví dụ: "
-                "`mở youtube cá nhân` hoặc `mở youtube học`.",
-                mention_author=False,
-            )
-            return
-
-        await message.reply(
-            f"Đã nhận: `{command}`",
-            mention_author=False,
-        )
-
-        try:
-            global last_command_response
-            last_command_response = None
-
-            async with discord_command_lock:
-                await route_command(command)
-
-            if last_command_response:
-                # Discord giới hạn một message khoảng 2000 ký tự.
-                response_text = last_command_response
-
-                if len(response_text) > 1900:
-                    response_text = response_text[:1900] + "\n..."
-
-                await message.reply(
-                    response_text,
-                    mention_author=False,
-                )
-            else:
-                await message.reply(
-                    "✅ Jarvis đã xử lý lệnh.",
-                    mention_author=False,
-                )
-        except Exception as error:
-            print(f"Jarvis: Lỗi Discord command: {error}")
-            await message.reply(
-                "❌ Jarvis gặp lỗi khi xử lý lệnh. Xem Terminal Ubuntu để biết chi tiết.",
-                mention_author=False,
-            )
-
-    try:
-        await client.start(token)
-    except discord.LoginFailure:
-        print("Jarvis: DISCORD_TOKEN không hợp lệ. Hãy kiểm tra/reset token.")
-    except asyncio.CancelledError:
-        raise
-    except Exception as error:
-        print(f"Jarvis: Không thể kết nối Discord: {error}")
-
-
-async def stop_discord_bot():
-    global discord_client
-
-    if discord_client is not None and not discord_client.is_closed():
-        await discord_client.close()
-
-    discord_client = None
-
-
-# ==========================================================
 # MAIN
 # ==========================================================
 
@@ -2457,15 +1630,13 @@ async def main():
     print()
     print('Jarvis: Sẵn sàng. Gõ "help" để xem lệnh.')
 
-    # Discord chạy nền. input() được đưa sang thread để không chặn event loop.
-    discord_task = asyncio.create_task(start_discord_bot())
     running = True
 
     try:
         while running:
             try:
                 print()
-                command = (await asyncio.to_thread(input, "Bạn: ")).strip()
+                command = input("Bạn: ").strip()
                 running = await route_command(command)
 
             except KeyboardInterrupt:
@@ -2484,16 +1655,6 @@ async def main():
                 print(error)
 
     finally:
-        await stop_discord_bot()
-
-        if not discord_task.done():
-            discord_task.cancel()
-
-        try:
-            await discord_task
-        except asyncio.CancelledError:
-            pass
-
         await close_mcp_session()
 
 
