@@ -3369,6 +3369,10 @@ async def route_command(command, *, allow_local_ai=True):
 
     command = CORE.brain.normalize_command(command)
 
+    # Người dùng thường thêm dấu câu khi nhập tự nhiên trên Terminal/Discord.
+    # Dấu cuối câu không làm thay đổi ý nghĩa của một lệnh chính xác.
+    command = re.sub(r"[?!.,;:]+$", "", command).strip()
+
     command_lower = command.lower()
 
     if not command_lower:
