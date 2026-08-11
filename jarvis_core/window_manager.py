@@ -1,0 +1,103 @@
+"""Track and close individual desktop windows opened by Jarvis."""
+
+import subprocess
+import time
+from pathlib import Path
+
+from .text import normalize_text
+
+
+class FileWindowManager:
+    """Best-effort window tracking through wmctrl, without killing an app."""
+
+    def __init__(self):
+        self.last_windows = {"file": None, "folder": None}
+
+    @staticmethod
+    def _parse_windows(output):
+        windows = []
+        for line in output.splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4:
+                windows.append({"id": parts[0], "title": parts[3]})
+        return windows
+
+    def list_windows(self):
+        try:
+            result = subprocess.run(
+                ["wmctrl", "-l"], capture_output=True, text=True, check=False, timeout=2
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return []
+        if result.returncode != 0:
+            return []
+        return self._parse_windows(result.stdout)
+
+    def snapshot_ids(self):
+        return {window["id"] for window in self.list_windows()}
+
+    def track_opened_path(self, path, previous_ids, timeout=3.0):
+        """Find the new window created after xdg-open and remember only that window."""
+        path = Path(path)
+        kind = "folder" if path.is_dir() else "file"
+        deadline = time.monotonic() + timeout
+        candidates = []
+        while time.monotonic() < deadline:
+            windows = self.list_windows()
+            candidates = [window for window in windows if window["id"] not in previous_ids]
+            if candidates:
+                break
+            time.sleep(0.15)
+
+        if len(candidates) != 1:
+            # Some apps reuse a window. Only accept an unambiguous title match.
+            needle = normalize_text(path.stem)
+            title_matches = [
+                window for window in self.list_windows()
+                if needle and needle in normalize_text(window["title"])
+            ]
+            if len(title_matches) != 1:
+                self.last_windows[kind] = None
+                return False
+            candidates = title_matches
+
+        selected = candidates[0]
+        self.last_windows[kind] = {
+            "id": selected["id"],
+            "title": selected["title"],
+            "path": str(path),
+        }
+        return True
+
+    def close_last(self, kind):
+        tracked = self.last_windows.get(kind)
+        kind_label = "thư mục/project" if kind == "folder" else "file"
+        if tracked is None:
+            return False, f"Không có cửa sổ {kind_label} nào do Jarvis theo dõi."
+
+        current_ids = {window["id"] for window in self.list_windows()}
+        if tracked["id"] not in current_ids:
+            self.last_windows[kind] = None
+            return False, f"Cửa sổ {kind_label} gần nhất đã được đóng trước đó."
+
+        try:
+            result = subprocess.run(
+                ["wmctrl", "-ic", tracked["id"]],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return False, "Không thể điều khiển cửa sổ; wmctrl chưa hoạt động."
+        if result.returncode != 0:
+            return False, f"Desktop không cho phép đóng riêng cửa sổ {kind_label} này."
+
+        self.last_windows[kind] = None
+        return True, f"Đã đóng cửa sổ {kind_label}: {tracked['path']}"
+
+    def close_last_file(self):
+        return self.close_last("file")
+
+    def close_last_folder(self):
+        return self.close_last("folder")

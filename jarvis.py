@@ -14,8 +14,11 @@ from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from jarvis_core.runtime import JarvisCore
+from jarvis_core.window_manager import FileWindowManager
 
-VERSION = "1.0.21-deep-sleep-timer"
+
+VERSION = "1.1.0-modular-core"
 
 load_dotenv()
 
@@ -35,6 +38,8 @@ STUDY_PROFILE = "Profile 1"
 # ==========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
+CORE = JarvisCore(BASE_DIR)
+FILE_WINDOWS = FileWindowManager()
 TTS_DIR = BASE_DIR / "tts"
 TTS_PYTHON = TTS_DIR / "VieNeu-TTS" / ".venv" / "bin" / "python"
 TTS_ENGINE = TTS_DIR / "tts_engine.py"
@@ -1997,14 +2002,19 @@ def open_filesystem_path(path):
         return False
 
     try:
+        previous_window_ids = FILE_WINDOWS.snapshot_ids()
         subprocess.Popen(
             ["xdg-open", str(resolved)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        tracked = FILE_WINDOWS.track_opened_path(resolved, previous_window_ids)
         kind = "thư mục" if resolved.is_dir() else "file"
         message = f"✅ Đã mở {kind}: {resolved}"
+        if not tracked:
+            close_command = "tắt thư mục" if resolved.is_dir() else "tắt file"
+            message += f"\n⚠️ Desktop không cung cấp mã cửa sổ; có thể chưa dùng được `{close_command}`."
         print(f"Jarvis: {message}")
         set_command_response(message)
         return True
@@ -2087,6 +2097,31 @@ def handle_filesystem_command(command):
       'tìm file report' -> bị hiểu thành tìm video YouTube.
     """
     command_clean = command.strip()
+
+    # Chỉ đóng cửa sổ file gần nhất do Jarvis mở, không kill toàn bộ ứng dụng.
+    if re.fullmatch(
+        r"(?:tắt|tat|đóng|dong)\s+(?:cửa\s*sổ\s+)?file(?:\s+gần\s+nhất)?",
+        command_clean,
+        re.IGNORECASE,
+    ):
+        success, detail = FILE_WINDOWS.close_last_file()
+        icon = "✅" if success else "❌"
+        message = f"{icon} {detail}"
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return True
+
+    if re.fullmatch(
+        r"(?:tắt|tat|đóng|dong)\s+(?:cửa\s*sổ\s+)?(?:thư\s*mục|thu\s*muc|project)(?:\s+gần\s+nhất)?",
+        command_clean,
+        re.IGNORECASE,
+    ):
+        success, detail = FILE_WINDOWS.close_last_folder()
+        icon = "✅" if success else "❌"
+        message = f"{icon} {detail}"
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return True
 
     # Chọn kết quả theo số.
     match = re.fullmatch(
@@ -2687,6 +2722,17 @@ SCREEN_SLEEP_COMMANDS = {
     "display off",
 }
 
+SCREEN_WAKE_COMMANDS = {
+    "mở màn hình",
+    "mo man hinh",
+    "bật màn hình",
+    "bat man hinh",
+    "đánh thức màn hình",
+    "danh thuc man hinh",
+    "wake screen",
+    "screen on",
+}
+
 
 def is_deep_sleep_command(command):
     return command.strip().lower() in DEEP_SLEEP_COMMANDS
@@ -2694,6 +2740,47 @@ def is_deep_sleep_command(command):
 
 def is_screen_sleep_command(command):
     return command.strip().lower() in SCREEN_SLEEP_COMMANDS
+
+
+def is_screen_wake_command(command):
+    return command.strip().lower() in SCREEN_WAKE_COMMANDS
+
+
+def wake_screen():
+    """Bật lại màn hình nhưng không bỏ qua màn hình khóa/mật khẩu."""
+    session_type = os.getenv("XDG_SESSION_TYPE", "").strip().lower()
+
+    if session_type == "x11":
+        try:
+            result = subprocess.run(
+                ["xset", "dpms", "force", "on"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode == 0:
+                return True
+        except FileNotFoundError:
+            pass
+
+    # GNOME/Wayland: bỏ trạng thái blank. Nếu phiên đã khóa, màn hình đăng
+    # nhập vẫn được giữ nguyên và người dùng vẫn phải xác thực.
+    try:
+        result = subprocess.run(
+            [
+                "gdbus", "call", "--session",
+                "--dest", "org.gnome.ScreenSaver",
+                "--object-path", "/org/gnome/ScreenSaver",
+                "--method", "org.gnome.ScreenSaver.SetActive",
+                "false",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
 
 
 def deep_sleep_machine():
@@ -2840,9 +2927,20 @@ def show_help():
     print("  tìm file <tên>")
     print("  mở file <tên>")
     print("  mở file <số>")
+    print("  tắt file             # chỉ đóng cửa sổ file Jarvis vừa mở")
+    print("  tắt thư mục/project  # chỉ đóng cửa sổ thư mục Jarvis vừa mở")
     print("  tìm thư mục <tên>")
     print("  mở thư mục <tên>")
     print("  mở thư mục <số>")
+    print("  tìm thông minh <tên>  # xếp hạng theo độ khớp và độ mới")
+    print("  file gần đây")
+    print()
+    print("  ghi nhớ <nội dung>")
+    print("  nhớ lại <từ khóa>")
+    print("  xem bộ nhớ")
+    print("  quên <từ khóa>")
+    print()
+    print("  tình trạng hệ thống")
     print()
     print("  về desktop")
     print("  ra desktop")
@@ -2859,6 +2957,7 @@ def show_help():
     print("  bật tiếng")
     print()
     print("  sleep           # chỉ tắt màn hình, nhạc vẫn chạy")
+    print("  mở màn hình     # bật màn hình, vẫn giữ khóa/mật khẩu")
     print("  sleep sâu       # Sleep sâu ngay lập tức")
     print("  sleep sâu sau 1h")
     print("  sleep sâu sau 30p")
@@ -2879,9 +2978,31 @@ def show_help():
 async def route_command(command):
     command = command.strip()
 
+    # Lõi module hóa xử lý memory, tìm file thông minh, natural-language
+    # aliases và system monitoring. Lệnh chưa nhận diện tiếp tục qua router 1.0.
+    core_response = CORE.handle(command)
+    if core_response is not None:
+        print(f"Jarvis: {core_response}")
+        set_command_response(core_response)
+        return True
+
+    command = CORE.brain.normalize_command(command)
+
     command_lower = command.lower()
 
     if not command_lower:
+        return True
+
+    # ------------------------------------------------------
+    # BẬT LẠI MÀN HÌNH - KHÔNG BỎ QUA KHÓA/MẬT KHẨU
+    # ------------------------------------------------------
+
+    if is_screen_wake_command(command):
+        if wake_screen():
+            set_command_response("💡 Đã bật lại màn hình. Khóa đăng nhập vẫn được giữ.")
+        else:
+            set_command_response("❌ Jarvis không thể bật màn hình trên phiên desktop hiện tại.")
+        print(f"Jarvis: {last_command_response}")
         return True
 
     # ------------------------------------------------------
@@ -3391,14 +3512,12 @@ async def route_command(command):
     # KHÔNG HIỂU
     # ------------------------------------------------------
 
-    print(
-        "Jarvis: Tôi chưa hiểu lệnh đó."
+    unknown_message = (
+        "❓ Tôi chưa hiểu lệnh đó. "
+        'Gõ `help` để xem các lệnh hiện có.'
     )
-
-    print(
-        'Jarvis: Gõ "help" để xem '
-        "các lệnh hiện có."
-    )
+    print(f"Jarvis: {unknown_message}")
+    set_command_response(unknown_message)
 
     return True
 
