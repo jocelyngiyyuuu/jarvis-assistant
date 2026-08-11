@@ -15,7 +15,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
-VERSION = "1.0.21-deep-sleep-timer"
+VERSION = "1.0.18-shutdown-timer"
 
 load_dotenv()
 
@@ -282,109 +282,6 @@ def open_chrome(profile, url):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-
-
-# ==========================================================
-# CHROME SHORTCUTS - MỞ THẲNG WEBSITE THEO PROFILE
-# ==========================================================
-
-CHROME_SHORTCUTS = {
-    "chatgpt": ("ChatGPT", "https://chatgpt.com/"),
-    "chat gpt": ("ChatGPT", "https://chatgpt.com/"),
-    "gmail": ("Gmail", "https://mail.google.com/"),
-    "mail": ("Gmail", "https://mail.google.com/"),
-    "drive": ("Google Drive", "https://drive.google.com/"),
-    "google drive": ("Google Drive", "https://drive.google.com/"),
-    "calendar": ("Google Calendar", "https://calendar.google.com/"),
-    "lịch google": ("Google Calendar", "https://calendar.google.com/"),
-    "lich google": ("Google Calendar", "https://calendar.google.com/"),
-    "github": ("GitHub", "https://github.com/"),
-    "google": ("Google", "https://www.google.com/"),
-    "chrome": ("Chrome", "chrome://newtab/"),
-}
-
-
-def _chrome_profile_from_explicit_command(command):
-    """Chỉ lấy profile khi người dùng nói rõ học/cá nhân; không gọi input khi chạy nền."""
-    command_lower = command.lower()
-
-    personal_words = (
-        "cá nhân",
-        "ca nhan",
-        "personal",
-    )
-    study_words = (
-        "học",
-        "hoc",
-        "học tập",
-        "hoc tap",
-        "study",
-    )
-
-    if any(word in command_lower for word in personal_words):
-        return PERSONAL_PROFILE, "Cá nhân"
-
-    if any(word in command_lower for word in study_words):
-        return STUDY_PROFILE, "Học / ChatGPT"
-
-    return None, None
-
-
-def handle_chrome_shortcut(command):
-    """
-    Mở nhanh website trong đúng Chrome profile.
-
-    Ví dụ:
-      mở chatgpt học
-      mở tab chatgpt cá nhân
-      mở gmail học
-      mở drive học
-      mở github cá nhân
-      mở chrome học
-    """
-    command_clean = re.sub(r"\s+", " ", command.strip().lower())
-
-    if not re.match(r"^(?:mở|mo|vào|vao)(?:\s+tab)?\s+", command_clean):
-        return False
-
-    # Bỏ động từ ở đầu và từ 'tab' nếu có.
-    target_text = re.sub(
-        r"^(?:mở|mo|vào|vao)(?:\s+tab)?\s+",
-        "",
-        command_clean,
-        count=1,
-    ).strip()
-
-    # Bỏ từ chỉ profile để còn lại tên website.
-    target_text = re.sub(
-        r"\s+(?:bằng\s+)?(?:tài\s+khoản\s+)?(?:cá nhân|ca nhan|personal|học tập|hoc tap|học|hoc|study)\s*$",
-        "",
-        target_text,
-        flags=re.IGNORECASE,
-    ).strip()
-
-    shortcut = CHROME_SHORTCUTS.get(target_text)
-    if shortcut is None:
-        return False
-
-    profile, profile_name = _chrome_profile_from_explicit_command(command)
-
-    if profile is None:
-        message = (
-            f"ℹ️ Hãy nói rõ profile, ví dụ: `mở {target_text} học` "
-            f"hoặc `mở {target_text} cá nhân`."
-        )
-        print(f"Jarvis: {message}")
-        set_command_response(message)
-        return True
-
-    site_name, url = shortcut
-    open_chrome(profile, url)
-
-    message = f"✅ Đang mở {site_name} bằng Chrome {profile_name}."
-    print(f"Jarvis: {message}")
-    set_command_response(message)
-    return True
 
 
 # ==========================================================
@@ -2488,168 +2385,137 @@ def handle_volume_command(command):
 
 
 # ==========================================================
-# HẸN GIỜ SLEEP SÂU / SUSPEND UBUNTU
+# HẸN GIỜ SHUTDOWN UBUNTU
 # ==========================================================
 
-deep_sleep_task = None
+shutdown_task = None
 
 
-def parse_deep_sleep_delay(command):
+def parse_shutdown_delay(command):
     """
-    Hiểu các lệnh dạng:
-      sleep sâu sau 1h
-      sleep sâu sau 30p
-      sleep sâu sau 45s
-      sleep sâu sau 1h30p
-      sleep sâu sau 1h 20p 15s
-
-    Đơn vị:
-      h = giờ
-      p = phút
-      s = giây
+    Hiểu các lệnh:
+      tắt máy sau 30 phút
+      tat may sau 30 phut
+      shutdown sau 2 giờ
+      shutdown sau 90 giây
     """
-    command_clean = re.sub(r"\s+", " ", command.strip().lower())
+    command_clean = command.strip().lower()
 
-    match = re.fullmatch(
-        r"(?:sleep sâu|sleep sau|ngủ sâu|ngu sau|suspend)(?:\s+sau)?\s+(.+)",
-        command_clean,
-        re.IGNORECASE,
-    )
+    patterns = [
+        r"^(?:tắt máy|tat may|shutdown)\s+sau\s+(\d+)\s*(giây|giay|second|seconds)$",
+        r"^(?:tắt máy|tat may|shutdown)\s+sau\s+(\d+)\s*(phút|phut|minute|minutes)$",
+        r"^(?:tắt máy|tat may|shutdown)\s+sau\s+(\d+)\s*(giờ|gio|hour|hours)$",
+    ]
 
-    if not match:
-        return None
+    for pattern in patterns:
+        match = re.fullmatch(pattern, command_clean, re.IGNORECASE)
+        if not match:
+            continue
 
-    duration_text = re.sub(r"\s+", "", match.group(1).lower())
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
 
-    duration_match = re.fullmatch(
-        r"(?:(\d+)h)?(?:(\d+)p)?(?:(\d+)s)?",
-        duration_text,
-        re.IGNORECASE,
-    )
+        if amount <= 0:
+            return None
 
-    if not duration_match:
-        return None
+        if unit in {"giây", "giay", "second", "seconds"}:
+            return amount
 
-    hours_text, minutes_text, seconds_text = duration_match.groups()
+        if unit in {"phút", "phut", "minute", "minutes"}:
+            return amount * 60
 
-    if hours_text is None and minutes_text is None and seconds_text is None:
-        return None
+        if unit in {"giờ", "gio", "hour", "hours"}:
+            return amount * 3600
 
-    hours = int(hours_text or 0)
-    minutes = int(minutes_text or 0)
-    seconds = int(seconds_text or 0)
-
-    total_seconds = hours * 3600 + minutes * 60 + seconds
-
-    if total_seconds <= 0:
-        return None
-
-    return total_seconds
+    return None
 
 
-def format_deep_sleep_time(seconds):
-    """Hiển thị thời gian theo đúng ký hiệu h / p / s."""
-    parts = []
+def format_shutdown_time(seconds):
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600} giờ"
 
-    hours, remainder = divmod(int(seconds), 3600)
-    minutes, secs = divmod(remainder, 60)
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60} phút"
 
-    if hours:
-        parts.append(f"{hours}h")
-    if minutes:
-        parts.append(f"{minutes}p")
-    if secs:
-        parts.append(f"{secs}s")
-
-    return " ".join(parts) if parts else "0s"
+    return f"{seconds} giây"
 
 
-async def deep_sleep_after_delay(seconds):
-    """Đợi đủ thời gian rồi đưa Ubuntu vào Sleep sâu."""
-    global deep_sleep_task
+async def shutdown_after_delay(seconds):
+    """Đợi đủ thời gian rồi yêu cầu Ubuntu poweroff."""
+    global shutdown_task
 
     try:
         await asyncio.sleep(seconds)
+        print("Jarvis: Đã đến giờ. Đang tắt máy...")
 
-        print("Jarvis: Đã đến giờ. Đang chuyển Ubuntu sang Sleep sâu...")
-
-        # Hàm này đã có sẵn trong Jarvis và gọi systemctl suspend.
-        success = await asyncio.to_thread(deep_sleep_machine)
-
-        if not success:
-            print("Jarvis: Không thể đưa Ubuntu vào Sleep sâu.")
+        subprocess.Popen(
+            ["systemctl", "poweroff"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     except asyncio.CancelledError:
         raise
 
-    except Exception as error:
-        print(f"Jarvis: Lỗi khi hẹn Sleep sâu: {error}")
-
     finally:
-        deep_sleep_task = None
+        shutdown_task = None
 
 
-async def handle_deep_sleep_timer_command(command):
-    global deep_sleep_task
+async def handle_shutdown_command(command):
+    global shutdown_task
 
-    command_lower = re.sub(r"\s+", " ", command.strip().lower())
+    command_lower = command.strip().lower()
 
     cancel_commands = {
-        "hủy sleep sâu",
-        "huy sleep sau",
-        "hủy ngủ sâu",
-        "huy ngu sau",
-        "hủy suspend",
-        "huy suspend",
-        "cancel sleep sâu",
-        "cancel deep sleep",
+        "hủy tắt máy",
+        "huy tat may",
+        "hủy shutdown",
+        "huy shutdown",
+        "cancel shutdown",
     }
 
     status_commands = {
-        "lịch sleep sâu",
-        "lich sleep sau",
-        "lịch ngủ sâu",
-        "lich ngu sau",
-        "sleep sâu status",
-        "deep sleep status",
+        "lịch tắt máy",
+        "lich tat may",
+        "shutdown status",
     }
 
     if command_lower in cancel_commands:
-        if deep_sleep_task is None or deep_sleep_task.done():
-            message = "ℹ️ Hiện không có lịch Sleep sâu."
+        if shutdown_task is None or shutdown_task.done():
+            message = "ℹ️ Hiện không có lịch tắt máy."
             print(f"Jarvis: {message}")
             set_command_response(message)
             return True
 
-        deep_sleep_task.cancel()
-        deep_sleep_task = None
+        shutdown_task.cancel()
+        shutdown_task = None
 
-        message = "✅ Đã hủy lịch Sleep sâu."
+        message = "✅ Đã hủy lịch tắt máy."
         print(f"Jarvis: {message}")
         set_command_response(message)
         return True
 
     if command_lower in status_commands:
-        if deep_sleep_task is None or deep_sleep_task.done():
-            message = "ℹ️ Hiện không có lịch Sleep sâu."
+        if shutdown_task is None or shutdown_task.done():
+            message = "ℹ️ Hiện không có lịch tắt máy."
         else:
-            message = "⏱️ Đang có một lịch Sleep sâu hoạt động."
+            message = "⏱️ Đang có một lịch tắt máy hoạt động."
 
         print(f"Jarvis: {message}")
         set_command_response(message)
         return True
 
-    seconds = parse_deep_sleep_delay(command)
+    seconds = parse_shutdown_delay(command)
     if seconds is None:
         return False
 
-    if deep_sleep_task is not None and not deep_sleep_task.done():
-        deep_sleep_task.cancel()
+    if shutdown_task is not None and not shutdown_task.done():
+        shutdown_task.cancel()
 
-    deep_sleep_task = asyncio.create_task(deep_sleep_after_delay(seconds))
+    shutdown_task = asyncio.create_task(shutdown_after_delay(seconds))
 
-    duration_text = format_deep_sleep_time(seconds)
-    message = f"⏱️ Đã đặt lịch Sleep sâu sau {duration_text}."
+    duration_text = format_shutdown_time(seconds)
+    message = f"⏱️ Đã đặt lịch tắt máy sau {duration_text}."
     print(f"Jarvis: {message}")
     set_command_response(message)
     return True
@@ -2814,16 +2680,6 @@ def show_help():
     print("  google sekiro")
     print("  tìm google transistor")
     print()
-    print("  mở chatgpt học")
-    print("  mở chatgpt cá nhân")
-    print("  mở gmail học")
-    print("  mở drive học")
-    print("  mở calendar học")
-    print("  mở github học")
-    print("  mở github cá nhân")
-    print("  mở chrome học")
-    print("  mở chrome cá nhân")
-    print()
     print("  mở github")
     print("  mở vscode")
     print("  mở terminal")
@@ -2858,14 +2714,14 @@ def show_help():
     print("  tắt tiếng")
     print("  bật tiếng")
     print()
+    print("  tắt máy sau 30 phút")
+    print("  tắt máy sau 2 giờ")
+    print("  shutdown sau 90 giây")
+    print("  hủy tắt máy")
+    print("  lịch tắt máy")
+    print()
     print("  sleep           # chỉ tắt màn hình, nhạc vẫn chạy")
-    print("  sleep sâu       # Sleep sâu ngay lập tức")
-    print("  sleep sâu sau 1h")
-    print("  sleep sâu sau 30p")
-    print("  sleep sâu sau 45s")
-    print("  sleep sâu sau 1h30p")
-    print("  hủy sleep sâu")
-    print("  lịch sleep sâu")
+    print("  sleep sâu       # suspend toàn máy")
     print("  tắt màn hình")
     print()
     print("  thoát")
@@ -2885,10 +2741,10 @@ async def route_command(command):
         return True
 
     # ------------------------------------------------------
-    # HẸN GIỜ SLEEP SÂU / SUSPEND
+    # HẸN GIỜ TẮT MÁY
     # ------------------------------------------------------
 
-    if await handle_deep_sleep_timer_command(command):
+    if await handle_shutdown_command(command):
         return True
 
     # ------------------------------------------------------
@@ -2920,13 +2776,6 @@ async def route_command(command):
     # ------------------------------------------------------
 
     if handle_volume_command(command):
-        return True
-
-    # ------------------------------------------------------
-    # MỞ NHANH WEBSITE TRONG CHROME THEO PROFILE
-    # ------------------------------------------------------
-
-    if handle_chrome_shortcut(command):
         return True
 
 
