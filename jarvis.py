@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+from difflib import SequenceMatcher
 import json
 import os
 import re
@@ -15,6 +16,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from jarvis_core.runtime import JarvisCore
+from jarvis_core.text import normalize_text as normalize_core_text
 from jarvis_core.window_manager import (
     ChromeWindowManager,
     FileWindowManager,
@@ -358,7 +360,7 @@ def handle_chrome_shortcut(command):
       mở github cá nhân
       mở chrome học
     """
-    command_clean = re.sub(r"\s+", " ", command.strip().lower())
+    command_clean = normalize_core_text(command)
 
     if not re.match(r"^(?:mở|mo|vào|vao)(?:\s+tab)?\s+", command_clean):
         return False
@@ -528,7 +530,15 @@ async def extract_videos_from_page(session, limit=10):
                 const videoId = u.searchParams.get('v');
                 if (!videoId) continue;
 
-                const url = `https://www.youtube.com/watch?v=${videoId}`;
+                // Giữ ngữ cảnh playlist/mix. Trước đây Jarvis chỉ giữ `v`,
+                // làm mất `list` và `index`, nên video kế tiếp ra ngoài playlist.
+                const target = new URL('/watch', location.origin);
+                target.searchParams.set('v', videoId);
+                for (const key of ['list', 'index', 'start_radio']) {
+                    const value = u.searchParams.get(key);
+                    if (value) target.searchParams.set(key, value);
+                }
+                const url = target.href;
                 const title = (
                     a.getAttribute('title') ||
                     a.textContent ||
@@ -950,6 +960,7 @@ async def refresh_youtube_videos():
 
 async def open_video(number):
     global youtube_videos
+    global youtube_page_id
 
     if not youtube_videos:
         print()
@@ -977,6 +988,19 @@ async def open_video(number):
             print('Jarvis: Dùng "làm mới youtube" để cập nhật danh sách.')
             return
 
+        if youtube_page_id is None:
+            youtube_page_id = await find_youtube_page(session)
+        if youtube_page_id is None:
+            message = "❌ Không tìm thấy tab YouTube để mở video."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return
+
+        await session.call_tool(
+            "select_page",
+            arguments={"pageId": youtube_page_id, "bringToFront": True},
+        )
+
         await session.call_tool(
             "navigate_page",
             arguments={
@@ -984,7 +1008,9 @@ async def open_video(number):
                 "url": selected_url,
             },
         )
-        print("Jarvis: Đã mở video.")
+        message = f"▶️ Đã mở video: {selected_title}"
+        print(f"Jarvis: {message}")
+        set_command_response(message)
 
     except Exception as error:
         print("Jarvis: Không thể nhấn vào video.")
@@ -1031,11 +1057,78 @@ async def open_video_by_name(query):
                 "url": selected_url,
             },
         )
-        print("Jarvis: Đã mở video.")
+        message = f"▶️ Đã mở video: {selected_video['title']}"
+        print(f"Jarvis: {message}")
+        set_command_response(message)
 
     except Exception as error:
         print("Jarvis: Không thể nhấn vào video.")
         print(f"Jarvis: Chi tiết: {error}")
+
+
+async def control_youtube_playback(should_play):
+    """Pause or resume the HTML5 player in Jarvis' current YouTube tab."""
+    global youtube_page_id
+
+    try:
+        session = await get_mcp_session()
+        if youtube_page_id is None:
+            youtube_page_id = await find_youtube_page(session)
+        if youtube_page_id is None:
+            message = "❌ Không tìm thấy tab YouTube đang mở."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return False
+
+        await session.call_tool(
+            "select_page",
+            arguments={"pageId": youtube_page_id, "bringToFront": True},
+        )
+
+        action = "play" if should_play else "pause"
+        script = f'''async () => {{
+            const video = document.querySelector('video.html5-main-video, video');
+            if (!video) return {{ok: false, error: 'Không tìm thấy trình phát video.'}};
+            try {{
+                if ('{action}' === 'play') {{
+                    await video.play();
+                }} else {{
+                    video.pause();
+                }}
+                return {{
+                    ok: true,
+                    paused: video.paused,
+                    title: document.title.replace(/\\s*-\\s*YouTube\\s*$/, '').trim()
+                }};
+            }} catch (error) {{
+                return {{ok: false, error: String(error)}};
+            }}
+        }}'''
+        result = await session.call_tool(
+            "evaluate_script",
+            arguments={"function": script},
+        )
+        state = _json_from_mcp_result(result, default={})
+        if not isinstance(state, dict) or not state.get("ok"):
+            detail = state.get("error") if isinstance(state, dict) else None
+            message = f"❌ Không thể điều khiển video{f': {detail}' if detail else '.'}"
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return False
+
+        title = clean_title(str(state.get("title", "")))
+        if should_play:
+            message = f"▶️ Đã phát tiếp video{f': {title}' if title else '.'}"
+        else:
+            message = f"⏸️ Đã dừng video{f': {title}' if title else '.'}"
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return True
+    except Exception as error:
+        message = f"❌ Không thể điều khiển video YouTube: {error}"
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
 
 
 # ==========================================================
@@ -2569,6 +2662,8 @@ def parse_deep_sleep_delay(command):
     """
     Hiểu các lệnh dạng:
       sleep sâu sau 1h
+      đặt lịch sleep sâu sau 1 giờ
+      hẹn sleep sâu sau 30 phút
       sleep sâu sau 30p
       sleep sâu sau 45s
       sleep sâu sau 1h30p
@@ -2579,10 +2674,11 @@ def parse_deep_sleep_delay(command):
       p = phút
       s = giây
     """
-    command_clean = re.sub(r"\s+", " ", command.strip().lower())
+    command_clean = normalize_core_text(command)
 
     match = re.fullmatch(
-        r"(?:sleep sâu|sleep sau|ngủ sâu|ngu sau|suspend)(?:\s+sau)?\s+(.+)",
+        r"(?:(?:dat lich|dat|hen gio|hen)\s+)?"
+        r"(?:sleep sau|ngu sau|suspend)(?:\s+(?:sau|after))?\s+(.+)",
         command_clean,
         re.IGNORECASE,
     )
@@ -2590,7 +2686,16 @@ def parse_deep_sleep_delay(command):
     if not match:
         return None
 
-    duration_text = re.sub(r"\s+", "", match.group(1).lower())
+    duration_text = match.group(1).lower()
+    # Chấp nhận cả ký hiệu ngắn và đơn vị tiếng Việt/Anh.
+    unit_aliases = (
+        (r"(?:gio|tieng|hours?|hrs?)", "h"),
+        (r"(?:phut|minutes?|mins?)", "p"),
+        (r"(?:giay|seconds?|secs?)", "s"),
+    )
+    for pattern, replacement in unit_aliases:
+        duration_text = re.sub(pattern, replacement, duration_text)
+    duration_text = re.sub(r"\s+", "", duration_text)
 
     duration_match = re.fullmatch(
         r"(?:(\d+)h)?(?:(\d+)p)?(?:(\d+)s)?",
@@ -2663,25 +2768,22 @@ async def deep_sleep_after_delay(seconds):
 async def handle_deep_sleep_timer_command(command):
     global deep_sleep_task
 
-    command_lower = re.sub(r"\s+", " ", command.strip().lower())
+    # So khớp trên chuỗi bỏ dấu để mọi cách gõ "hủy/huỷ/huy" và
+    # "sâu/sau" đều chạy cùng một lệnh thay vì rơi xuống phần gợi ý.
+    command_lower = normalize_core_text(command)
 
     cancel_commands = {
-        "hủy sleep sâu",
         "huy sleep sau",
-        "hủy ngủ sâu",
         "huy ngu sau",
-        "hủy suspend",
         "huy suspend",
-        "cancel sleep sâu",
+        "cancel sleep sau",
         "cancel deep sleep",
     }
 
     status_commands = {
-        "lịch sleep sâu",
         "lich sleep sau",
-        "lịch ngủ sâu",
         "lich ngu sau",
-        "sleep sâu status",
+        "sleep sau status",
         "deep sleep status",
     }
 
@@ -2712,6 +2814,19 @@ async def handle_deep_sleep_timer_command(command):
 
     seconds = parse_deep_sleep_delay(command)
     if seconds is None:
+        incomplete_timer = re.match(
+            r"(?:(?:dat lich|dat|hen gio|hen)\s+)?"
+            r"(?:sleep sau|ngu sau|suspend)(?:\s+(?:sau|after))?(?:\s|$)",
+            command_lower,
+        )
+        if incomplete_timer:
+            message = (
+                "ℹ️ Thời gian Sleep chưa đầy đủ hoặc chưa hợp lệ. Ví dụ: "
+                "`đặt lịch sleep sâu sau 1 giờ` hoặc `sleep sâu sau 30p`."
+            )
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return True
         return False
 
     if deep_sleep_task is not None and not deep_sleep_task.done():
@@ -2920,6 +3035,8 @@ def show_help():
     print("  mở video 1")
     print("  mở video 2")
     print("  mở video sekiro")
+    print("  dừng video")
+    print("  phát tiếp video")
     print("  làm mới youtube")
     print("  quay lại youtube")
     print("  hiện youtube")
@@ -3008,6 +3125,21 @@ def show_help():
     print("  tắt màn hình")
     print()
     print("  thoát")
+
+    # Terminal nhận danh sách chi tiết phía trên; Discord cần một phản hồi được
+    # lưu riêng, nếu không bot chỉ gửi câu mặc định "đã xử lý lệnh".
+    set_command_response(
+        "🧰 **JARVIS CÓ THỂ**\n\n"
+        "🌐 **Web:** mở/tìm YouTube, Google, ChatGPT, Gmail, Drive, "
+        "Calendar và GitHub theo profile học hoặc cá nhân.\n"
+        "🖥️ **Ứng dụng:** mở/đóng VS Code, Terminal, Chrome và hiện desktop.\n"
+        "📁 **File:** tìm/mở file, thư mục, project và xem file gần đây.\n"
+        "🧠 **Bộ nhớ:** ghi nhớ, nhớ lại, xem hoặc quên thông tin.\n"
+        "📊 **Hệ thống:** xem CPU, RAM, ổ đĩa và uptime.\n"
+        "🔊 **Âm thanh:** xem, tăng, giảm, đặt âm lượng và bật/tắt tiếng.\n"
+        "🌙 **Nguồn:** tắt màn hình, Sleep sâu, đặt hoặc hủy lịch Sleep.\n\n"
+        "Gõ `help` trên Terminal để xem toàn bộ cú pháp và ví dụ."
+    )
     print()
 
 
@@ -3015,29 +3147,212 @@ def show_help():
 # COMMAND ROUTER
 # ==========================================================
 
-def _command_from_local_ai_decision(decision):
+def _command_from_local_ai_decision(decision, original_command):
     """Map an AI decision onto an existing, reviewed Jarvis command."""
     action = decision.get("action")
     args = decision.get("args", {})
     profile_names = {"study": "học", "personal": "cá nhân"}
+    plain = normalize_core_text(original_command)
 
     if action == "open_site":
         site = str(args.get("site", "")).lower()
         profile = profile_names.get(str(args.get("profile", "")).lower())
-        if site in CHROME_SHORTCUTS and profile:
+        # Không thực thi khi AI chỉ đoán một tên site bị gõ sai.
+        if site in CHROME_SHORTCUTS and site in plain and profile:
             return f"mở {site} {profile}"
     elif action == "close_chrome":
         profile = profile_names.get(str(args.get("profile", "")).lower())
-        if profile:
+        if profile and ("chrome" in plain or "trinh duyet" in plain):
             return f"tắt chrome {profile}"
     elif action == "open_vscode":
-        return "mở vscode"
+        if "vscode" in plain or "visual studio code" in plain:
+            return "mở vscode"
     elif action == "close_vscode":
-        return "tắt vscode"
+        if "vscode" in plain or "visual studio code" in plain:
+            return "tắt vscode"
     elif action == "show_desktop":
-        return "hiện desktop"
+        if "desktop" in plain:
+            return "hiện desktop"
     elif action == "system_status":
-        return "tình trạng hệ thống"
+        status_terms = ("tinh trang", "he thong", "cpu", "ram", "o dia", "uptime")
+        if any(term in plain for term in status_terms):
+            return "tình trạng hệ thống"
+    return None
+
+
+def _suggest_local_ai_command(decision):
+    """Turn an uncertain AI action into a confirmation instead of executing it."""
+    action = decision.get("action")
+    args = decision.get("args", {})
+    profile = "học" if args.get("profile") == "study" else "cá nhân"
+    if action == "open_site" and args.get("site") in CHROME_SHORTCUTS:
+        site = args["site"]
+        return f"🤔 Có phải bạn muốn `mở {site} {profile}`?"
+    if action == "close_chrome":
+        return f"🤔 Có phải bạn muốn `tắt chrome {profile}`?"
+    suggestions = {
+        "open_vscode": "mở vscode",
+        "close_vscode": "tắt vscode",
+        "show_desktop": "hiện desktop",
+        "system_status": "tình trạng hệ thống",
+    }
+    if action in suggestions:
+        return f"🤔 Có phải bạn muốn `{suggestions[action]}`?"
+    return None
+
+
+COMMAND_SUGGESTION_CATALOG = (
+    # Trợ giúp
+    ("help", "help"),
+    ("tro giup", "help"),
+    ("chuc nang", "help"),
+    # YouTube và tìm kiếm web
+    ("mo youtube", "mở youtube học"),
+    ("mo youtube hoc", "mở youtube học"),
+    ("mo youtube ca nhan", "mở youtube cá nhân"),
+    ("mo video", "mở video <số hoặc tên>"),
+    ("dung video", "dừng video"),
+    ("tam dung video", "dừng video"),
+    ("pause video", "dừng video"),
+    ("phat tiep video", "phát tiếp video"),
+    ("tiep tuc video", "phát tiếp video"),
+    ("resume video", "phát tiếp video"),
+    ("lam moi youtube", "làm mới youtube"),
+    ("quay lai youtube", "quay lại youtube"),
+    ("hien youtube", "hiện youtube"),
+    ("tat youtube", "tắt youtube"),
+    ("dong youtube", "đóng youtube"),
+    ("tim youtube", "tìm youtube <nội dung>"),
+    ("tim video", "tìm video <nội dung>"),
+    ("trang chu youtube", "trang chủ youtube"),
+    ("home youtube", "home youtube"),
+    ("google", "google <nội dung>"),
+    ("tim google", "tìm google <nội dung>"),
+    # Website theo Chrome profile
+    ("mo chatgpt hoc", "mở chatgpt học"),
+    ("mo chatgpt ca nhan", "mở chatgpt cá nhân"),
+    ("mo gmail hoc", "mở gmail học"),
+    ("mo gmail ca nhan", "mở gmail cá nhân"),
+    ("mo drive hoc", "mở drive học"),
+    ("mo drive ca nhan", "mở drive cá nhân"),
+    ("mo calendar hoc", "mở calendar học"),
+    ("mo calendar ca nhan", "mở calendar cá nhân"),
+    ("mo github hoc", "mở github học"),
+    ("mo github ca nhan", "mở github cá nhân"),
+    ("mo chrome hoc", "mở chrome học"),
+    ("mo chrome ca nhan", "mở chrome cá nhân"),
+    ("tat chrome hoc", "tắt chrome học"),
+    ("tat chrome ca nhan", "tắt chrome cá nhân"),
+    # Ứng dụng và cửa sổ
+    ("mo github", "mở github"),
+    ("mo vscode", "mở vscode"),
+    ("tat vscode", "tắt vscode"),
+    ("mo terminal", "mở terminal"),
+    ("tat chrome", "tắt chrome <học hoặc cá nhân>"),
+    ("tat file manager", "tắt file manager"),
+    ("tat tat ca", "tắt tất cả"),
+    # Thư mục, file và project
+    ("mo downloads", "mở downloads"),
+    ("mo documents", "mở documents"),
+    ("mo pictures", "mở pictures"),
+    ("mo home", "mở home"),
+    ("tim file", "tìm file <tên>"),
+    ("tim tep", "tìm file <tên>"),
+    ("mo file", "mở file <tên hoặc số>"),
+    ("mo tep", "mở file <tên hoặc số>"),
+    ("tat file", "tắt file"),
+    ("tim thu muc", "tìm thư mục <tên>"),
+    ("mo thu muc", "mở thư mục <tên hoặc số>"),
+    ("tat thu muc", "tắt thư mục"),
+    ("tim project", "tìm thư mục <tên project>"),
+    ("mo project", "mở thư mục <tên project>"),
+    ("tat project", "tắt project"),
+    ("tim thong minh", "tìm thông minh <tên>"),
+    ("file gan day", "file gần đây"),
+    # Bộ nhớ
+    ("ghi nho", "ghi nhớ <nội dung>"),
+    ("nho rang", "ghi nhớ <nội dung>"),
+    ("nho lai", "nhớ lại <từ khóa>"),
+    ("xem bo nho", "xem bộ nhớ"),
+    ("quen", "quên <từ khóa>"),
+    ("xoa bo nho", "quên <từ khóa>"),
+    # Hệ thống và desktop
+    ("tinh trang he thong", "tình trạng hệ thống"),
+    ("kiem tra he thong", "tình trạng hệ thống"),
+    ("kiem tra may", "tình trạng hệ thống"),
+    ("hien desktop", "hiện desktop"),
+    ("ve desktop", "về desktop"),
+    ("ra desktop", "ra desktop"),
+    # Âm lượng
+    ("am luong", "âm lượng"),
+    ("am luong hien tai", "âm lượng hiện tại"),
+    ("dat am luong", "âm lượng <0-100>"),
+    ("tang am luong", "tăng âm lượng <số>"),
+    ("giam am luong", "giảm âm lượng <số>"),
+    ("tat tieng", "tắt tiếng"),
+    ("bat tieng", "bật tiếng"),
+    # Màn hình và Sleep
+    ("sleep man hinh", "sleep màn hình"),
+    ("tat man hinh", "tắt màn hình"),
+    ("mo man hinh", "mở màn hình"),
+    ("bat man hinh", "bật màn hình"),
+    ("sleep sau", "sleep sâu"),
+    ("ngu sau", "sleep sâu"),
+    ("suspend", "sleep sâu"),
+    ("sleep sau sau", "sleep sâu sau <thời gian>"),
+    ("hen sleep sau", "sleep sâu sau <thời gian>"),
+    ("dat lich sleep sau", "đặt lịch sleep sâu sau <thời gian>"),
+    ("hen gio sleep sau", "hẹn giờ sleep sâu sau <thời gian>"),
+    ("huy sleep sau", "hủy sleep sâu"),
+    ("cancel sleep", "hủy sleep sâu"),
+    ("lich sleep sau", "lịch sleep sâu"),
+    ("sleep status", "lịch sleep sâu"),
+    # Thoát chỉ dùng trực tiếp trên Ubuntu; Discord sẽ tiếp tục chặn lệnh này.
+    ("thoat", "thoát"),
+    ("tam biet", "thoát"),
+)
+
+
+def _suggest_known_command(command):
+    """Suggest a reviewed command for questions, incomplete input, and typos."""
+    plain = normalize_core_text(command)
+    words = plain.split()
+
+    def has_word_like(target, threshold=0.72):
+        return any(SequenceMatcher(None, word, target).ratio() >= threshold for word in words)
+
+    mentions_sleep = has_word_like("sleep") or "ngu sau" in plain or "suspend" in plain
+    wants_cancel = (
+        has_word_like("huy")
+        or "cancel" in words
+        or "dung lai" in plain
+        or "ngung" in words
+        or "bo lich" in plain
+    )
+    if mentions_sleep and wants_cancel:
+        return (
+            "💡 Để hủy lịch Sleep của máy, hãy gõ `hủy sleep sâu`. "
+            "Nếu chưa đặt lịch, Jarvis sẽ báo không có lịch Sleep sâu."
+        )
+
+    # Bỏ các từ thường dùng khi người dùng đang hỏi cách viết một lệnh.
+    candidate = re.sub(
+        r"^(?:jarvis\s+)?(?:toi quen lenh|quen mat lenh|toi quen|quen mat|lenh|toi muon|lam sao de|cach|cho toi hoi)\s+",
+        "",
+        plain,
+    ).strip()
+    best_command = None
+    best_score = 0.0
+    for alias, canonical in COMMAND_SUGGESTION_CATALOG:
+        full_score = SequenceMatcher(None, candidate, alias).ratio()
+        prefix = candidate[:min(len(candidate), len(alias) + 2)]
+        prefix_score = SequenceMatcher(None, prefix, alias).ratio()
+        score = max(full_score, prefix_score)
+        if score > best_score:
+            best_command = canonical
+            best_score = score
+    if best_command is not None and best_score >= 0.74:
+        return f"🤔 Có phải bạn muốn dùng lệnh `{best_command}`?"
     return None
 
 
@@ -3173,6 +3488,29 @@ async def route_command(command, *, allow_local_ai=True):
     if video_name_match:
         query = video_name_match.group(1).strip()
         await open_video_by_name(query)
+        return True
+
+
+    # ------------------------------------------------------
+    # DỪNG / PHÁT TIẾP VIDEO YOUTUBE
+    # ------------------------------------------------------
+
+    if command_lower in {
+        "dừng video", "dung video",
+        "tạm dừng video", "tam dung video",
+        "pause video", "pause youtube",
+    }:
+        await control_youtube_playback(False)
+        return True
+
+    if command_lower in {
+        "phát tiếp video", "phat tiep video",
+        "tiếp tục video", "tiep tuc video",
+        "phát video", "phat video",
+        "resume video", "resume youtube",
+        "play video", "play youtube",
+    }:
+        await control_youtube_playback(True)
         return True
 
 
@@ -3575,10 +3913,35 @@ async def route_command(command, *, allow_local_ai=True):
         "tro giup",
         "giúp",
         "giup",
+        "có chức năng gì",
+        "co chuc nang gi",
+        "bạn có chức năng gì",
+        "ban co chuc nang gi",
+        "jarvis có chức năng gì",
+        "jarvis co chuc nang gi",
+        "bạn làm được gì",
+        "ban lam duoc gi",
+        "jarvis làm được gì",
+        "jarvis lam duoc gi",
+        "bạn có thể làm gì",
+        "ban co the lam gi",
+        "jarvis có thể làm gì",
+        "jarvis co the lam gi",
+        "làm gì",
+        "lam gi",
     }:
 
         show_help()
 
+        return True
+
+
+    # Chỉ gợi ý sau khi toàn bộ lệnh chính xác đã được thử. Nếu đặt phần này
+    # sớm hơn, lệnh đúng như "mở youtube cá nhân" sẽ bị hỏi lại thay vì chạy.
+    known_suggestion = _suggest_known_command(command)
+    if known_suggestion:
+        print(f"Jarvis: {known_suggestion}")
+        set_command_response(known_suggestion)
         return True
 
 
@@ -3587,7 +3950,10 @@ async def route_command(command, *, allow_local_ai=True):
     # ------------------------------------------------------
 
     if not allow_local_ai:
-        message = "❌ AI local đã chọn một thao tác không hợp lệ."
+        message = (
+            "🤔 Tôi chưa chắc bạn muốn thực hiện lệnh nào. "
+            "Hãy viết rõ hơn hoặc gõ `help` để xem các lệnh mẫu."
+        )
         print(f"Jarvis: {message}")
         set_command_response(message)
         return True
@@ -3601,12 +3967,13 @@ async def route_command(command, *, allow_local_ai=True):
             "Hãy kiểm tra dịch vụ Ollama bằng lệnh `ollama list`."
         )
     else:
-        routed_command = _command_from_local_ai_decision(decision)
+        routed_command = _command_from_local_ai_decision(decision, command)
         if routed_command:
             print(f"Jarvis: AI hiểu lệnh là: {routed_command}")
             return await route_command(routed_command, allow_local_ai=False)
-        local_answer = decision.get("reply") or (
-            "Tôi chưa thể thực hiện yêu cầu đó bằng các công cụ an toàn hiện có."
+        local_answer = decision.get("reply") or _suggest_local_ai_command(decision) or (
+            "🤔 Tôi chưa hiểu rõ lệnh đó. Hãy viết lại cụ thể hơn hoặc gõ "
+            "`help` để xem các lệnh mẫu."
         )
     print(f"Jarvis: {local_answer}")
     set_command_response(local_answer)
