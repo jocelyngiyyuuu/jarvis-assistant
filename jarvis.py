@@ -2480,7 +2480,8 @@ def handle_volume_command(command):
 
     # Tăng âm lượng; mặc định +5%
     increase_match = re.fullmatch(
-        r"(?:tăng\s+âm\s+lượng|tang\s+am\s+luong|volume\s+up)(?:\s+(\d{1,3})%?)?",
+        r"(?:tăng\s+âm\s+lượng|tang\s+am\s+luong|volume\s+up|tăng|tang)"
+        r"(?:\s+(\d{1,3})%?)?",
         command_clean,
         re.IGNORECASE,
     )
@@ -2500,7 +2501,8 @@ def handle_volume_command(command):
 
     # Giảm âm lượng; mặc định -5%
     decrease_match = re.fullmatch(
-        r"(?:giảm\s+âm\s+lượng|giam\s+am\s+luong|volume\s+down)(?:\s+(\d{1,3})%?)?",
+        r"(?:giảm\s+âm\s+lượng|giam\s+am\s+luong|volume\s+down|giảm|giam)"
+        r"(?:\s+(\d{1,3})%?)?",
         command_clean,
         re.IGNORECASE,
     )
@@ -2980,8 +2982,10 @@ def show_help():
     print("  âm lượng 50")
     print("  tăng âm lượng")
     print("  tăng âm lượng 10")
+    print("  tăng / tăng 10       # dạng ngắn của tăng âm lượng")
     print("  giảm âm lượng")
     print("  giảm âm lượng 10")
+    print("  giảm / giảm 10       # dạng ngắn của giảm âm lượng")
     print("  tắt tiếng")
     print("  bật tiếng")
     print()
