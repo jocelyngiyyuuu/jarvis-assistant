@@ -15,7 +15,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from jarvis_core.runtime import JarvisCore
-from jarvis_core.window_manager import FileWindowManager
+from jarvis_core.window_manager import ChromeWindowManager, FileWindowManager
 
 
 VERSION = "1.1.0-modular-core"
@@ -40,6 +40,7 @@ STUDY_PROFILE = "Profile 1"
 BASE_DIR = Path(__file__).resolve().parent
 CORE = JarvisCore(BASE_DIR)
 FILE_WINDOWS = FileWindowManager()
+CHROME_WINDOWS = ChromeWindowManager()
 TTS_DIR = BASE_DIR / "tts"
 TTS_PYTHON = TTS_DIR / "VieNeu-TTS" / ".venv" / "bin" / "python"
 TTS_ENGINE = TTS_DIR / "tts_engine.py"
@@ -278,15 +279,18 @@ def choose_chrome_profile(command=""):
 # ==========================================================
 
 def open_chrome(profile, url):
+    previous_window_ids = CHROME_WINDOWS.snapshot_ids()
     subprocess.Popen(
         [
             "google-chrome",
             f"--profile-directory={profile}",
+            "--new-window",
             url,
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    return CHROME_WINDOWS.track_profile_window(profile, previous_window_ids)
 
 
 # ==========================================================
@@ -1840,6 +1844,7 @@ async def close_chrome():
     youtube_profile = None
     youtube_profile_name = None
     youtube_page_id = None
+    CHROME_WINDOWS.clear()
 
     return _terminate_processes(
         [
@@ -1848,6 +1853,28 @@ async def close_chrome():
         ],
         "Chrome",
     )
+
+
+async def close_chrome_profile(profile, profile_name):
+    """Chỉ đóng các cửa sổ của profile đã được Jarvis mở và theo dõi."""
+    global youtube_videos
+    global youtube_profile
+    global youtube_profile_name
+    global youtube_page_id
+
+    success, detail = CHROME_WINDOWS.close_profile(profile, profile_name)
+    if success and youtube_profile == profile:
+        await close_mcp_session()
+        youtube_videos = []
+        youtube_profile = None
+        youtube_profile_name = None
+        youtube_page_id = None
+
+    icon = "✅" if success else "❌"
+    message = f"{icon} {detail}"
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return True
 
 
 async def close_all_managed_apps():
@@ -2916,6 +2943,8 @@ def show_help():
     print("  mở terminal")
     print("  tắt vscode")
     print("  tắt chrome")
+    print("  tắt chrome cá nhân    # không tắt Chrome học")
+    print("  tắt chrome học        # không tắt Chrome cá nhân")
     print("  tắt file manager")
     print("  tắt tất cả      # giữ Terminal/Jarvis tiếp tục chạy")
     print()
@@ -3226,6 +3255,20 @@ async def route_command(command):
     # ------------------------------------------------------
     # TẮT CHROME
     # ------------------------------------------------------
+
+    chrome_profile_close = re.fullmatch(
+        r"(?:tắt|tat|đóng|dong|close)\s+(?:google\s+)?chrome\s+"
+        r"(cá\s*nhân|ca\s*nhan|personal|học|hoc|học\s*tập|hoc\s*tap|study)",
+        command_lower,
+        re.IGNORECASE,
+    )
+    if chrome_profile_close:
+        profile_word = chrome_profile_close.group(1)
+        if re.fullmatch(r"cá\s*nhân|ca\s*nhan|personal", profile_word, re.IGNORECASE):
+            await close_chrome_profile(PERSONAL_PROFILE, "Cá nhân")
+        else:
+            await close_chrome_profile(STUDY_PROFILE, "Học / ChatGPT")
+        return True
 
     if command_lower in {
         "tắt chrome",

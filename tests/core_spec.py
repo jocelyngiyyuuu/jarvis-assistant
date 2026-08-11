@@ -6,7 +6,7 @@ from jarvis_core.brain import NaturalLanguageRouter
 from jarvis_core.file_manager import SmartFileManager
 from jarvis_core.memory import MemoryStore
 from jarvis_core.monitoring import SystemMonitor
-from jarvis_core.window_manager import FileWindowManager
+from jarvis_core.window_manager import ChromeWindowManager, FileWindowManager
 
 
 class BrainTests(unittest.TestCase):
@@ -73,6 +73,13 @@ class WindowManagerTests(unittest.TestCase):
         manager.last_windows["folder"] = {"id": "0x2", "path": "/tmp/project", "title": "project"}
         self.assertEqual(manager.last_windows["file"]["id"], "0x1")
         self.assertEqual(manager.last_windows["folder"]["id"], "0x2")
+
+    def test_chrome_profiles_are_tracked_separately(self):
+        manager = ChromeWindowManager()
+        manager.profile_windows["Default"] = [{"id": "0x1", "title": "Personal"}]
+        manager.profile_windows["Profile 1"] = [{"id": "0x2", "title": "Study"}]
+        manager.clear()
+        self.assertEqual(manager.profile_windows, {})
 
 
 if __name__ == "__main__":

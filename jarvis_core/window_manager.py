@@ -101,3 +101,62 @@ class FileWindowManager:
 
     def close_last_folder(self):
         return self.close_last("folder")
+
+
+class ChromeWindowManager(FileWindowManager):
+    """Track Chrome windows separately for each profile used by Jarvis."""
+
+    def __init__(self):
+        super().__init__()
+        self.profile_windows = {}
+
+    def track_profile_window(self, profile, previous_ids, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        candidates = []
+        while time.monotonic() < deadline:
+            candidates = [
+                window for window in self.list_windows()
+                if window["id"] not in previous_ids
+            ]
+            if len(candidates) == 1:
+                break
+            time.sleep(0.15)
+        if len(candidates) != 1:
+            return False
+        tracked = self.profile_windows.setdefault(profile, [])
+        if candidates[0]["id"] not in {window["id"] for window in tracked}:
+            tracked.append(candidates[0])
+        return True
+
+    def close_profile(self, profile, profile_name):
+        tracked = self.profile_windows.get(profile, [])
+        if not tracked:
+            return False, f"Không có cửa sổ Chrome {profile_name} nào do Jarvis theo dõi."
+
+        current_ids = {window["id"] for window in self.list_windows()}
+        closable = [window for window in tracked if window["id"] in current_ids]
+        if not closable:
+            self.profile_windows[profile] = []
+            return False, f"Các cửa sổ Chrome {profile_name} đã được đóng trước đó."
+
+        failed = 0
+        for window in closable:
+            try:
+                result = subprocess.run(
+                    ["wmctrl", "-ic", window["id"]],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=2,
+                )
+                failed += int(result.returncode != 0)
+            except (FileNotFoundError, subprocess.SubprocessError):
+                failed += 1
+
+        if failed:
+            return False, f"Không thể đóng riêng {failed} cửa sổ Chrome {profile_name}."
+        self.profile_windows[profile] = []
+        return True, f"Đã đóng {len(closable)} cửa sổ Chrome {profile_name} do Jarvis mở."
+
+    def clear(self):
+        self.profile_windows.clear()
