@@ -15,7 +15,11 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from jarvis_core.runtime import JarvisCore
-from jarvis_core.window_manager import ChromeWindowManager, FileWindowManager
+from jarvis_core.window_manager import (
+    ChromeWindowManager,
+    FileWindowManager,
+    chrome_profile_from_close_command,
+)
 
 
 VERSION = "1.1.0-modular-core"
@@ -283,6 +287,9 @@ def open_chrome(profile, url):
     subprocess.Popen(
         [
             "google-chrome",
+            # Jarvis đóng riêng từng profile bằng wmctrl. Trên phiên Wayland,
+            # buộc cửa sổ Chrome qua XWayland để wmctrl nhìn thấy window ID.
+            "--ozone-platform=x11",
             f"--profile-directory={profile}",
             "--new-window",
             url,
@@ -3008,7 +3015,33 @@ def show_help():
 # COMMAND ROUTER
 # ==========================================================
 
-async def route_command(command):
+def _command_from_local_ai_decision(decision):
+    """Map an AI decision onto an existing, reviewed Jarvis command."""
+    action = decision.get("action")
+    args = decision.get("args", {})
+    profile_names = {"study": "học", "personal": "cá nhân"}
+
+    if action == "open_site":
+        site = str(args.get("site", "")).lower()
+        profile = profile_names.get(str(args.get("profile", "")).lower())
+        if site in CHROME_SHORTCUTS and profile:
+            return f"mở {site} {profile}"
+    elif action == "close_chrome":
+        profile = profile_names.get(str(args.get("profile", "")).lower())
+        if profile:
+            return f"tắt chrome {profile}"
+    elif action == "open_vscode":
+        return "mở vscode"
+    elif action == "close_vscode":
+        return "tắt vscode"
+    elif action == "show_desktop":
+        return "hiện desktop"
+    elif action == "system_status":
+        return "tình trạng hệ thống"
+    return None
+
+
+async def route_command(command, *, allow_local_ai=True):
     command = command.strip()
 
     # Lõi module hóa xử lý memory, tìm file thông minh, natural-language
@@ -3260,15 +3293,9 @@ async def route_command(command):
     # TẮT CHROME
     # ------------------------------------------------------
 
-    chrome_profile_close = re.fullmatch(
-        r"(?:tắt|tat|đóng|dong|close)\s+(?:google\s+)?chrome\s+"
-        r"(cá\s*nhân|ca\s*nhan|personal|học|hoc|học\s*tập|hoc\s*tap|study)",
-        command_lower,
-        re.IGNORECASE,
-    )
+    chrome_profile_close = chrome_profile_from_close_command(command_lower)
     if chrome_profile_close:
-        profile_word = chrome_profile_close.group(1)
-        if re.fullmatch(r"cá\s*nhân|ca\s*nhan|personal", profile_word, re.IGNORECASE):
+        if chrome_profile_close == "personal":
             await close_chrome_profile(PERSONAL_PROFILE, "Cá nhân")
         else:
             await close_chrome_profile(STUDY_PROFILE, "Học / ChatGPT")
@@ -3556,15 +3583,33 @@ async def route_command(command):
 
 
     # ------------------------------------------------------
-    # KHÔNG HIỂU
+    # AI LOCAL (OLLAMA) - FALLBACK CHO HỘI THOẠI/LỆNH CHƯA NHẬN DIỆN
     # ------------------------------------------------------
 
-    unknown_message = (
-        "❓ Tôi chưa hiểu lệnh đó. "
-        'Gõ `help` để xem các lệnh hiện có.'
-    )
-    print(f"Jarvis: {unknown_message}")
-    set_command_response(unknown_message)
+    if not allow_local_ai:
+        message = "❌ AI local đã chọn một thao tác không hợp lệ."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return True
+
+    print(f"Jarvis: AI local ({CORE.local_ai.model}) đang phân tích...")
+    try:
+        decision = await asyncio.to_thread(CORE.local_ai.decide, command)
+    except RuntimeError as error:
+        local_answer = (
+            f"❌ {error} "
+            "Hãy kiểm tra dịch vụ Ollama bằng lệnh `ollama list`."
+        )
+    else:
+        routed_command = _command_from_local_ai_decision(decision)
+        if routed_command:
+            print(f"Jarvis: AI hiểu lệnh là: {routed_command}")
+            return await route_command(routed_command, allow_local_ai=False)
+        local_answer = decision.get("reply") or (
+            "Tôi chưa thể thực hiện yêu cầu đó bằng các công cụ an toàn hiện có."
+        )
+    print(f"Jarvis: {local_answer}")
+    set_command_response(local_answer)
 
     return True
 

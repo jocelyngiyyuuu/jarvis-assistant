@@ -1,5 +1,6 @@
 """Track and close individual desktop windows opened by Jarvis."""
 
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -17,15 +18,16 @@ class FileWindowManager:
     def _parse_windows(output):
         windows = []
         for line in output.splitlines():
+            # ``wmctrl -lx``: id, desktop, WM_CLASS, title.
             parts = line.split(None, 3)
             if len(parts) == 4:
-                windows.append({"id": parts[0], "title": parts[3]})
+                windows.append({"id": parts[0], "class": parts[2], "title": parts[3]})
         return windows
 
     def list_windows(self):
         try:
             result = subprocess.run(
-                ["wmctrl", "-l"], capture_output=True, text=True, check=False, timeout=2
+                ["wmctrl", "-lx"], capture_output=True, text=True, check=False, timeout=2
             )
         except (FileNotFoundError, subprocess.SubprocessError):
             return []
@@ -103,6 +105,26 @@ class FileWindowManager:
         return self.close_last("folder")
 
 
+def chrome_profile_from_close_command(command):
+    """Return the requested Chrome profile kind from a close command."""
+    match = re.fullmatch(
+        r"(?:tắt|tat|đóng|dong|close)\s+(?:google\s+)?chrome\s+"
+        r"(?:profile\s+)?("
+        r"cá\s*nhân|ca\s*nhan|personal|"
+        r"học(?:\s*tập)?(?:\s*/\s*chat\s*gpt)?|"
+        r"hoc(?:\s*tap)?(?:\s*/\s*chat\s*gpt)?|"
+        r"study|chat\s*gpt"
+        r")",
+        str(command).strip().lower(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    if re.fullmatch(r"cá\s*nhân|ca\s*nhan|personal", match.group(1), re.IGNORECASE):
+        return "personal"
+    return "study"
+
+
 class ChromeWindowManager(FileWindowManager):
     """Track Chrome windows separately for each profile used by Jarvis."""
 
@@ -110,22 +132,27 @@ class ChromeWindowManager(FileWindowManager):
         super().__init__()
         self.profile_windows = {}
 
-    def track_profile_window(self, profile, previous_ids, timeout=3.0):
+    def track_profile_window(self, profile, previous_ids, timeout=10.0):
         deadline = time.monotonic() + timeout
         candidates = []
         while time.monotonic() < deadline:
             candidates = [
                 window for window in self.list_windows()
                 if window["id"] not in previous_ids
+                and "chrome" in window.get("class", "").lower()
             ]
-            if len(candidates) == 1:
+            if candidates:
                 break
             time.sleep(0.15)
-        if len(candidates) != 1:
+        if not candidates:
             return False
+
+        # Chrome có thể tạo hơn một X11 window phụ trong lúc khởi động.
+        # Cửa sổ trình duyệt chính xuất hiện cuối danh sách wmctrl.
+        selected = candidates[-1]
         tracked = self.profile_windows.setdefault(profile, [])
-        if candidates[0]["id"] not in {window["id"] for window in tracked}:
-            tracked.append(candidates[0])
+        if selected["id"] not in {window["id"] for window in tracked}:
+            tracked.append(selected)
         return True
 
     def close_profile(self, profile, profile_name):

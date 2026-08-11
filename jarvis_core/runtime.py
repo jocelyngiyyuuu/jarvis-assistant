@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .brain import NaturalLanguageRouter
 from .file_manager import SmartFileManager
+from .local_ai import LocalAI
 from .memory import MemoryStore
 from .monitoring import SystemMonitor
 
@@ -15,6 +16,7 @@ class JarvisCore:
         self.memory = MemoryStore(base_dir / ".jarvis_data" / "memory.sqlite3")
         self.files = SmartFileManager([Path.home()])
         self.monitor = SystemMonitor(Path.home())
+        self.local_ai = LocalAI()
 
     def handle(self, command):
         intent = self.brain.detect(command)

@@ -8,3 +8,14 @@ mcp_errors.log
 .jarvis_data/
 *_backup*.py
 test_*.py
+tests/
+
+# Runtime-generated audio
+tts/output.wav
+tts/test_output.wav
+
+# Retired local implementations and entry points
+tts/OpenVoice/
+jarbis.py
+jarvis_before_discord.py
+jarvis_v1.0_discord.py
