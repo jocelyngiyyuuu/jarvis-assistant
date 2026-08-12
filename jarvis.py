@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
 import asyncio
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -16,6 +20,14 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from jarvis_core.runtime import JarvisCore
+from jarvis_core.help_catalog import (
+    HELP_CATEGORIES,
+    format_help_category,
+    format_help_overview,
+    format_recent_updates,
+    resolve_help_category,
+)
+from jarvis_core.security import classify_remote_command, redact_sensitive
 from jarvis_core.text import normalize_text as normalize_core_text
 from jarvis_core.window_manager import (
     ChromeWindowManager,
@@ -31,6 +43,19 @@ load_dotenv()
 discord_client = None
 discord_command_lock = asyncio.Lock()
 last_command_response = None
+ipc_server = None
+
+# Chỉ cho phép một process Jarvis hoạt động. Nếu Terminal và systemd cùng
+# khởi động Jarvis, mỗi process sẽ có event loop/timer riêng và có thể gửi hai
+# lệnh suspend độc lập.
+instance_lock_file = None
+
+# Chặn một timer/lệnh cũ gọi suspend lần nữa ngay sau khi máy resume. Python
+# monotonic clock không tính thời gian hệ thống nằm trong suspend, nên khoảng
+# bảo vệ này đo đúng thời gian máy thực sự hoạt động sau lần gọi trước.
+SUSPEND_COOLDOWN_SECONDS = 5 * 60
+suspend_request_lock = threading.Lock()
+last_suspend_request_monotonic = None
 
 # Kết quả tìm file/thư mục gần nhất để có thể chọn bằng số từ Terminal/Discord.
 file_search_results = []
@@ -45,6 +70,7 @@ STUDY_PROFILE = "Profile 1"
 
 BASE_DIR = Path(__file__).resolve().parent
 CORE = JarvisCore(BASE_DIR)
+IPC_SOCKET_PATH = Path(os.getenv("XDG_RUNTIME_DIR", "/tmp")) / f"jarvis-{os.getuid()}.sock"
 FILE_WINDOWS = FileWindowManager()
 CHROME_WINDOWS = ChromeWindowManager()
 TTS_DIR = BASE_DIR / "tts"
@@ -209,6 +235,66 @@ def speak_last_response():
     """Đọc phản hồi cuối mà route_command đã lưu cho Terminal/Discord."""
     if last_command_response:
         speak(last_command_response)
+
+
+# ==========================================================
+# IPC LOCAL - GTK DÙNG CHUNG PHIÊN JARVIS/DISCORD
+# ==========================================================
+
+async def _handle_ipc_client(reader, writer):
+    """Nhận từng lệnh JSON qua Unix socket và xử lý trong process Jarvis chính."""
+    global last_command_response
+    try:
+        while line := await reader.readline():
+            try:
+                request = json.loads(line.decode("utf-8"))
+                command = str(request.get("command", "")).strip()
+                source = str(request.get("source", "gtk")).strip() or "gtk"
+                if not command:
+                    raise ValueError("Lệnh không được để trống.")
+                CORE.conversation.add(source, "user", command)
+                async with discord_command_lock:
+                    last_command_response = None
+                    await route_command(command)
+                    response = last_command_response or "✅ Jarvis đã xử lý lệnh."
+                CORE.conversation.add(source, "assistant", response)
+                payload = {"ok": True, "response": response}
+            except Exception as error:
+                payload = {"ok": False, "response": f"Không thể xử lý lệnh: {error}"}
+            writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            await writer.drain()
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+
+
+async def start_ipc_server():
+    global ipc_server
+    try:
+        IPC_SOCKET_PATH.unlink(missing_ok=True)
+        ipc_server = await asyncio.start_unix_server(
+            _handle_ipc_client, path=str(IPC_SOCKET_PATH)
+        )
+        IPC_SOCKET_PATH.chmod(0o600)
+        print(f"Jarvis: GTK IPC sẵn sàng tại {IPC_SOCKET_PATH}")
+    except OSError as error:
+        ipc_server = None
+        print(f"Jarvis: Không thể mở GTK IPC: {error}")
+
+
+async def stop_ipc_server():
+    global ipc_server
+    if ipc_server is not None:
+        ipc_server.close()
+        await ipc_server.wait_closed()
+        ipc_server = None
+    try:
+        IPC_SOCKET_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ==========================================================
@@ -2656,6 +2742,18 @@ def handle_volume_command(command):
 # ==========================================================
 
 deep_sleep_task = None
+deep_sleep_target = None
+
+
+def _power_log(event, **details):
+    """Ghi dấu vết đủ để xác định Jarvis có phát yêu cầu suspend hay không."""
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    print(
+        f"JARVIS_POWER timestamp={timestamp} pid={os.getpid()} "
+        f"event={event}{(' ' + detail_text) if detail_text else ''}",
+        flush=True,
+    )
 
 
 def parse_deep_sleep_delay(command):
@@ -2723,6 +2821,29 @@ def parse_deep_sleep_delay(command):
     return total_seconds
 
 
+def parse_deep_sleep_clock(command, now=None):
+    """Đổi lệnh giờ đồng hồ thành thời điểm local tiếp theo và số giây chờ."""
+    command_clean = normalize_core_text(command)
+    match = re.fullmatch(
+        r"(?:(?:dat lich|dat|hen gio|hen)\s+)?"
+        r"(?:sleep sau|ngu sau|suspend)(?:\s+(?:luc|vao luc))?\s+"
+        r"(\d{1,2})(?:(?:[:h])\s*(\d{1,2}))?(?:\s*(?:gio))?",
+        command_clean,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    current = now or datetime.now().astimezone()
+    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= current:
+        target += timedelta(days=1)
+    return target, max(1, int((target - current).total_seconds()))
+
+
 def format_deep_sleep_time(seconds):
     """Hiển thị thời gian theo đúng ký hiệu h / p / s."""
     parts = []
@@ -2742,15 +2863,25 @@ def format_deep_sleep_time(seconds):
 
 async def deep_sleep_after_delay(seconds):
     """Đợi đủ thời gian rồi đưa Ubuntu vào Sleep sâu."""
-    global deep_sleep_task
+    global deep_sleep_task, deep_sleep_target
+
+    current_task = asyncio.current_task()
 
     try:
         await asyncio.sleep(seconds)
 
         print("Jarvis: Đã đến giờ. Đang chuyển Ubuntu sang Sleep sâu...")
 
-        # Hàm này đã có sẵn trong Jarvis và gọi systemctl suspend.
-        success = await asyncio.to_thread(deep_sleep_machine)
+        # Xóa lịch trước khi gọi systemctl. Khi process tiếp tục sau resume,
+        # timer đã tiêu thụ không thể còn xuất hiện như một lịch đang chạy.
+        if deep_sleep_task is current_task:
+            deep_sleep_task = None
+            deep_sleep_target = None
+
+        success = await asyncio.to_thread(
+            deep_sleep_machine,
+            source="timer",
+        )
 
         if not success:
             print("Jarvis: Không thể đưa Ubuntu vào Sleep sâu.")
@@ -2762,11 +2893,15 @@ async def deep_sleep_after_delay(seconds):
         print(f"Jarvis: Lỗi khi hẹn Sleep sâu: {error}")
 
     finally:
-        deep_sleep_task = None
+        # Một task cũ bị cancel có thể hoàn tất sau khi task mới đã được tạo.
+        # Chỉ task đang sở hữu biến toàn cục mới được phép xóa nó.
+        if deep_sleep_task is current_task:
+            deep_sleep_task = None
+            deep_sleep_target = None
 
 
 async def handle_deep_sleep_timer_command(command):
-    global deep_sleep_task
+    global deep_sleep_task, deep_sleep_target
 
     # So khớp trên chuỗi bỏ dấu để mọi cách gõ "hủy/huỷ/huy" và
     # "sâu/sau" đều chạy cùng một lệnh thay vì rơi xuống phần gợi ý.
@@ -2796,6 +2931,7 @@ async def handle_deep_sleep_timer_command(command):
 
         deep_sleep_task.cancel()
         deep_sleep_task = None
+        deep_sleep_target = None
 
         message = "✅ Đã hủy lịch Sleep sâu."
         print(f"Jarvis: {message}")
@@ -2806,13 +2942,20 @@ async def handle_deep_sleep_timer_command(command):
         if deep_sleep_task is None or deep_sleep_task.done():
             message = "ℹ️ Hiện không có lịch Sleep sâu."
         else:
-            message = "⏱️ Đang có một lịch Sleep sâu hoạt động."
+            target_text = (
+                deep_sleep_target.strftime("%H:%M ngày %d/%m/%Y")
+                if deep_sleep_target else "thời điểm đã đặt"
+            )
+            message = f"⏱️ Lịch Sleep sâu: {target_text}."
 
         print(f"Jarvis: {message}")
         set_command_response(message)
         return True
 
+    clock_schedule = parse_deep_sleep_clock(command)
     seconds = parse_deep_sleep_delay(command)
+    if clock_schedule is not None:
+        target, seconds = clock_schedule
     if seconds is None:
         incomplete_timer = re.match(
             r"(?:(?:dat lich|dat|hen gio|hen)\s+)?"
@@ -2822,7 +2965,7 @@ async def handle_deep_sleep_timer_command(command):
         if incomplete_timer:
             message = (
                 "ℹ️ Thời gian Sleep chưa đầy đủ hoặc chưa hợp lệ. Ví dụ: "
-                "`đặt lịch sleep sâu sau 1 giờ` hoặc `sleep sâu sau 30p`."
+                "`sleep sâu sau 30p` hoặc `sleep sâu lúc 23:30`."
             )
             print(f"Jarvis: {message}")
             set_command_response(message)
@@ -2833,9 +2976,16 @@ async def handle_deep_sleep_timer_command(command):
         deep_sleep_task.cancel()
 
     deep_sleep_task = asyncio.create_task(deep_sleep_after_delay(seconds))
-
-    duration_text = format_deep_sleep_time(seconds)
-    message = f"⏱️ Đã đặt lịch Sleep sâu sau {duration_text}."
+    if clock_schedule is not None:
+        deep_sleep_target = target
+        message = (
+            f"⏱️ Đã đặt Sleep sâu lúc {target.strftime('%H:%M ngày %d/%m/%Y')} "
+            f"(còn {format_deep_sleep_time(seconds)})."
+        )
+    else:
+        deep_sleep_target = datetime.now().astimezone() + timedelta(seconds=seconds)
+        duration_text = format_deep_sleep_time(seconds)
+        message = f"⏱️ Đã đặt lịch Sleep sâu sau {duration_text}."
     print(f"Jarvis: {message}")
     set_command_response(message)
     return True
@@ -2934,24 +3084,61 @@ def wake_screen():
         return False
 
 
-def deep_sleep_machine():
+def deep_sleep_machine(*, source="command"):
     """Suspend toàn máy. CPU/app/nhạc tạm dừng cho tới khi máy thức lại."""
-    try:
-        print("Jarvis: Đang đưa máy vào Sleep sâu...")
+    global last_suspend_request_monotonic
 
-        subprocess.Popen(
+    try:
+        with suspend_request_lock:
+            now = time.monotonic()
+            if last_suspend_request_monotonic is not None:
+                elapsed = now - last_suspend_request_monotonic
+                if elapsed < SUSPEND_COOLDOWN_SECONDS:
+                    remaining = int(SUSPEND_COOLDOWN_SECONDS - elapsed)
+                    _power_log(
+                        "suspend_blocked_cooldown",
+                        source=source,
+                        remaining_seconds=remaining,
+                    )
+                    print(
+                        "Jarvis: Đã chặn yêu cầu Sleep sâu lặp lại "
+                        f"({remaining}s bảo vệ còn lại)."
+                    )
+                    return False
+
+            # Đánh dấu trước khi gọi systemctl để mọi đường lệnh đồng thời đều
+            # bị chặn, kể cả khi systemctl chưa kịp chuyển máy sang suspend.
+            last_suspend_request_monotonic = now
+
+        print("Jarvis: Đang đưa máy vào Sleep sâu...")
+        _power_log("suspend_requested", source=source)
+
+        result = subprocess.run(
             ["systemctl", "suspend"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            check=False,
         )
 
-        return True
+        if result.returncode == 0:
+            _power_log("suspend_command_finished", source=source, returncode=0)
+            return True
+
+        _power_log(
+            "suspend_command_failed",
+            source=source,
+            returncode=result.returncode,
+        )
+        print(f"Jarvis: systemctl suspend thất bại (code {result.returncode}).")
+        return False
 
     except FileNotFoundError:
+        _power_log("suspend_command_missing", source=source)
         print("Jarvis: Không tìm thấy lệnh systemctl.")
         return False
 
     except Exception as error:
+        _power_log("suspend_command_error", source=source, error=repr(error))
         print(f"Jarvis: Không thể Sleep sâu: {error}")
         return False
 
@@ -3026,6 +3213,10 @@ def sleep_screen_only():
 
 def show_help():
     print()
+
+
+def _show_help_legacy():
+    """Danh sách đầy đủ cũ, giữ lại để tham khảo khi bảo trì."""
     print("Jarvis có thể:")
     print()
     print("  mở youtube")
@@ -3089,10 +3280,20 @@ def show_help():
     print("  mở thư mục <số>")
     print("  tìm thông minh <tên>  # xếp hạng theo độ khớp và độ mới")
     print("  file gần đây")
+    print("  file lớn nhất")
+    print("  quét file có thể dọn  # chỉ báo cáo, không tự xóa")
+    print("  file đang được sử dụng")
+    print("  phân tích file <đường dẫn>")
+    print("  dung lượng ổ đĩa")
+    print("  dung lượng thư mục <đường dẫn>")
     print()
     print("  ghi nhớ <nội dung>")
+    print("  ghi nhớ thiết bị: <nội dung>")
+    print("  ghi nhớ tạm thời 2 ngày: <nội dung>")
     print("  nhớ lại <từ khóa>")
     print("  xem bộ nhớ")
+    print("  cập nhật mục <ID> thành <nội dung>")
+    print("  quên mục <ID>")
     print("  quên <từ khóa>")
     print()
     print("  tình trạng hệ thống")
@@ -3141,6 +3342,15 @@ def show_help():
         "Gõ `help` trên Terminal để xem toàn bộ cú pháp và ví dụ."
     )
     print()
+
+
+def show_help_category(category_key):
+    """Hiển thị một nhóm trợ giúp; định nghĩa này thay thế help legacy dài."""
+    message = format_help_category(category_key)
+    print()
+    print(message.replace("**", "").replace("`", ""))
+    print()
+    set_command_response(message)
 
 
 # ==========================================================
@@ -3415,7 +3625,7 @@ async def route_command(command, *, allow_local_ai=True):
     # ------------------------------------------------------
 
     if is_deep_sleep_command(command):
-        if deep_sleep_machine():
+        if deep_sleep_machine(source="router"):
             set_command_response("😴 Ubuntu đang chuyển sang Sleep sâu.")
         else:
             set_command_response("❌ Jarvis không thể đưa Ubuntu vào Sleep sâu.")
@@ -3911,6 +4121,38 @@ async def route_command(command, *, allow_local_ai=True):
     # HELP
     # ------------------------------------------------------
 
+    whats_new_commands = {
+        "co gi moi", "chuc nang moi", "jarvis co gi moi",
+        "sau update ban co the lam nhung gi",
+        "sau update jarvis co the lam nhung gi",
+        "sau cap nhat ban co the lam nhung gi",
+        "ban vua update gi", "da update nhung gi",
+    }
+    if normalize_core_text(command) in whats_new_commands:
+        message = format_recent_updates()
+        print()
+        print(message.replace("**", "").replace("`", ""))
+        print()
+        set_command_response(message)
+        return True
+
+    help_match = re.match(
+        r"^(?:help|tro giup|giup|chuc nang|kham pha chuc nang)(?:\s+(.+))?$",
+        normalize_core_text(command),
+    )
+    if help_match and help_match.group(1):
+        category_key = resolve_help_category(help_match.group(1))
+        if category_key:
+            show_help_category(category_key)
+        else:
+            message = (
+                "Tôi chưa tìm thấy nhóm đó. Hãy chọn: Bộ nhớ, File & ổ đĩa, "
+                "Hệ thống, Web, Ứng dụng, Âm thanh hoặc Nguồn & lịch."
+            )
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+        return True
+
     if command_lower in {
         "help",
         "trợ giúp",
@@ -3933,9 +4175,15 @@ async def route_command(command, *, allow_local_ai=True):
         "jarvis co the lam gi",
         "làm gì",
         "lam gi",
+        "khám phá chức năng",
+        "kham pha chuc nang",
     }:
 
-        show_help()
+        overview = format_help_overview()
+        print()
+        print(overview.replace("**", "").replace("`", ""))
+        print()
+        set_command_response(overview)
 
         return True
 
@@ -3997,6 +4245,140 @@ def _env_int(name):
         return int(value)
     except ValueError:
         return None
+
+
+class DiscordHelpCommandView(discord.ui.View):
+    """Các nút chỉ đưa cú pháp mẫu, không tự chạy hành động hệ thống."""
+
+    def __init__(self, category_key, owner_id):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        category = HELP_CATEGORIES[category_key]
+        for index, (label, command) in enumerate(category["commands"][:20]):
+            button = discord.ui.Button(
+                label=label[:80],
+                style=discord.ButtonStyle.secondary,
+                row=min(3, index // 5),
+            )
+
+            async def show_command(interaction, sample=command):
+                if interaction.user.id != self.owner_id:
+                    await interaction.response.send_message(
+                        "Bạn không có quyền điều khiển Jarvis này.", ephemeral=True
+                    )
+                    return
+                await interaction.response.send_message(
+                    f"Lệnh mẫu:\n```\n{sample}\n```\nBạn có thể sao chép hoặc gửi chính xác lệnh này.",
+                    ephemeral=True,
+                )
+
+            button.callback = show_command
+            self.add_item(button)
+
+
+class DiscordHelpCategoryView(discord.ui.View):
+    def __init__(self, owner_id):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        for index, (key, category) in enumerate(HELP_CATEGORIES.items()):
+            button = discord.ui.Button(
+                label=category["title"][:80],
+                emoji=category["icon"],
+                style=discord.ButtonStyle.primary if key == "memory" else discord.ButtonStyle.secondary,
+                row=index // 5,
+            )
+
+            async def show_category(interaction, category_key=key):
+                if interaction.user.id != self.owner_id:
+                    await interaction.response.send_message(
+                        "Bạn không có quyền điều khiển Jarvis này.", ephemeral=True
+                    )
+                    return
+                response = format_help_category(category_key)
+                CORE.conversation.add("discord", "user", f"help {category_key}")
+                CORE.conversation.add("discord", "assistant", response)
+                await interaction.response.send_message(
+                    response,
+                    view=DiscordHelpCommandView(category_key, self.owner_id),
+                    ephemeral=True,
+                )
+
+            button.callback = show_category
+            self.add_item(button)
+
+
+class DiscordDangerConfirmationView(discord.ui.View):
+    """Single-use, owner-only confirmation that expires after 60 seconds."""
+
+    def __init__(self, command, owner_id, channel_id):
+        super().__init__(timeout=60)
+        self.command = command
+        self.owner_id = owner_id
+        self.channel_id = channel_id
+        self.used = False
+
+    async def _check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Bạn không có quyền xác nhận yêu cầu này.", ephemeral=True
+            )
+            return False
+        if self.used:
+            await interaction.response.send_message(
+                "Yêu cầu này đã được xử lý hoặc hết hiệu lực.", ephemeral=True
+            )
+            return False
+        self.used = True
+        for child in self.children:
+            child.disabled = True
+        return True
+
+    @discord.ui.button(label="Xác nhận", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, _button):
+        if not await self._check(interaction):
+            return
+        CORE.security.audit(
+            "discord", self.command, "confirm", "confirmed",
+            interaction.user.id, interaction.channel_id,
+        )
+        await interaction.response.edit_message(
+            content=f"✅ Đã xác nhận: `{self.command}`\nJarvis đang thực hiện…",
+            view=self,
+        )
+        global last_command_response
+        try:
+            async with discord_command_lock:
+                last_command_response = None
+                await route_command(self.command)
+                response = redact_sensitive(
+                    last_command_response or "✅ Jarvis đã xử lý lệnh."
+                )
+            CORE.conversation.add("discord", "user", self.command)
+            CORE.conversation.add("discord", "assistant", response)
+            await interaction.followup.send(response[:1900], ephemeral=True)
+        except Exception as error:
+            CORE.security.audit(
+                "discord", self.command, "confirm", "error",
+                interaction.user.id, interaction.channel_id,
+            )
+            await interaction.followup.send(
+                f"❌ Không thể thực hiện: {redact_sensitive(error)}", ephemeral=True
+            )
+
+    @discord.ui.button(label="Hủy", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, _button):
+        if not await self._check(interaction):
+            return
+        CORE.security.audit(
+            "discord", self.command, "confirm", "cancelled",
+            interaction.user.id, interaction.channel_id,
+        )
+        await interaction.response.edit_message(
+            content=f"Đã hủy yêu cầu: `{self.command}`", view=self
+        )
+
+    async def on_timeout(self):
+        self.used = True
 
 
 def _discord_command_needs_profile(command):
@@ -4102,20 +4484,93 @@ async def start_discord_bot():
         if not command:
             return
 
+        settings = CORE.security.settings()
+        if not CORE.security.rate_limit(message.author.id):
+            CORE.security.audit(
+                "discord", command, "rate_limit", "blocked",
+                message.author.id, message.channel.id,
+            )
+            await message.reply(
+                "⏳ Bạn gửi lệnh quá nhanh. Hãy chờ khoảng 10 giây rồi thử lại.",
+                mention_author=False,
+            )
+            return
+
+        risk = classify_remote_command(command)
+        if not settings["discord_enabled"] and not CORE.security.is_allowed_when_locked(command):
+            CORE.security.audit(
+                "discord", command, risk, "remote_locked",
+                message.author.id, message.channel.id,
+            )
+            await message.reply(
+                "🔒 Điều khiển Discord đang bị khóa trên Ubuntu. Chỉ help và trạng thái hệ thống được phép.",
+                mention_author=False,
+            )
+            return
+        if risk == "forbidden":
+            CORE.security.audit(
+                "discord", command, risk, "forbidden",
+                message.author.id, message.channel.id,
+            )
+            await message.reply(
+                "⛔ Jarvis từ chối đọc bí mật hoặc xóa vĩnh viễn qua Discord.",
+                mention_author=False,
+            )
+            return
+        if risk == "confirm":
+            if not settings["dangerous_enabled"]:
+                CORE.security.audit(
+                    "discord", command, risk, "dangerous_locked",
+                    message.author.id, message.channel.id,
+                )
+                await message.reply(
+                    "🔒 Lệnh nguy hiểm từ xa đang bị tắt trong ứng dụng Ubuntu.",
+                    mention_author=False,
+                )
+                return
+            CORE.security.audit(
+                "discord", command, risk, "pending_confirmation",
+                message.author.id, message.channel.id,
+            )
+            warning = (
+                f"⚠️ **Yêu cầu cần xác nhận**\n`{command}`\n\n"
+                "Chỉ tài khoản của bạn có thể xác nhận. Yêu cầu hết hạn sau 60 giây."
+            )
+            await message.reply(
+                warning,
+                mention_author=False,
+                view=DiscordDangerConfirmationView(
+                    command, owner_id, message.channel.id
+                ),
+            )
+            return
+
+        CORE.security.audit(
+            "discord", command, risk, "accepted",
+            message.author.id, message.channel.id,
+        )
+        CORE.conversation.add("discord", "user", command)
+
         if command.lower() in {
             "thoát", "thoat", "exit", "quit", "bye",
             "tạm biệt", "tam biet",
         }:
+            response_text = "Lệnh thoát từ Discord bị khóa. Hãy thoát Jarvis trực tiếp trên Ubuntu."
+            CORE.conversation.add("discord", "assistant", response_text)
             await message.reply(
-                "Lệnh thoát từ Discord bị khóa. Hãy thoát Jarvis trực tiếp trên Ubuntu.",
+                response_text,
                 mention_author=False,
             )
             return
 
         if _discord_command_needs_profile(command):
-            await message.reply(
+            response_text = (
                 "Lệnh này cần chỉ rõ Chrome profile. Ví dụ: "
-                "`mở youtube cá nhân` hoặc `mở youtube học`.",
+                "`mở youtube cá nhân` hoặc `mở youtube học`."
+            )
+            CORE.conversation.add("discord", "assistant", response_text)
+            await message.reply(
+                response_text,
                 mention_author=False,
             )
             return
@@ -4130,13 +4585,14 @@ async def start_discord_bot():
             deep_sleep_message = (
                 "😴 Jarvis sẽ đưa Ubuntu vào Sleep sâu. Nhạc và chương trình sẽ tạm dừng."
             )
+            CORE.conversation.add("discord", "assistant", deep_sleep_message)
             await message.reply(
                 deep_sleep_message,
                 mention_author=False,
             )
             speak(deep_sleep_message)
             await asyncio.sleep(0.8)
-            deep_sleep_machine()
+            deep_sleep_machine(source="discord")
             return
 
         # Sleep màn hình không suspend hệ thống nên Discord/Jarvis vẫn hoạt động.
@@ -4144,6 +4600,7 @@ async def start_discord_bot():
             screen_sleep_message = (
                 "🌙 Jarvis sẽ tắt màn hình. Nhạc và Discord vẫn tiếp tục chạy."
             )
+            CORE.conversation.add("discord", "assistant", screen_sleep_message)
             await message.reply(
                 screen_sleep_message,
                 mention_author=False,
@@ -4164,22 +4621,42 @@ async def start_discord_bot():
 
             if last_command_response:
                 # Discord giới hạn một message khoảng 2000 ký tự.
-                response_text = last_command_response
+                response_text = redact_sensitive(last_command_response)
 
                 if len(response_text) > 1900:
                     response_text = response_text[:1900] + "\n..."
 
+                CORE.conversation.add("discord", "assistant", response_text)
+                response_view = None
+                if last_command_response.startswith("🧰 **JARVIS CÓ THỂ"):
+                    response_view = DiscordHelpCategoryView(owner_id)
+                else:
+                    help_match = re.match(
+                        r"^(?:help|tro giup|giup|chuc nang|kham pha chuc nang)(?:\s+(.+))?$",
+                        normalize_core_text(command),
+                    )
+                    if help_match and help_match.group(1):
+                        category_key = resolve_help_category(help_match.group(1))
+                        if category_key:
+                            response_view = DiscordHelpCommandView(
+                                category_key, owner_id
+                            )
                 await message.reply(
                     response_text,
                     mention_author=False,
+                    view=response_view,
                 )
             else:
+                CORE.conversation.add("discord", "assistant", "✅ Jarvis đã xử lý lệnh.")
                 await message.reply(
                     "✅ Jarvis đã xử lý lệnh.",
                     mention_author=False,
                 )
         except Exception as error:
             print(f"Jarvis: Lỗi Discord command: {error}")
+            CORE.conversation.add(
+                "discord", "assistant", "❌ Jarvis gặp lỗi khi xử lý lệnh."
+            )
             await message.reply(
                 "❌ Jarvis gặp lỗi khi xử lý lệnh. Xem Terminal Ubuntu để biết chi tiết.",
                 mention_author=False,
@@ -4208,7 +4685,49 @@ async def stop_discord_bot():
 # MAIN
 # ==========================================================
 
+def acquire_instance_lock():
+    """Giữ process lock trong suốt vòng đời Jarvis."""
+    global instance_lock_file
+
+    lock_name = f"jarvis-{os.getuid()}.lock"
+    runtime_dir = Path(os.getenv("XDG_RUNTIME_DIR", "/tmp"))
+    lock_paths = [runtime_dir / lock_name]
+    fallback_path = Path("/tmp") / lock_name
+    if fallback_path not in lock_paths:
+        lock_paths.append(fallback_path)
+
+    last_error = None
+    for lock_path in lock_paths:
+        lock_file = None
+        try:
+            lock_file = lock_path.open("a+")
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(f"{os.getpid()}\n")
+            lock_file.flush()
+            instance_lock_file = lock_file
+            return True
+        except BlockingIOError:
+            if lock_file is not None:
+                lock_file.close()
+            print(
+                "Jarvis: Một phiên Jarvis khác đang chạy. "
+                "Đã dừng phiên mới để tránh trùng lịch Sleep sâu."
+            )
+            return False
+        except OSError as error:
+            last_error = error
+            if lock_file is not None:
+                lock_file.close()
+
+    print(f"Jarvis: Không thể tạo khóa tiến trình: {last_error}")
+    return False
+
 async def main():
+    if not acquire_instance_lock():
+        return
+
     print()
     print("=" * 60)
     print(f"            JARVIS v{VERSION}")
@@ -4221,6 +4740,7 @@ async def main():
 
     print()
     start_tts_worker()
+    await start_ipc_server()
 
     if interactive_terminal:
         jarvis_say('Sẵn sàng. Gõ "help" để xem lệnh.')
@@ -4243,7 +4763,13 @@ async def main():
                     global last_command_response
                     last_command_response = None
 
+                    if command:
+                        CORE.conversation.add("terminal", "user", command)
                     running = await route_command(command)
+                    if last_command_response:
+                        CORE.conversation.add(
+                            "terminal", "assistant", last_command_response
+                        )
                     speak_last_response()
 
                 except KeyboardInterrupt:
@@ -4267,6 +4793,7 @@ async def main():
             await discord_task
 
     finally:
+        await stop_ipc_server()
         await stop_discord_bot()
 
         if not discord_task.done():

@@ -7,8 +7,7 @@ venv/
 mcp_errors.log
 .jarvis_data/
 *_backup*.py
-test_*.py
-tests/
+/test_*.py
 
 # Runtime-generated audio
 tts/output.wav

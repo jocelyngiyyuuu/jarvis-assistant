@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from collections import deque
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -79,17 +80,31 @@ class LocalAI:
     """Talk to Ollama without adding a third-party HTTP dependency."""
 
     def __init__(self, model=None, base_url=None, timeout=90, history_size=8):
-        self.model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+        self.model = model or os.getenv("OLLAMA_MODEL", "qwen3:4b")
         self.base_url = (base_url or os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
         self.timeout = timeout
         self.history = deque(maxlen=history_size)
+
+    @staticmethod
+    def _strip_thinking(content):
+        """Ẩn reasoning mà một số template Qwen3 vẫn trả trong content."""
+        content = str(content or "").strip()
+        content = re.sub(r"^.*?</think>\s*", "", content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL | re.IGNORECASE)
+        return content.strip()
 
     def chat(self, message):
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self.history)
         messages.append({"role": "user", "content": str(message).strip()})
         payload = json.dumps(
-            {"model": self.model, "messages": messages, "stream": False},
+            {
+                "model": self.model,
+                "messages": messages,
+                "think": False,
+                "options": {"num_ctx": 4096},
+                "stream": False,
+            },
             ensure_ascii=False,
         ).encode("utf-8")
         request = Request(
@@ -105,7 +120,7 @@ class LocalAI:
         except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"Không thể kết nối Ollama: {error}") from error
 
-        answer = str(result.get("message", {}).get("content", "")).strip()
+        answer = self._strip_thinking(result.get("message", {}).get("content", ""))
         if not answer:
             raise RuntimeError("Ollama không trả về nội dung.")
 
@@ -123,7 +138,8 @@ class LocalAI:
                     {"role": "user", "content": str(message).strip()},
                 ],
                 "format": DECISION_SCHEMA,
-                "options": {"temperature": 0, "num_predict": 300},
+                "think": False,
+                "options": {"temperature": 0, "num_predict": 300, "num_ctx": 4096},
                 "stream": False,
             },
             ensure_ascii=False,

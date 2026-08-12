@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Jarvis
+Comment=Trợ lý AI local cho Ubuntu
+Exec=@PROJECT_DIR@/scripts/launch-jarvis-gui.sh
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+StartupWMClass=com.jarvis.Assistant
