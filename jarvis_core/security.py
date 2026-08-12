@@ -21,6 +21,13 @@ SAFE_WHEN_LOCKED = {
 
 def classify_remote_command(command):
     plain = normalize_text(command)
+    # Hẹn gửi chỉ tạo lịch; tới hạn mới hiển thị nút xác nhận gửi riêng.
+    if re.match(
+        r"sau\s+(?:\d+\s*(?:h|p|s|gio|phut|giay)\s*)+"
+        r"(?:nua\s+)?(?:hay\s+)?(?:gui|nhan)(?:\s+tin nhan)?(?:\s+zalo)?\s+cho\s+",
+        plain,
+    ):
+        return "normal"
     permanently_forbidden = (
         "xoa vinh vien", "rm -rf", "private key", "api key", "discord token",
         "doc .env", "mo .env", "cat .env", "mat khau",
@@ -31,6 +38,11 @@ def classify_remote_command(command):
         "sleep sau", "ngu sau", "suspend", "huy sleep sau", "shutdown",
         "tat may", "khoi dong lai", "reboot", "xoa file", "dua vao thung rac",
     )
+    if re.search(
+        r"(?:gui|nhan)\s+(?:tin nhan\s+)?(?:zalo\s+)?cho\s+.+\s+(?:voi\s+)?noi dung\s+.+",
+        plain,
+    ):
+        return "confirm"
     if any(pattern in plain for pattern in dangerous):
         return "confirm"
     sensitive = ("xem bo nho", "nho lai", "phan tich file")
@@ -150,3 +162,16 @@ class RemoteSecurity:
                 (max(1, min(int(limit), 200)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def last_discord_channel_id(self):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT channel_id FROM security_events "
+                "WHERE source='discord' AND channel_id<>'' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return int(row["channel_id"])
+        except (TypeError, ValueError):
+            return None

@@ -14,7 +14,7 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import GLib, Gtk
+from gi.repository import GLib, Gtk, Pango
 
 from jarvis_core.runtime import JarvisCore
 from jarvis_core.help_catalog import HELP_CATEGORIES
@@ -39,6 +39,8 @@ headerbar { background-color: #2c1628; color: #ffffff; border-bottom: 3px solid 
 .muted { color: #aaa3aa; }
 .card { background-color: #302b31; color: #f7f4f7; border: 1px solid #514a52; border-radius: 10px; padding: 16px; }
 .assistant-card { border-left: 4px solid #e95420; }
+.zalo-summary-card { background-color: #29262d; border-left: 4px solid #55c2ff; padding: 18px 20px; }
+.zalo-summary-card label { color: #f7f5f8; }
 .status-good { color: #79d58a; font-weight: 700; }
 .danger { color: #ff8d9a; }
 .metric { font-size: 24px; font-weight: 700; }
@@ -127,7 +129,9 @@ class JarvisWindow(Gtk.ApplicationWindow):
         sidebar.append(model)
         first.set_active(True)
         search.connect("search-changed", self._filter_navigation)
-        self._load_conversation_history()
+        # Mỗi lần mở GTK là một phiên hiển thị mới. Tin cũ vẫn nằm trong
+        # SQLite của Jarvis nhưng không tự đổ lại lên màn hình.
+        self.last_conversation_id = CORE.conversation.latest_id()
         GLib.timeout_add(700, self._sync_conversation)
         GLib.idle_add(self._ensure_file_index_background)
         GLib.timeout_add_seconds(600, self._periodic_index_check)
@@ -165,6 +169,8 @@ class JarvisWindow(Gtk.ApplicationWindow):
         card.add_css_class("card")
         if text:
             label = Gtk.Label(label=text, xalign=0, wrap=True, selectable=True)
+            label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            label.set_max_width_chars(92)
             card.append(label)
         return card
 
@@ -197,11 +203,6 @@ class JarvisWindow(Gtk.ApplicationWindow):
         if not payload.get("ok"):
             raise RuntimeError(payload.get("response", "Lệnh thất bại."))
         return payload["response"]
-
-    def _load_conversation_history(self):
-        rows = CORE.conversation.recent(50)
-        for row in rows:
-            self._append_conversation_event(row)
 
     def _sync_conversation(self):
         rows = CORE.conversation.since(self.last_conversation_id, limit=100)
@@ -281,6 +282,8 @@ class JarvisWindow(Gtk.ApplicationWindow):
         card = self._card(text)
         if assistant:
             card.add_css_class("assistant-card")
+            if "TÓM TẮT ZALO CÔNG VIỆC" in text:
+                card.add_css_class("zalo-summary-card")
         else:
             card.set_halign(Gtk.Align.END)
         self.chat_box.append(card)

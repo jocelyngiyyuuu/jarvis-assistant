@@ -25,6 +25,7 @@ from jarvis_core.help_catalog import (
     format_help_category,
     format_help_overview,
     format_recent_updates,
+    format_category_choices,
     resolve_help_category,
 )
 from jarvis_core.security import classify_remote_command, redact_sensitive
@@ -41,8 +42,19 @@ VERSION = "1.1.0-modular-core"
 load_dotenv()
 
 discord_client = None
+discord_notification_channel_id = None
 discord_command_lock = asyncio.Lock()
 last_command_response = None
+pending_command_suggestions = {}
+SUGGESTION_CONFIRM_TTL_SECONDS = 120
+
+SUGGESTION_AFFIRMATIONS = {
+    "dung", "dung roi", "phai", "phai roi", "uh", "u", "ừ", "ok",
+    "okay", "xac nhan", "dong y", "chinh xac", "cu chay", "thuc hien di",
+}
+SUGGESTION_REJECTIONS = {
+    "khong", "khong phai", "sai", "bo qua", "huy", "thoi", "cancel",
+}
 ipc_server = None
 
 # Chỉ cho phép một process Jarvis hoạt động. Nếu Terminal và systemd cùng
@@ -249,13 +261,18 @@ async def _handle_ipc_client(reader, writer):
             try:
                 request = json.loads(line.decode("utf-8"))
                 command = str(request.get("command", "")).strip()
+                original_command = command
                 source = str(request.get("source", "gtk")).strip() or "gtk"
                 if not command:
                     raise ValueError("Lệnh không được để trống.")
                 CORE.conversation.add(source, "user", command)
+                command, confirmation_note = resolve_command_confirmation(command, source)
                 async with discord_command_lock:
                     last_command_response = None
-                    await route_command(command)
+                    if confirmation_note and command == original_command:
+                        set_command_response(confirmation_note)
+                    else:
+                        await route_command(command, source=source)
                     response = last_command_response or "✅ Jarvis đã xử lý lệnh."
                 CORE.conversation.add(source, "assistant", response)
                 payload = {"ok": True, "response": response}
@@ -403,6 +420,8 @@ CHROME_SHORTCUTS = {
     "lịch google": ("Google Calendar", "https://calendar.google.com/"),
     "lich google": ("Google Calendar", "https://calendar.google.com/"),
     "github": ("GitHub", "https://github.com/"),
+    "zalo": ("Zalo công việc", "https://chat.zalo.me/"),
+    "zalo web": ("Zalo công việc", "https://chat.zalo.me/"),
     "google": ("Google", "https://www.google.com/"),
     "chrome": ("Chrome", "chrome://newtab/"),
 }
@@ -423,6 +442,9 @@ def _chrome_profile_from_explicit_command(command):
         "học tập",
         "hoc tap",
         "study",
+        "công việc",
+        "cong viec",
+        "work",
     )
 
     if any(word in command_lower for word in personal_words):
@@ -461,7 +483,7 @@ def handle_chrome_shortcut(command):
 
     # Bỏ từ chỉ profile để còn lại tên website.
     target_text = re.sub(
-        r"\s+(?:bằng\s+)?(?:tài\s+khoản\s+)?(?:cá nhân|ca nhan|personal|học tập|hoc tap|học|hoc|study)\s*$",
+        r"\s+(?:bằng\s+)?(?:tài\s+khoản\s+)?(?:cá nhân|ca nhan|personal|học tập|hoc tap|học|hoc|study|công việc|cong viec|work)\s*$",
         "",
         target_text,
         flags=re.IGNORECASE,
@@ -472,6 +494,11 @@ def handle_chrome_shortcut(command):
         return False
 
     profile, profile_name = _chrome_profile_from_explicit_command(command)
+
+    # Zalo mặc định là tài khoản công việc trong Chrome học. Người dùng vẫn
+    # có thể nói rõ "mở zalo cá nhân" để ghi đè quy tắc này.
+    if profile is None and target_text in {"zalo", "zalo web"}:
+        profile, profile_name = STUDY_PROFILE, "Học / ChatGPT"
 
     if profile is None:
         message = (
@@ -809,6 +836,193 @@ async def find_youtube_page(session):
 
     # Tab YouTube gần nhất
     return youtube_pages[-1]
+
+
+async def find_zalo_page(session):
+    """Return the most recently listed Zalo Web page."""
+    pages_result = await session.call_tool("list_pages", arguments={})
+    zalo_pages = []
+    for line in result_to_text(pages_result).splitlines():
+        if "chat.zalo.me" not in line.lower():
+            continue
+        page_id = extract_page_id(line)
+        if page_id is not None:
+            zalo_pages.append(page_id)
+    return zalo_pages[-1] if zalo_pages else None
+
+
+def parse_zalo_date(value):
+    """Parse hôm nay/hôm qua or dd/mm[/yyyy] from a Zalo command."""
+    plain = normalize_core_text(value)
+    now = datetime.now()
+    if "hom nay" in plain:
+        return now.date()
+    if "hom qua" in plain:
+        return (now - timedelta(days=1)).date()
+    match = re.search(r"(?:ngay\s+)?(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?", plain)
+    if not match:
+        return None
+    day, month = int(match.group(1)), int(match.group(2))
+    year = int(match.group(3) or now.year)
+    try:
+        return datetime(year, month, day).date()
+    except ValueError:
+        return None
+
+
+def parse_zalo_request(command):
+    """Return date, optional group and optional grounded question."""
+    plain = normalize_core_text(command)
+    selected_date = parse_zalo_date(command)
+    group = None
+    question = None
+    group_match = re.search(
+        r"(?:nhom|trong nhom)\s+(.+?)(?=\s+(?:hom nay|hom qua|ngay\s+\d|hoi\s+|ve\s+su kien|su kien)|$)",
+        plain,
+    )
+    if group_match:
+        group = group_match.group(1).strip()
+    question_match = re.search(r"\bve\s+(.+)$", plain)
+    if not question_match and plain.startswith(("hoi zalo ", "cho toi biet zalo ", "kiem tra zalo ")):
+        question_match = re.search(r"\b(?:su kien|noi dung)\s+(.+)$", plain)
+    if question_match:
+        question = question_match.group(1).strip()
+    return selected_date, group, question
+
+
+async def summarize_zalo_work(max_chats=20, selected_date=None, group_query=None, question=None):
+    """Read visible chats tagged Công việc and summarize them with local AI."""
+    try:
+        session = None
+        page_id = None
+        # Với nhiều Chrome profile, autoConnect đôi khi bám vào browser khác.
+        # Tạo lại phiên tối đa 3 lần để tìm đúng tab Zalo của profile học.
+        for attempt in range(3):
+            session = await get_mcp_session()
+            page_id = await find_zalo_page(session)
+            if page_id is not None:
+                break
+            if attempt < 2:
+                await close_mcp_session()
+                await asyncio.sleep(0.4)
+        if page_id is None:
+            message = "❌ Không tìm thấy tab Zalo Web. Hãy dùng `mở zalo công việc` trước."
+            set_command_response(message)
+            return True
+
+        await session.call_tool(
+            "select_page", arguments={"pageId": page_id, "bringToFront": True}
+        )
+        prepare_script = r'''async () => {
+            const textLeaf = value => [...document.querySelectorAll('body *')]
+              .find(el => el.childElementCount === 0 && el.textContent.trim() === value);
+            const active = textLeaf('Công việc');
+            const open = document.querySelector('[data-id="div_MiniLabel_OpenLabelList"]');
+            if (open) {
+              open.click();
+              await new Promise(r => setTimeout(r, 350));
+              const label = textLeaf('Công việc');
+              if (!label) return {ok:false, error:'Không tìm thấy nhãn Công việc.'};
+              label.click();
+              await new Promise(r => setTimeout(r, 700));
+            } else if (!active) {
+              return {ok:false, error:'Không mở được bộ lọc Công việc.'};
+            }
+            const rows = [...document.querySelectorAll('[role="grid"] .msg-item')];
+            return {ok:true, count:rows.length, titles:rows.map(row =>
+              (row.querySelector('.conv-item-title__name')?.textContent || '').trim())};
+        }'''
+        prepared = _json_from_mcp_result(
+            await session.call_tool("evaluate_script", arguments={"function": prepare_script}),
+            default={},
+        )
+        if not isinstance(prepared, dict) or not prepared.get("ok"):
+            detail = prepared.get("error", "Giao diện Zalo đã thay đổi.") if isinstance(prepared, dict) else "Giao diện Zalo đã thay đổi."
+            set_command_response(f"❌ Không thể đọc nhãn Công việc: {detail}")
+            return True
+
+        titles = [str(title) for title in prepared.get("titles", [])]
+        indices = list(range(min(int(prepared.get("count", 0)), max_chats)))
+        if group_query:
+            normalized_query = normalize_core_text(group_query)
+            ranked = sorted(
+                ((SequenceMatcher(None, normalized_query, normalize_core_text(title)).ratio(), index)
+                 for index, title in enumerate(titles)),
+                reverse=True,
+            )
+            if not ranked or (ranked[0][0] < 0.45 and normalized_query not in normalize_core_text(titles[ranked[0][1]])):
+                set_command_response(f"ℹ️ Không tìm thấy nhóm Zalo gần với `{group_query}` trong nhãn Công việc.")
+                return True
+            indices = [ranked[0][1]]
+
+        conversations = []
+        date_text = selected_date.strftime("%d/%m/%Y") if selected_date else ""
+        for index in indices:
+            script = f'''async () => {{
+              const rows = [...document.querySelectorAll('[role="grid"] .msg-item')];
+              const row = rows[{index}];
+              if (!row) return {{ok:false}};
+              const title = (row.querySelector('.conv-item-title__name')?.textContent || 'Nhóm {index + 1}').trim();
+              const preview = (row.querySelector('.z-conv-message')?.innerText || '').trim();
+              (row.querySelector('.conv-item') || row).click();
+              await new Promise(r => setTimeout(r, 650));
+              const area = document.querySelector('main .message-view__scroll');
+              let content = '';
+              const wantedDate = {json.dumps(date_text)};
+              if (wantedDate && area) {{
+                const shortDate = wantedDate.slice(0, 5);
+                const today = new Date();
+                const pad = n => String(n).padStart(2, '0');
+                const todayText = `${{pad(today.getDate())}}/${{pad(today.getMonth()+1)}}/${{today.getFullYear()}}`;
+                const blocks = [...area.querySelectorAll('.block-date')];
+                content = blocks.filter(block => {{
+                  const first = (block.innerText || '').split('\n')[0].trim().toLowerCase();
+                  return first.includes(wantedDate) || first.includes(shortDate) ||
+                    (wantedDate === todayText && first.includes('hôm nay'));
+                }}).map(block => block.innerText).join('\n\n');
+              }} else {{
+                content = (area?.innerText || '').trim();
+              }}
+              return {{ok:true, title, preview, content:content.slice(-1400)}};
+            }}'''
+            item = _json_from_mcp_result(
+                await session.call_tool("evaluate_script", arguments={"function": script}),
+                default={},
+            )
+            if not isinstance(item, dict) or not item.get("ok"):
+                continue
+            content = str(item.get("content", "")).strip()
+            preview = str(item.get("preview", "")).strip()
+            if selected_date and not content:
+                continue
+            if not content and (not preview or "Chưa có tin nhắn" in preview):
+                continue
+            conversations.append({
+                "nhom": clean_title(str(item.get("title", "Nhóm không tên"))),
+                "noi_dung": content or preview,
+            })
+
+        if not conversations:
+            scope = f" ngày {date_text}" if selected_date else ""
+            set_command_response(f"ℹ️ Không tìm thấy nội dung Zalo{scope} trong phạm vi đã chọn.")
+            return True
+
+        if question:
+            summary = await asyncio.to_thread(CORE.local_ai.answer_zalo_question, conversations, question)
+            heading = "🔎 **TRẢ LỜI TỪ ZALO CÔNG VIỆC**"
+        else:
+            summary = await asyncio.to_thread(CORE.local_ai.summarize_zalo_work, conversations)
+            heading = "📋 **TÓM TẮT ZALO CÔNG VIỆC**"
+        scope = f" — {date_text}" if selected_date else ""
+        message = f"{heading}{scope}\n\n{summary}"
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+    except Exception as error:
+        message = f"❌ Không thể tổng hợp Zalo: {error}"
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
 
 
 # ==========================================================
@@ -2991,6 +3205,395 @@ async def handle_deep_sleep_timer_command(command):
     return True
 
 
+REMINDER_DURATION_PART = r"\d+\s*(?:gio|giay|phut|h|p|s)"
+
+
+def _duration_seconds(value):
+    """Parse compact/mixed durations such as 1h15p, 1h 15p or 2gio30phut."""
+    plain = normalize_core_text(value)
+    parts = re.findall(r"(\d+)\s*(gio|giay|phut|h|p|s)", plain)
+    if not parts:
+        return None
+    consumed = re.sub(r"\s+", "", plain)
+    rebuilt = "".join(f"{amount}{unit}" for amount, unit in parts)
+    if consumed != rebuilt:
+        return None
+    total = 0
+    for amount, unit in parts:
+        multiplier = 3600 if unit in {"h", "gio"} else 60 if unit in {"p", "phut"} else 1
+        total += int(amount) * multiplier
+    return total if total > 0 else None
+
+
+def parse_reminder_command(command, now=None):
+    """Parse `nhắc tôi sau ...` and `nhắc tôi lúc ... [ngày ...]` commands."""
+    raw = str(command).strip()
+    plain = normalize_core_text(raw)
+    current = now or datetime.now().astimezone()
+    duration = rf"((?:{REMINDER_DURATION_PART}\s*)+)"
+    leading_delay_match = re.match(
+        rf"sau\s+{duration}(?:\s+nua)?\s+(?:hay\s+)?nhac(?:\s+toi|\s+nho)?\s+(.+)$",
+        plain,
+    )
+    if leading_delay_match:
+        seconds = _duration_seconds(leading_delay_match.group(1))
+        content = raw[leading_delay_match.start(2):].strip().lstrip(":,- ")
+        return current + timedelta(seconds=seconds), content
+
+    delay_match = re.match(
+        rf"(?:(?:dat|hen|tao)(?:\s+lich)?\s+)?nhac(?:\s+toi|\s+nho)?\s+sau\s+{duration}"
+        rf"(?:\s+nua)?\s*[:,-]?\s*(.+)$",
+        plain,
+    )
+    if delay_match:
+        seconds = _duration_seconds(delay_match.group(1))
+        content = raw[delay_match.start(2):].strip().lstrip(":,- ")
+        content = re.sub(r"^(?:nữa|nua)\s*[:,-]?\s*", "", content, flags=re.IGNORECASE)
+        return current + timedelta(seconds=seconds), content
+
+    # Cách nói tự nhiên: "tạo nhắc nhở phơi đồ sau 1h15p".
+    trailing_match = re.match(
+        rf"(?:(?:dat|hen|tao)(?:\s+lich)?\s+)?nhac(?:\s+nho)?\s+(.+?)\s+sau\s+{duration}(?:\s+nua)?$",
+        plain,
+    )
+    if trailing_match:
+        seconds = _duration_seconds(trailing_match.group(2))
+        content = raw[trailing_match.start(1):trailing_match.end(1)].strip()
+        return current + timedelta(seconds=seconds), content
+    clock_match = re.match(
+        r"(?:(?:dat|hen|tao)(?:\s+lich)?\s+)?nhac(?:\s+toi|\s+nho)?\s+(?:luc|vao luc)\s+"
+        r"(\d{1,2})(?::|h)(\d{1,2})?"
+        r"(?:\s+ngay\s+(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?)?"
+        r"\s*[:,-]?\s*(.+)$",
+        plain,
+    )
+    if not clock_match:
+        return None
+    hour, minute = int(clock_match.group(1)), int(clock_match.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    day, month, year = clock_match.group(3), clock_match.group(4), clock_match.group(5)
+    try:
+        if day:
+            target = current.replace(
+                year=int(year or current.year), month=int(month), day=int(day),
+                hour=hour, minute=minute, second=0, microsecond=0,
+            )
+        else:
+            target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= current:
+                target += timedelta(days=1)
+    except ValueError:
+        return None
+    if target <= current:
+        return None
+    content = raw[clock_match.start(6):].strip().lstrip(":,- ")
+    return target, content
+
+
+def parse_scheduled_zalo_command(command, now=None):
+    """Parse `nhắn zalo cho <người> lúc/sau <thời gian>: <nội dung>`."""
+    raw = str(command).strip()
+    plain = normalize_core_text(raw)
+    duration = rf"((?:{REMINDER_DURATION_PART}\s*)+)"
+    leading_match = re.match(
+        rf"sau\s+{duration}(?:\s+nua)?\s+(?:hay\s+)?(?:nhan|gui)"
+        rf"(?:\s+tin nhan)?(?:\s+zalo)?"
+        rf"(?:\s+(?:trong\s+)?the\s+(tra loi sau|gia dinh))?\s+cho\s+(.+?)\s+"
+        rf"(?:voi\s+)?noi dung\s*[:,-]?\s*(.+)$",
+        plain,
+    )
+    if leading_match:
+        seconds = _duration_seconds(leading_match.group(1))
+        tag_key = leading_match.group(2)
+        raw_recipient = raw[leading_match.start(3):leading_match.end(3)].strip()
+        raw_content = raw[leading_match.start(4):].strip().lstrip(":,- ")
+        tag_name = (
+            "Trả lời sau" if tag_key == "tra loi sau"
+            else "Gia đình" if tag_key == "gia dinh" else ""
+        )
+        current = now or datetime.now().astimezone()
+        return current + timedelta(seconds=seconds), raw_recipient, raw_content, tag_name
+
+    match = re.match(
+        r"(?:hen\s+)?(?:nhan|gui)(?:\s+tin nhan)?(?:\s+zalo)?"
+        r"(?:\s+(?:trong\s+)?the\s+(tra loi sau|gia dinh))?\s+cho\s+(.+?)\s+(sau|luc)\s+(.+)$",
+        plain,
+    )
+    if not match:
+        return None
+    tag, recipient, mode, tail = match.groups()
+    synthetic = f"nhac toi {mode} {tail}"
+    parsed = parse_reminder_command(synthetic, now=now)
+    if not parsed:
+        return None
+    due_at, normalized_content = parsed
+    raw_recipient = raw[match.start(2):match.end(2)].strip()
+    raw_tail = raw[match.start(4):]
+    content = raw_tail[-len(normalized_content):] if normalized_content else normalized_content
+    tag_name = "Trả lời sau" if tag == "tra loi sau" else "Gia đình" if tag == "gia dinh" else ""
+    return due_at, raw_recipient, content.strip().lstrip(":,- "), tag_name
+
+
+async def send_zalo_message(recipient, content, send=False, tag=""):
+    """Find one unambiguous Zalo contact and prepare or send a message."""
+    session = await get_mcp_session()
+    page_id = await find_zalo_page(session)
+    if page_id is None:
+        open_chrome(STUDY_PROFILE, "https://chat.zalo.me/")
+        await asyncio.sleep(2.5)
+        page_id = await find_zalo_page(session)
+    if page_id is None:
+        return False, "Không tìm thấy tab Zalo Web."
+    await session.call_tool("select_page", arguments={"pageId": page_id, "bringToFront": True})
+    script = f'''async () => {{
+      const recipient = {json.dumps(recipient)};
+      const wantedTag = {json.dumps(tag)};
+      const normalize = value => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\\s+/g,' ').trim();
+      const search = document.querySelector('nav input[type="text"], nav input, nav [role="textbox"]');
+      if (!search) return {{ok:false,error:'Không tìm thấy ô tìm kiếm Zalo.'}};
+      search.focus();
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (valueSetter) valueSetter.call(search, recipient); else search.value = recipient;
+      search.dispatchEvent(new Event('input', {{bubbles:true}}));
+      search.dispatchEvent(new Event('change', {{bubbles:true}}));
+      await new Promise(r => setTimeout(r, 1200));
+      const rows = [...document.querySelectorAll('.conv-item')];
+      const matches = rows.map((row,index) => ({{row,index,name:(row.querySelector('.conv-item-title__name, [class*="title"]')?.textContent || '').trim(), text:(row.innerText||'')}}))
+        .filter(item => normalize(item.name) === normalize(recipient) && (!wantedTag || normalize(item.text).includes(normalize(wantedTag))));
+      if (matches.length !== 1) return {{ok:false,error:matches.length ? `Có ${{matches.length}} kết quả trùng tên.` : 'Không tìm thấy đúng người nhận.', names:rows.slice(0,8).map(r=>r.innerText.split('\\n')[0])}};
+      (matches[0].row.querySelector('.conv-item') || matches[0].row).click();
+      await new Promise(r => setTimeout(r, 800));
+      const editor = document.querySelector('main [contenteditable="true"]');
+      if (!editor) return {{ok:false,error:'Không tìm thấy ô soạn tin.'}};
+      const existingCount = [...document.querySelectorAll('main .chat-item')]
+        .filter(item => (item.innerText || '').includes({json.dumps(content)})).length;
+      editor.focus(); document.execCommand('selectAll', false, null);
+      document.execCommand('insertText', false, {json.dumps(content)});
+      return {{ok:true,name:matches[0].name,existingCount}};
+    }}'''
+    result = _json_from_mcp_result(
+        await session.call_tool("evaluate_script", arguments={"function": script}), default={}
+    )
+    if not isinstance(result, dict) or not result.get("ok"):
+        detail = result.get("error", "Không thể soạn tin Zalo.") if isinstance(result, dict) else "Không thể soạn tin Zalo."
+        candidates = result.get("names", []) if isinstance(result, dict) else []
+        if candidates:
+            detail += " Tên đang thấy: " + ", ".join(str(name) for name in candidates if name)[:300]
+        return False, detail
+    if send:
+        await session.call_tool("press_key", arguments={"key": "Enter"})
+        verify_script = f'''() => {{
+          const content = {json.dumps(content)};
+          const editor = document.querySelector('main [contenteditable="true"]');
+          const currentCount = [...document.querySelectorAll('main .chat-item')]
+            .filter(item => (item.innerText || '').includes(content)).length;
+          return {{
+            editorEmpty: !editor || !(editor.innerText || '').trim(),
+            messageAdded: currentCount > {int(result.get('existingCount', 0))},
+            currentCount
+          }};
+        }}'''
+        verified = {}
+        for _attempt in range(3):
+            await asyncio.sleep(0.7)
+            verified = _json_from_mcp_result(
+                await session.call_tool("evaluate_script", arguments={"function": verify_script}),
+                default={},
+            )
+            if isinstance(verified, dict) and verified.get("editorEmpty") and verified.get("messageAdded"):
+                break
+        if not isinstance(verified, dict) or not (
+            verified.get("editorEmpty") and verified.get("messageAdded")
+        ):
+            return False, (
+                "Zalo chưa xác nhận tin đã được gửi. Nội dung có thể vẫn nằm trong ô soạn; "
+                "hãy kiểm tra cửa sổ Zalo."
+            )
+        return True, f"Đã gửi và xác minh tin Zalo cho {result.get('name', recipient)}."
+    return True, f"Đã soạn bản nháp Zalo cho {result.get('name', recipient)} (chưa gửi)."
+
+
+def handle_reminder_command(command, source="terminal"):
+    plain = normalize_core_text(command)
+
+    def format_pending_reminders(rows, heading="⏰ **LỊCH NHẮC VIỆC**"):
+        lines = [heading]
+        for row in rows[:30]:
+            due = datetime.fromisoformat(row["due_at"])
+            if row.get("kind") == "zalo_send":
+                tag = f" · thẻ {row['zalo_tag']}" if row.get("zalo_tag") else ""
+                detail = f"Zalo → {row.get('recipient', '')}{tag} · {row['content']}"
+            else:
+                detail = f"Nhắc Discord · {row['content']}"
+            lines.append(
+                f"#{row['id']} · {due.strftime('%H:%M ngày %d/%m/%Y')}\n   {detail}"
+            )
+        return "\n".join(lines)
+
+    if plain in {"lich nhac", "xem lich nhac", "danh sach nhac", "cac lich nhac"}:
+        rows = CORE.reminders.pending()
+        if not rows:
+            message = "ℹ️ Hiện không có lịch nhắc việc."
+        else:
+            message = format_pending_reminders(rows)
+        set_command_response(message)
+        return True
+    if plain in {
+        "huy lich nhac", "huy nhac", "xoa lich nhac", "xoa nhac",
+        "toi muon huy lich nhac", "toi muon xoa lich nhac",
+    }:
+        rows = CORE.reminders.pending()
+        if not rows:
+            message = "ℹ️ Hiện không có lịch nhắc việc nào để hủy."
+        else:
+            message = (
+                format_pending_reminders(rows, "🗑️ **BẠN MUỐN HỦY LỊCH NÀO?**")
+                + "\n\nTrả lời: `hủy lịch nhắc #<số>` — ví dụ `hủy lịch nhắc #2`."
+            )
+        set_command_response(message)
+        return True
+    cancel = re.fullmatch(
+        r"(?:huy|xoa)\s+(?:lich\s+)?nhac(?:\s+(?:muc|so))?\s+#?(\d+)", plain
+    )
+    if cancel:
+        reminder_id = int(cancel.group(1))
+        deleted = CORE.reminders.cancel(reminder_id)
+        set_command_response(
+            f"✅ Đã hủy lịch nhắc #{reminder_id}." if deleted
+            else f"ℹ️ Không tìm thấy lịch nhắc đang chờ #{reminder_id}."
+        )
+        return True
+    starts_as_reminder = re.match(
+        r"(?:(?:dat|hen|tao)(?:\s+lich)?\s+)?nhac(?:\s+toi|\s+nho)?(?:\s+|$)",
+        plain,
+    ) or re.match(
+        rf"sau\s+(?:{REMINDER_DURATION_PART}\s*)+(?:\s+nua)?\s+(?:hay\s+)?nhac(?:\s+toi|\s+nho)?(?:\s+|$)",
+        plain,
+    )
+    if not starts_as_reminder:
+        return False
+    parsed = parse_reminder_command(command)
+    if parsed is None:
+        set_command_response(
+            "ℹ️ Lịch nhắc chưa hợp lệ. Ví dụ: `nhắc tôi sau 1h15p đi phơi đồ`, "
+            "`tạo nhắc nhở phơi đồ sau 1h15p` hoặc "
+            "`nhắc tôi lúc 19:30 ngày 13/08/2026: gọi khách hàng`."
+        )
+        return True
+    due_at, content = parsed
+    reminder_id = CORE.reminders.add(content, due_at, source)
+    set_command_response(
+        f"⏰ Đã đặt lịch nhắc #{reminder_id} lúc "
+        f"{due_at.strftime('%H:%M ngày %d/%m/%Y')}: {content}"
+    )
+    return True
+
+
+async def handle_zalo_send_command(command, source="terminal"):
+    plain = normalize_core_text(command)
+    scheduled = parse_scheduled_zalo_command(command)
+    if scheduled:
+        due_at, recipient, content, tag = scheduled
+        reminder_id = CORE.reminders.add(
+            content, due_at, source, kind="zalo_send", recipient=recipient, zalo_tag=tag
+        )
+        set_command_response(
+            f"📨 Đã hẹn tin Zalo #{reminder_id} cho {recipient}"
+            f"{f' trong thẻ {tag}' if tag else ''} lúc "
+            f"{due_at.strftime('%H:%M ngày %d/%m/%Y')}. Tới giờ Discord sẽ yêu cầu xác nhận gửi."
+        )
+        return True
+    draft = re.match(
+        r"soan zalo(?:\s+(?:trong\s+)?the\s+(tra loi sau|gia dinh))?\s+cho\s+(.+?)\s*:\s*(.+)$",
+        plain,
+    )
+    if not draft:
+        draft = re.match(
+            r"soan\s+(?:tin nhan\s+)?(?:cho\s+)(.+?)\s+"
+            r"(?:voi\s+)?noi dung\s*[:,-]?\s*(.+)$",
+            plain,
+        )
+        if draft:
+            raw_recipient = command[draft.start(1):draft.end(1)].strip()
+            raw_content = command[draft.start(2):].strip().lstrip(":,- ")
+            ok, message = await send_zalo_message(
+                raw_recipient, raw_content, send=False
+            )
+            set_command_response(("📝 " if ok else "❌ ") + message)
+            return True
+    if draft:
+        tag_key = draft.group(1)
+        tag = "Trả lời sau" if tag_key == "tra loi sau" else "Gia đình" if tag_key == "gia dinh" else ""
+        raw_recipient = command[draft.start(2):draft.end(2)].strip()
+        raw_content = command[draft.start(3):].strip()
+        ok, message = await send_zalo_message(raw_recipient, raw_content, send=False, tag=tag)
+        set_command_response(("📝 " if ok else "❌ ") + message)
+        return True
+    immediate = re.match(
+        r"(?:gui|nhan)\s+(?:tin nhan\s+)?(?:zalo\s+)?cho\s+(.+?)\s+"
+        r"(?:voi\s+)?noi dung\s*[:,-]?\s*(.+)$",
+        plain,
+    )
+    if immediate:
+        raw_recipient = command[immediate.start(1):immediate.end(1)].strip()
+        raw_content = command[immediate.start(2):].strip().lstrip(":,- ")
+        # Discord chỉ tới đây sau khi nút nguy hiểm đã được xác nhận.
+        should_send = source == "discord"
+        ok, message = await send_zalo_message(
+            raw_recipient, raw_content, send=should_send
+        )
+        prefix = "✅ " if ok and should_send else "📝 " if ok else "❌ "
+        if ok and not should_send:
+            message += " Hãy gửi từ Discord để có nút xác nhận an toàn."
+        set_command_response(prefix + message)
+        return True
+    return False
+
+
+async def reminder_dispatch_loop():
+    """Deliver persistent due reminders to the configured Discord channel."""
+    while True:
+        try:
+            if discord_client is not None and not discord_client.is_closed() and discord_client.is_ready():
+                for row in CORE.reminders.due(datetime.now().astimezone()):
+                    is_zalo = row.get("kind") == "zalo_send"
+                    message = (
+                        f"📨 **TIN ZALO ĐẾN GIỜ #{row['id']}**\n"
+                        f"Người nhận: **{redact_sensitive(row.get('recipient', ''))}**\n"
+                        f"Thẻ: **{redact_sensitive(row.get('zalo_tag') or 'Không chỉ định')}**\n"
+                        f"Nội dung: {redact_sensitive(row['content'])}"
+                        if is_zalo else
+                        f"⏰ **NHẮC VIỆC #{row['id']}**\n{redact_sensitive(row['content'])}"
+                    )
+                    channel_id = (
+                        _env_int("DISCORD_CHANNEL_ID")
+                        or discord_notification_channel_id
+                        or CORE.security.last_discord_channel_id()
+                    )
+                    channel = discord_client.get_channel(channel_id) if channel_id else None
+                    if channel is None and channel_id:
+                        try:
+                            channel = await discord_client.fetch_channel(channel_id)
+                        except Exception:
+                            channel = None
+                    if channel is not None:
+                        if is_zalo:
+                            CORE.reminders.mark_awaiting(row["id"])
+                            await channel.send(
+                                message + "\n\nXác nhận trong 60 giây để gửi.",
+                                view=DiscordZaloSendConfirmationView(row),
+                            )
+                        else:
+                            await channel.send(message)
+                            CORE.reminders.mark_delivered(row["id"])
+                        CORE.conversation.add("discord", "assistant", message)
+                        print(f"Jarvis: {message}")
+        except Exception as error:
+            print(f"Jarvis: Lỗi gửi lịch nhắc Discord: {error}")
+        await asyncio.sleep(10)
+
+
 # ==========================================================
 # 2 CHẾ ĐỘ SLEEP UBUNTU
 # ==========================================================
@@ -3443,6 +4046,15 @@ COMMAND_SUGGESTION_CATALOG = (
     ("mo chatgpt ca nhan", "mở chatgpt cá nhân"),
     ("mo gmail hoc", "mở gmail học"),
     ("mo gmail ca nhan", "mở gmail cá nhân"),
+    ("mo zalo", "mở zalo công việc"),
+    ("mo zalo web", "mở zalo"),
+    ("mo zalo cong viec", "mở zalo công việc"),
+    ("vao zalo", "mở zalo"),
+    ("tom tat zalo cong viec", "tóm tắt zalo công việc"),
+    ("tong hop zalo cong viec", "tóm tắt zalo công việc"),
+    ("tom tat zalo hom nay", "tóm tắt zalo hôm nay"),
+    ("tom tat zalo ngay", "tóm tắt zalo ngày <dd/mm/yyyy>"),
+    ("tom tat zalo nhom", "tóm tắt zalo nhóm <tên nhóm>"),
     ("mo drive hoc", "mở drive học"),
     ("mo drive ca nhan", "mở drive cá nhân"),
     ("mo calendar hoc", "mở calendar học"),
@@ -3517,10 +4129,52 @@ COMMAND_SUGGESTION_CATALOG = (
     ("cancel sleep", "hủy sleep sâu"),
     ("lich sleep sau", "lịch sleep sâu"),
     ("sleep status", "lịch sleep sâu"),
+    ("nhac toi sau", "nhắc tôi sau <thời gian> <nội dung>"),
+    ("nhac toi luc", "nhắc tôi lúc <giờ> [ngày dd/mm/yyyy]: <nội dung>"),
+    ("lich nhac", "lịch nhắc"),
+    ("huy lich nhac", "hủy lịch nhắc <số>"),
+    ("soan zalo cho", "soạn zalo cho <tên>: <nội dung>"),
+    ("soan tin nhan cho", "soạn tin nhắn cho <tên> với nội dung <nội dung>"),
+    ("nhan zalo cho", "nhắn zalo cho <tên> lúc <giờ>: <nội dung>"),
+    ("nhan zalo cho sau", "nhắn zalo cho <tên> sau <thời gian> nữa: <nội dung>"),
     # Thoát chỉ dùng trực tiếp trên Ubuntu; Discord sẽ tiếp tục chặn lệnh này.
     ("thoat", "thoát"),
     ("tam biet", "thoát"),
 )
+
+
+def _remember_command_suggestion(source, command):
+    """Remember only complete, executable suggestions for a short time."""
+    if not command or "<" in command or ">" in command:
+        pending_command_suggestions.pop(source, None)
+        return
+    pending_command_suggestions[source] = (command, time.monotonic())
+
+
+def resolve_command_confirmation(command, source="terminal"):
+    """Expand a short yes/no reply against the last suggestion for this source."""
+    plain = normalize_core_text(command)
+    pending = pending_command_suggestions.get(source)
+    if not pending:
+        return command, None
+
+    suggested_command, created_at = pending
+    if time.monotonic() - created_at > SUGGESTION_CONFIRM_TTL_SECONDS:
+        pending_command_suggestions.pop(source, None)
+        if plain in SUGGESTION_AFFIRMATIONS:
+            return command, "⌛ Gợi ý trước đã hết hạn. Hãy nhập lại lệnh bạn muốn chạy."
+        return command, None
+
+    if plain in SUGGESTION_REJECTIONS:
+        pending_command_suggestions.pop(source, None)
+        return command, "👌 Đã bỏ qua lệnh được gợi ý."
+    if plain in SUGGESTION_AFFIRMATIONS:
+        pending_command_suggestions.pop(source, None)
+        return suggested_command, f"✅ Đã xác nhận lệnh `{suggested_command}`."
+
+    # Một lệnh mới thay thế câu hỏi xác nhận cũ.
+    pending_command_suggestions.pop(source, None)
+    return command, None
 
 
 def _suggest_known_command(command):
@@ -3566,8 +4220,24 @@ def _suggest_known_command(command):
     return None
 
 
-async def route_command(command, *, allow_local_ai=True):
+async def route_command(command, *, allow_local_ai=True, source="terminal"):
     command = command.strip()
+
+    if normalize_core_text(command) in SUGGESTION_AFFIRMATIONS:
+        set_command_response(
+            "ℹ️ Không có lệnh nào đang chờ xác nhận bằng chữ. "
+            "Với gửi Zalo hoặc lệnh nguy hiểm, hãy dùng nút xác nhận trên Discord."
+        )
+        return True
+
+    # Các lệnh lưu/gửi nội dung phải chạy trước bước chuẩn hóa để giữ nguyên
+    # chữ hoa, dấu tiếng Việt và dấu câu trong lời nhắc/tin nhắn.
+    if await handle_zalo_send_command(command, source=source):
+        print(f"Jarvis: {last_command_response}")
+        return True
+    if handle_reminder_command(command, source=source):
+        print(f"Jarvis: {last_command_response}")
+        return True
 
     # Lõi module hóa xử lý memory, tìm file thông minh, natural-language
     # aliases và system monitoring. Lệnh chưa nhận diện tiếp tục qua router 1.0.
@@ -3587,6 +4257,42 @@ async def route_command(command, *, allow_local_ai=True):
 
     if not command_lower:
         return True
+
+    if normalize_core_text(command) in {
+        "lich su tro chuyen", "xem lich su tro chuyen", "lich su chat", "xem chat cu",
+    }:
+        rows = CORE.conversation.recent(20)
+        if not rows:
+            message = "ℹ️ Jarvis chưa có lịch sử trò chuyện."
+        else:
+            source_names = {"gtk": "Ứng dụng", "discord": "Discord", "terminal": "Terminal"}
+            lines = ["🗃️ **LỊCH SỬ TRÒ CHUYỆN GẦN ĐÂY**"]
+            for row in rows:
+                role = "Bạn" if row["role"] == "user" else "Jarvis"
+                source_name = source_names.get(row["source"], row["source"])
+                content = redact_sensitive(row["content"]).replace("\n", " ")[:180]
+                lines.append(f"• {role} · {source_name}: {content}")
+            message = "\n".join(lines)
+        set_command_response(message)
+        return True
+
+    plain_command = normalize_core_text(command)
+    is_zalo_analysis = "zalo" in plain_command and any(term in plain_command for term in (
+        "tom tat", "tong hop", "doc", "co gi", "viec can lam", "hoi",
+        "su kien", "kiem tra", "cho toi biet",
+    ))
+    if is_zalo_analysis:
+        selected_date, group_query, question = parse_zalo_request(command)
+        mentions_date = any(term in plain_command for term in ("hom nay", "hom qua", "ngay"))
+        if mentions_date and selected_date is None:
+            message = "ℹ️ Ngày không hợp lệ. Ví dụ: `tóm tắt zalo ngày 12/08/2026`."
+            set_command_response(message)
+            return True
+        return await summarize_zalo_work(
+            selected_date=selected_date,
+            group_query=group_query,
+            question=question,
+        )
 
     # ------------------------------------------------------
     # BẬT LẠI MÀN HÌNH - KHÔNG BỎ QUA KHÓA/MẬT KHẨU
@@ -4145,10 +4851,7 @@ async def route_command(command, *, allow_local_ai=True):
         if category_key:
             show_help_category(category_key)
         else:
-            message = (
-                "Tôi chưa tìm thấy nhóm đó. Hãy chọn: Bộ nhớ, File & ổ đĩa, "
-                "Hệ thống, Web, Ứng dụng, Âm thanh hoặc Nguồn & lịch."
-            )
+            message = f"Tôi chưa tìm thấy nhóm đó. Hãy chọn: {format_category_choices()}."
             print(f"Jarvis: {message}")
             set_command_response(message)
         return True
@@ -4192,6 +4895,8 @@ async def route_command(command, *, allow_local_ai=True):
     # sớm hơn, lệnh đúng như "mở youtube cá nhân" sẽ bị hỏi lại thay vì chạy.
     known_suggestion = _suggest_known_command(command)
     if known_suggestion:
+        match = re.search(r"`([^`]+)`", known_suggestion)
+        _remember_command_suggestion(source, match.group(1) if match else None)
         print(f"Jarvis: {known_suggestion}")
         set_command_response(known_suggestion)
         return True
@@ -4222,12 +4927,19 @@ async def route_command(command, *, allow_local_ai=True):
         routed_command = _command_from_local_ai_decision(decision, command)
         if routed_command:
             print(f"Jarvis: AI hiểu lệnh là: {routed_command}")
-            return await route_command(routed_command, allow_local_ai=False)
+            return await route_command(
+                routed_command, allow_local_ai=False, source=source
+            )
         local_answer = decision.get("reply") or _suggest_local_ai_command(decision) or (
             "🤔 Tôi chưa hiểu rõ lệnh đó. Hãy viết lại cụ thể hơn hoặc gõ "
             "`help` để xem các lệnh mẫu."
         )
     print(f"Jarvis: {local_answer}")
+    suggestion_match = re.search(
+        r"Có phải bạn muốn(?: dùng lệnh)? `([^`]+)`\?", local_answer
+    )
+    if suggestion_match:
+        _remember_command_suggestion(source, suggestion_match.group(1))
     set_command_response(local_answer)
 
     return True
@@ -4307,6 +5019,47 @@ class DiscordHelpCategoryView(discord.ui.View):
             self.add_item(button)
 
 
+class DiscordZaloSendConfirmationView(discord.ui.View):
+    """One-time confirmation for a scheduled external Zalo message."""
+    def __init__(self, reminder):
+        super().__init__(timeout=60)
+        self.reminder = reminder
+        self.used = False
+
+    async def interaction_check(self, interaction):
+        owner_id = _env_int("DISCORD_USER_ID")
+        if self.used or interaction.user.id != owner_id:
+            await interaction.response.send_message("Bạn không thể xác nhận yêu cầu này.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Xác nhận gửi Zalo", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, _button):
+        self.used = True
+        await interaction.response.edit_message(content="⏳ Jarvis đang gửi tin Zalo…", view=None)
+        ok, detail = await send_zalo_message(
+            self.reminder.get("recipient", ""), self.reminder["content"], send=True,
+            tag=self.reminder.get("zalo_tag", ""),
+        )
+        if ok:
+            CORE.reminders.mark_delivered(self.reminder["id"])
+            await interaction.followup.send(f"✅ {detail}")
+        else:
+            CORE.reminders.mark_cancelled(self.reminder["id"])
+            await interaction.followup.send(f"❌ {detail}")
+
+    @discord.ui.button(label="Hủy", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, _button):
+        self.used = True
+        CORE.reminders.mark_cancelled(self.reminder["id"])
+        await interaction.response.edit_message(content="Đã hủy gửi tin Zalo.", view=None)
+
+    async def on_timeout(self):
+        if not self.used:
+            CORE.reminders.mark_cancelled(self.reminder["id"])
+            self.used = True
+
+
 class DiscordDangerConfirmationView(discord.ui.View):
     """Single-use, owner-only confirmation that expires after 60 seconds."""
 
@@ -4349,7 +5102,7 @@ class DiscordDangerConfirmationView(discord.ui.View):
         try:
             async with discord_command_lock:
                 last_command_response = None
-                await route_command(self.command)
+                await route_command(self.command, source="discord")
                 response = redact_sensitive(
                     last_command_response or "✅ Jarvis đã xử lý lệnh."
                 )
@@ -4436,7 +5189,7 @@ def _discord_command_needs_profile(command):
 
 async def start_discord_bot():
     """Chạy Discord bot song song với giao diện Terminal của Jarvis."""
-    global discord_client
+    global discord_client, discord_notification_channel_id
 
     token = os.getenv("DISCORD_TOKEN", "").strip()
     owner_id = _env_int("DISCORD_USER_ID")
@@ -4470,6 +5223,7 @@ async def start_discord_bot():
 
     @client.event
     async def on_message(message):
+        global discord_notification_channel_id
         if message.author.bot:
             return
 
@@ -4479,9 +5233,21 @@ async def start_discord_bot():
         if channel_id is not None and message.channel.id != channel_id:
             return
 
+        # Khi .env không khóa một channel cụ thể, dùng kênh hợp lệ gần nhất
+        # của chính chủ làm nơi gửi lời nhắc chủ động.
+        discord_notification_channel_id = message.channel.id
+
         command = message.content.strip()
 
         if not command:
+            return
+
+        command, confirmation_note = resolve_command_confirmation(command, "discord")
+        if confirmation_note and normalize_core_text(message.content) in SUGGESTION_REJECTIONS:
+            await message.reply(confirmation_note, mention_author=False)
+            return
+        if confirmation_note and command == message.content.strip():
+            await message.reply(confirmation_note, mention_author=False)
             return
 
         settings = CORE.security.settings()
@@ -4615,17 +5381,14 @@ async def start_discord_bot():
             last_command_response = None
 
             async with discord_command_lock:
-                await route_command(command)
+                await route_command(command, source="discord")
 
             speak_last_response()
 
             if last_command_response:
-                # Discord giới hạn một message khoảng 2000 ký tự.
+                # Discord giới hạn một message khoảng 2000 ký tự. Bản tổng hợp
+                # Zalo có thể dài vì gồm tới 20 nhóm, nên chia theo dòng thay vì cắt mất.
                 response_text = redact_sensitive(last_command_response)
-
-                if len(response_text) > 1900:
-                    response_text = response_text[:1900] + "\n..."
-
                 CORE.conversation.add("discord", "assistant", response_text)
                 response_view = None
                 if last_command_response.startswith("🧰 **JARVIS CÓ THỂ"):
@@ -4641,11 +5404,22 @@ async def start_discord_bot():
                             response_view = DiscordHelpCommandView(
                                 category_key, owner_id
                             )
+                chunks = []
+                remaining = response_text
+                while remaining:
+                    if len(remaining) <= 1900:
+                        chunks.append(remaining)
+                        break
+                    split_at = remaining.rfind("\n", 0, 1900)
+                    if split_at < 500:
+                        split_at = 1900
+                    chunks.append(remaining[:split_at].rstrip())
+                    remaining = remaining[split_at:].lstrip()
                 await message.reply(
-                    response_text,
-                    mention_author=False,
-                    view=response_view,
+                    chunks[0], mention_author=False, view=response_view
                 )
+                for chunk in chunks[1:]:
+                    await message.channel.send(chunk)
             else:
                 CORE.conversation.add("discord", "assistant", "✅ Jarvis đã xử lý lệnh.")
                 await message.reply(
@@ -4749,6 +5523,7 @@ async def main():
         print("Jarvis: Discord vẫn tiếp tục nhận lệnh.")
 
     discord_task = asyncio.create_task(start_discord_bot())
+    reminder_task = asyncio.create_task(reminder_dispatch_loop())
 
     try:
         if interactive_terminal:
@@ -4759,13 +5534,21 @@ async def main():
                 try:
                     print()
                     command = (await asyncio.to_thread(input, "Bạn: ")).strip()
+                    original_command = command
 
                     global last_command_response
                     last_command_response = None
 
                     if command:
                         CORE.conversation.add("terminal", "user", command)
-                    running = await route_command(command)
+                    command, confirmation_note = resolve_command_confirmation(
+                        command, "terminal"
+                    )
+                    if confirmation_note and command == original_command:
+                        set_command_response(confirmation_note)
+                        running = True
+                    else:
+                        running = await route_command(command, source="terminal")
                     if last_command_response:
                         CORE.conversation.add(
                             "terminal", "assistant", last_command_response
@@ -4798,9 +5581,15 @@ async def main():
 
         if not discord_task.done():
             discord_task.cancel()
+        if not reminder_task.done():
+            reminder_task.cancel()
 
         try:
             await discord_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await reminder_task
         except asyncio.CancelledError:
             pass
 

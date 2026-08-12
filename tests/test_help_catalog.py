@@ -5,6 +5,7 @@ from jarvis_core.help_catalog import (
     format_help_category,
     format_help_overview,
     format_recent_updates,
+    format_category_choices,
     resolve_help_category,
 )
 
@@ -31,6 +32,16 @@ class HelpCatalogTests(unittest.TestCase):
         self.assertIn("Sleep theo giờ", message)
         self.assertIn("sleep sâu lúc 23:30", message)
         self.assertIn("Bảo mật Discord", message)
+
+    def test_zalo_and_reminders_are_discoverable_everywhere(self):
+        self.assertIn("zalo", HELP_CATEGORIES)
+        zalo = "\n".join(command for _label, command in HELP_CATEGORIES["zalo"]["commands"])
+        power = "\n".join(command for _label, command in HELP_CATEGORIES["power"]["commands"])
+        self.assertIn("tóm tắt zalo ngày", zalo)
+        self.assertIn("gửi tin nhắn cho Minh", zalo)
+        self.assertIn("sau 2h nữa", zalo)
+        self.assertIn("nhắc tôi sau", power)
+        self.assertIn("Zalo công việc", format_category_choices())
 
 
 if __name__ == "__main__":

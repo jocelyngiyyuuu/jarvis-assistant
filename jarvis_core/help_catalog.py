@@ -17,6 +17,7 @@ HELP_CATEGORIES = {
             ("Xem tất cả", "xem bộ nhớ"),
             ("Cập nhật", "cập nhật mục 1 thành nội dung mới"),
             ("Quên theo ID", "quên mục 1"),
+            ("Lịch sử trò chuyện", "lịch sử trò chuyện"),
         ),
     },
     "files": {
@@ -59,6 +60,32 @@ HELP_CATEGORIES = {
             ("ChatGPT", "mở chatgpt học"),
         ),
     },
+    "zalo": {
+        "title": "Zalo công việc",
+        "icon": "💬",
+        "description": "Mở Zalo học, tóm tắt theo ngày/nhóm, hỏi sự kiện, soạn và hẹn gửi có xác nhận Discord.",
+        "aliases": ("zalo", "zalo cong viec", "tin nhan", "nhan zalo"),
+        "commands": (
+            ("Mở Zalo mặc định Chrome học", "mở zalo"),
+            ("Tóm tắt tối đa 20 nhóm", "tóm tắt zalo công việc"),
+            ("Tóm tắt hôm nay", "tóm tắt zalo hôm nay"),
+            ("Tóm tắt hôm qua", "tóm tắt zalo hôm qua"),
+            ("Tóm tắt theo ngày", "tóm tắt zalo ngày 12/08/2026"),
+            ("Tóm tắt một nhóm", "tóm tắt zalo nhóm PRF193 hôm nay"),
+            ("Hỏi sự kiện trong nhóm", "hỏi zalo nhóm PRF193 hôm nay về khảo sát"),
+            ("Soạn bản nháp", "soạn zalo cho Minh: nội dung cần gửi"),
+            ("Soạn mặc định Zalo học", "soạn tin nhắn cho Minh với nội dung test"),
+            ("Soạn theo thẻ", "soạn zalo thẻ Trả lời sau cho Minh: nội dung cần gửi"),
+            ("Gửi ngay có xác nhận", "gửi tin nhắn cho Minh với nội dung test"),
+            ("Hẹn theo giờ", "nhắn zalo cho Minh lúc 20:30: nội dung cần gửi"),
+            ("Hẹn theo ngày giờ", "nhắn zalo cho Minh lúc 19:30 ngày 13/08/2026: nội dung cần gửi"),
+            ("Hẹn sau một khoảng", "nhắn zalo cho Minh sau 2h nữa: nội dung cần gửi"),
+            ("Thời gian ở đầu câu", "sau 1h15p hãy nhắn zalo cho Suri với nội dung ra phơi đồ với a2"),
+            ("Mặc định Zalo khi hẹn", "sau 10s gửi tin nhắn cho Minh với nội dung test"),
+            ("Hẹn theo thẻ Gia đình", "nhắn zalo thẻ Gia đình cho Minh lúc 20:30: nội dung cần gửi"),
+            ("Hẹn thẻ Trả lời sau", "nhắn zalo thẻ Trả lời sau cho Minh sau 30p nữa: nội dung cần gửi"),
+        ),
+    },
     "apps": {
         "title": "Ứng dụng Ubuntu",
         "icon": "🖥️",
@@ -98,12 +125,99 @@ HELP_CATEGORIES = {
             ("Hẹn lúc 23:30", "sleep sâu lúc 23:30"),
             ("Xem lịch", "lịch sleep sâu"),
             ("Hủy lịch", "hủy sleep sâu"),
+            ("Nhắc sau 30 phút", "nhắc tôi sau 30p kiểm tra đơn hàng"),
+            ("Nhắc thời lượng ghép", "nhắc tôi sau 1h15p đi phơi đồ"),
+            ("Tạo nhắc tự nhiên", "tạo nhắc nhở phơi đồ sau 1h15p"),
+            ("Nhắc với thời gian trước", "sau 1h15p hãy nhắc tôi đi phơi đồ"),
+            ("Nhắc theo ngày giờ", "nhắc tôi lúc 19:30 ngày 13/08/2026: gọi khách hàng"),
+            ("Xem lịch nhắc", "lịch nhắc"),
+            ("Chọn lịch cần hủy", "hủy lịch nhắc"),
         ),
     },
 }
 
 
 RECENT_UPDATES = (
+    (
+        "Hẹn gửi tin mặc định qua Zalo học",
+        "Câu 'sau 10s gửi tin nhắn cho...' không cần nói Zalo/profile và được lưu thành lịch gửi.",
+        "sau 10s gửi tin nhắn cho Minh với nội dung test",
+    ),
+    (
+        "Mở Zalo mặc định bằng Chrome học",
+        "Các lệnh mở/vào Zalo không cần nói profile; chỉ dùng Chrome cá nhân khi bạn yêu cầu rõ.",
+        "mở zalo",
+    ),
+    (
+        "Hẹn nhắn Zalo với thời gian ở đầu câu",
+        "Hiểu dạng 'sau 1h15p hãy nhắn Zalo cho...' và lưu lịch ngay cả khi tab Zalo chưa mở.",
+        "sau 1h15p hãy nhắn zalo cho Suri với nội dung ra phơi đồ với a2",
+    ),
+    (
+        "Câu nhắc tự nhiên với thời gian ở đầu",
+        "Hiểu trực tiếp dạng 'sau 1h15p hãy nhắc tôi...' và tạo lịch mà không cần cú pháp cố định.",
+        "sau 1h15p hãy nhắc tôi đi phơi đồ",
+    ),
+    (
+        "Chọn lịch nhắc cần hủy",
+        "Lệnh hủy hiển thị ID, thời gian, loại, người nhận và nội dung trước khi bạn chọn; không mặc định lịch #1.",
+        "hủy lịch nhắc",
+    ),
+    (
+        "Thời lượng nhắc việc linh hoạt",
+        "Hiểu thời lượng ghép 1h15p/1h 15p và câu tự nhiên 'tạo nhắc nhở ... sau ...' mà không đẩy sang AI.",
+        "tạo nhắc nhở phơi đồ sau 1h15p",
+    ),
+    (
+        "Xác minh gửi Zalo",
+        "Chỉ báo đã gửi khi ô soạn trống và bong bóng chứa đúng nội dung thực sự xuất hiện; không còn báo thành công chỉ vì đã nhấn phím.",
+        "gửi tin nhắn cho Minh với nội dung test",
+    ),
+    (
+        "Mặc định nhắn tin bằng Zalo học",
+        "Lệnh soạn/nhắn/gửi cho một người không cần nói lại nền tảng; Jarvis dùng Zalo Web trong Chrome học.",
+        "soạn tin nhắn cho Minh với nội dung test",
+    ),
+    (
+        "Phiên chat mới khi mở ứng dụng",
+        "GTK không tải lại bong bóng cũ; lịch sử vẫn được lưu local và chỉ hiện khi bạn yêu cầu.",
+        "lịch sử trò chuyện",
+    ),
+    (
+        "Gửi Zalo an toàn",
+        "Hiểu câu gửi tin tự nhiên, tìm đúng người và chỉ gửi sau khi chủ tài khoản bấm nút xác nhận Discord.",
+        "gửi tin nhắn cho Minh với nội dung test",
+    ),
+    (
+        "Tìm liên hệ theo thẻ Zalo",
+        "Giới hạn người nhận trong thẻ Trả lời sau hoặc Gia đình để tránh nhầm người trùng tên.",
+        "soạn zalo thẻ Trả lời sau cho Minh: nội dung cần gửi",
+    ),
+    (
+        "Hẹn gửi Zalo",
+        "Hẹn theo giờ, ngày giờ hoặc sau một khoảng; tới hạn Discord hiển thị bản xem trước và nút xác nhận 60 giây.",
+        "nhắn zalo cho Minh sau 2h nữa: nội dung cần gửi",
+    ),
+    (
+        "Zalo theo ngày, nhóm và sự kiện",
+        "Tóm tắt đúng ngày, chọn một nhóm, giữ liên kết và trả lời câu hỏi kèm bằng chứng từ tin nhắn.",
+        "hỏi zalo nhóm PRF193 hôm nay về khảo sát",
+    ),
+    (
+        "Nhắc việc chủ động qua Discord",
+        "Lưu lịch bền vững, nhắc theo khoảng thời gian hoặc ngày giờ, xem và hủy từng lịch.",
+        "nhắc tôi sau 30p kiểm tra công việc",
+    ),
+    (
+        "Tổng hợp Zalo công việc",
+        "Đọc cục bộ tối đa 20 nhóm Công việc, tóm tắt, liệt kê việc cần làm và giữ lại các liên kết trên GTK/Discord.",
+        "tóm tắt zalo công việc",
+    ),
+    (
+        "Xác nhận lệnh gõ sai",
+        "Trả lời đúng/phải/ok để chạy lệnh Jarvis vừa gợi ý; lệnh nguy hiểm vẫn giữ lớp xác nhận Discord.",
+        "mở vscod",
+    ),
     (
         "Đồng bộ nhiều kênh",
         "GTK, Discord và Terminal dùng chung lịch sử, phiên YouTube, timer và bộ nhớ.",
@@ -157,7 +271,7 @@ def format_help_overview():
             f"{category['icon']} **{category['title']}** — {category['description']}"
         )
     lines.extend(
-        ["", "Chọn một nhóm trên ứng dụng hoặc nhập `help bộ nhớ`, `help file`, `help hệ thống`…"]
+        ["", "Chọn một nhóm trên ứng dụng hoặc nhập `help bộ nhớ`, `help file`, `help zalo`, `help lịch`…"]
     )
     return "\n".join(lines)
 
@@ -180,3 +294,8 @@ def format_recent_updates():
         lines.extend([f"**{title}**", f"• {description}", f"• Thử: `{command}`", ""])
     lines.append("Gõ `help` hoặc `khám phá chức năng` để xem toàn bộ khả năng.")
     return "\n".join(lines)
+
+
+def format_category_choices():
+    """Generate category guidance from the same catalog used by GTK/Discord."""
+    return ", ".join(category["title"] for category in HELP_CATEGORIES.values())

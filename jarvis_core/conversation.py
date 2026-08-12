@@ -61,3 +61,11 @@ class ConversationStore:
                 (max(1, min(int(limit), 500)),),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
+
+    def latest_id(self):
+        """Return the archive cursor without loading old messages into a new UI session."""
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(id), 0) AS latest_id FROM conversation_events"
+            ).fetchone()
+        return int(row["latest_id"])

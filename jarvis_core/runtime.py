@@ -10,6 +10,7 @@ from .local_ai import LocalAI
 from .memory import MemoryStore
 from .monitoring import SystemMonitor
 from .security import RemoteSecurity
+from .reminders import ReminderStore
 
 
 class JarvisCore:
@@ -27,6 +28,7 @@ class JarvisCore:
             base_dir / ".jarvis_data" / "conversation.sqlite3"
         )
         self.security = RemoteSecurity(base_dir / ".jarvis_data")
+        self.reminders = ReminderStore(base_dir / ".jarvis_data" / "reminders.sqlite3")
 
     def handle(self, command):
         intent = self.brain.detect(command)

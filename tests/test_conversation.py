@@ -28,6 +28,15 @@ class ConversationStoreTests(unittest.TestCase):
                 [row["content"] for row in store.recent(2)], ["hai", "ba"]
             )
 
+    def test_latest_id_starts_fresh_view_without_deleting_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConversationStore(Path(directory) / "conversation.sqlite3")
+            first = store.add("gtk", "user", "tin cũ")
+            self.assertEqual(store.latest_id(), first)
+            second = store.add("discord", "assistant", "tin mới")
+            self.assertEqual([row["id"] for row in store.since(first)], [second])
+            self.assertEqual(len(store.recent()), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
