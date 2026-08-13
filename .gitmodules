@@ -1,0 +1,3 @@
+[submodule "tts/VieNeu-TTS"]
+	path = tts/VieNeu-TTS
+	url = https://github.com/pnnbao97/VieNeu-TTS.git

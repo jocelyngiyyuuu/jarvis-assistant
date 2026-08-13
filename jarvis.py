@@ -711,6 +711,80 @@ async def extract_videos_from_page(session, limit=10):
 # TẠO MCP SERVER
 # ==========================================================
 
+MCP_ERROR_LOG_MAX_BYTES = 5 * 1024 * 1024
+MCP_ERROR_LOG_BACKUP_COUNT = 2
+MCP_IGNORED_STDERR_LINES = {
+    "No handler registered for issue code PerformanceIssue",
+}
+
+
+class MCPErrorLogFilter:
+    """Pipe MCP stderr to disk while dropping one known upstream warning."""
+
+    def __init__(self, log_path):
+        self._log = open(log_path, "ab", buffering=0)
+        self._read_fd, self._write_fd = os.pipe()
+        self._closed = False
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def fileno(self):
+        return self._write_fd
+
+    def _drain(self):
+        buffer = b""
+        with os.fdopen(self._read_fd, "rb", buffering=0) as source:
+            while chunk := source.read(8192):
+                buffer += chunk
+                lines = buffer.split(b"\n")
+                buffer = lines.pop()
+                for line in lines:
+                    text = line.decode("utf-8", errors="replace").rstrip("\r")
+                    if text not in MCP_IGNORED_STDERR_LINES:
+                        self._log.write(line + b"\n")
+            if buffer:
+                text = buffer.decode("utf-8", errors="replace").rstrip("\r")
+                if text not in MCP_IGNORED_STDERR_LINES:
+                    self._log.write(buffer)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        os.close(self._write_fd)
+        # stdio_client has already stopped the MCP child before this method is
+        # called, so EOF is guaranteed. Wait for the complete stderr drain
+        # before closing the destination file; never race a live writer.
+        self._thread.join()
+        self._log.close()
+
+
+def rotate_mcp_error_log(
+    log_path,
+    *,
+    max_bytes=MCP_ERROR_LOG_MAX_BYTES,
+    backup_count=MCP_ERROR_LOG_BACKUP_COUNT,
+):
+    """Rotate an oversized MCP stderr log before opening a new session."""
+    path = Path(log_path)
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return False
+        if backup_count <= 0:
+            path.unlink()
+            return True
+        Path(f"{path}.{backup_count}").unlink(missing_ok=True)
+        for index in range(backup_count - 1, 0, -1):
+            source = Path(f"{path}.{index}")
+            if source.exists():
+                source.replace(Path(f"{path}.{index + 1}"))
+        path.replace(Path(f"{path}.1"))
+        return True
+    except OSError as error:
+        print(f"Jarvis: Không thể xoay mcp_errors.log: {error}")
+        return False
+
+
 def create_mcp_server():
     return StdioServerParameters(
         command="npx",
@@ -719,6 +793,7 @@ def create_mcp_server():
             "chrome-devtools-mcp@latest",
             "--autoConnect",
             "--no-usage-statistics",
+            "--no-performance-crux",
         ],
     )
 
@@ -742,16 +817,13 @@ async def get_mcp_session():
         # chrome-devtools-mcp đôi khi ghi cảnh báo lặp lại vào stderr
         # (ví dụ PerformanceIssue). Chuyển stderr sang file log để Terminal
         # của Jarvis không bị spam, nhưng vẫn giữ log để kiểm tra khi cần.
-        mcp_errlog = open(
-            Path(__file__).resolve().parent / "mcp_errors.log",
-            "a",
-            encoding="utf-8",
-            buffering=1,
-        )
+        mcp_log_path = Path(__file__).resolve().parent / "mcp_errors.log"
+        rotate_mcp_error_log(mcp_log_path)
+        mcp_errlog = MCPErrorLogFilter(mcp_log_path)
 
         mcp_stdio_context = stdio_client(
             server,
-            errlog=mcp_errlog,
+            errlog=mcp_errlog,  # type: ignore[arg-type]
         )
         read, write = await mcp_stdio_context.__aenter__()
 

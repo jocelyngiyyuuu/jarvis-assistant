@@ -5,7 +5,9 @@ venv/
 .venv/
 
 mcp_errors.log
+mcp_errors.log.*
 .jarvis_data/
+backups/
 *_backup*.py
 /test_*.py
 
