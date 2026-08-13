@@ -1,5 +1,7 @@
 """Track and close individual desktop windows opened by Jarvis."""
 
+import ctypes
+import ctypes.util
 import re
 import subprocess
 import time
@@ -131,6 +133,167 @@ class ChromeWindowManager(FileWindowManager):
     def __init__(self):
         super().__init__()
         self.profile_windows = {}
+        self.automation_window_id = None
+
+    @staticmethod
+    def _normalize_window_id(window_id):
+        try:
+            return hex(int(str(window_id), 16))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _window_pid(window_id):
+        try:
+            result = subprocess.run(
+                ["xprop", "-id", window_id, "_NET_WM_PID"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        match = re.search(r"=\s*(\d+)\s*$", result.stdout)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _active_window_id():
+        try:
+            result = subprocess.run(
+                ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+                capture_output=True, text=True, check=False, timeout=2,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return None
+        match = re.search(r"0x[0-9a-f]+", result.stdout, re.IGNORECASE)
+        return ChromeWindowManager._normalize_window_id(match.group(0)) if match else None
+
+    @staticmethod
+    def _x11_force_focus(window_id):
+        library = ctypes.util.find_library("X11")
+        if not library:
+            return False
+        display = None
+        try:
+            x11 = ctypes.CDLL(library)
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            x11.XMapRaised.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XMapRaised.restype = ctypes.c_int
+            x11.XSetInputFocus.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong,
+            ]
+            x11.XSetInputFocus.restype = ctypes.c_int
+            x11.XFlush.argtypes = [ctypes.c_void_p]
+            x11.XFlush.restype = ctypes.c_int
+            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            x11.XCloseDisplay.restype = ctypes.c_int
+            display = x11.XOpenDisplay(None)
+            if not display:
+                return False
+            window = ctypes.c_ulong(int(window_id, 16))
+            x11.XMapRaised(display, window)
+            x11.XSetInputFocus(display, window, 2, 0)
+            x11.XFlush(display)
+            return True
+        except (OSError, TypeError, ValueError, ctypes.ArgumentError):
+            return False
+        finally:
+            if display:
+                try:
+                    x11.XCloseDisplay(display)
+                except (OSError, TypeError, ctypes.ArgumentError):
+                    pass
+
+    def _focus_window(self, window_id):
+        try:
+            subprocess.run(
+                ["wmctrl", "-ia", window_id],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False, timeout=2,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            pass
+        time.sleep(0.05)
+        normalized_id = self._normalize_window_id(window_id)
+        if self._active_window_id() == normalized_id:
+            return True
+        if not self._x11_force_focus(window_id):
+            return False
+        time.sleep(0.05)
+        return self._active_window_id() == normalized_id
+
+    def activate_automation_window(
+        self, previous_ids, owner_pid, target_hint, timeout=10.0
+    ):
+        """Activate only the X11 window owned by Jarvis' CDP Chrome PID."""
+        deadline = time.monotonic() + timeout
+        selected_id = None
+        previous_normalized = {
+            self._normalize_window_id(window_id) for window_id in previous_ids
+        }
+        target_hint = str(target_hint or "").casefold()
+        while time.monotonic() < deadline:
+            windows = [
+                window for window in self.list_windows()
+                if self._window_pid(window["id"]) == owner_pid
+            ]
+            current_ids = {
+                self._normalize_window_id(window["id"]) for window in windows
+            }
+            new_windows = [
+                window for window in windows
+                if self._normalize_window_id(window["id"]) not in previous_normalized
+            ]
+            if len(new_windows) == 1 and target_hint in new_windows[0].get(
+                "title", ""
+            ).casefold():
+                selected_id = new_windows[0]["id"]
+                break
+            if len(new_windows) > 1:
+                matching_new = [
+                    window for window in new_windows
+                    if target_hint in window.get("title", "").casefold()
+                ]
+                if len(matching_new) == 1:
+                    selected_id = matching_new[0]["id"]
+                    break
+                time.sleep(0.15)
+                continue
+            target_windows = [
+                window for window in windows
+                if target_hint and target_hint in window.get("title", "").casefold()
+            ]
+            active_id = self._active_window_id()
+            target_ids = {
+                self._normalize_window_id(window["id"])
+                for window in target_windows
+            }
+            if active_id in target_ids:
+                selected_id = next(
+                    window["id"] for window in target_windows
+                    if self._normalize_window_id(window["id"]) == active_id
+                )
+                break
+            if (
+                self._normalize_window_id(self.automation_window_id) in target_ids
+            ):
+                selected_id = self.automation_window_id
+                break
+            if len(target_windows) == 1:
+                selected_id = target_windows[0]["id"]
+                break
+            time.sleep(0.15)
+
+        if selected_id is None:
+            return False
+        if not self._focus_window(selected_id):
+            return False
+        self.automation_window_id = selected_id
+        return True
 
     def track_profile_window(self, profile, previous_ids, timeout=10.0):
         deadline = time.monotonic() + timeout

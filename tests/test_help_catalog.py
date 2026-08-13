@@ -41,6 +41,8 @@ class HelpCatalogTests(unittest.TestCase):
         self.assertIn("gửi tin nhắn cho Minh", zalo)
         self.assertIn("sau 2h nữa", zalo)
         self.assertIn("nhắc tôi sau", power)
+        web = "\n".join(command for _label, command in HELP_CATEGORIES["web"]["commands"])
+        self.assertIn("youtube đang phát gì", web)
         self.assertIn("Zalo công việc", format_category_choices())
 
 

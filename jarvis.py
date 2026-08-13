@@ -12,7 +12,8 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
+from urllib.request import urlopen
 
 import discord
 from dotenv import load_dotenv
@@ -45,6 +46,7 @@ discord_client = None
 discord_notification_channel_id = None
 discord_command_lock = asyncio.Lock()
 last_command_response = None
+last_spoken_response = None
 pending_command_suggestions = {}
 SUGGESTION_CONFIRM_TTL_SECONDS = 120
 
@@ -74,6 +76,11 @@ file_search_results = []
 
 PERSONAL_PROFILE = "Default"
 STUDY_PROFILE = "Profile 1"
+JARVIS_CHROME_PROFILE = "Jarvis"
+JARVIS_CHROME_PROFILE_NAME = "Jarvis"
+JARVIS_CHROME_DATA_DIR = Path.home() / ".config" / "jarvis-chrome"
+JARVIS_CHROME_DEBUG_PORT = 9223
+JARVIS_CHROME_DEBUG_URL = f"http://127.0.0.1:{JARVIS_CHROME_DEBUG_PORT}"
 
 
 # ==========================================================
@@ -246,7 +253,7 @@ def jarvis_say(text, *, show=True):
 def speak_last_response():
     """Đọc phản hồi cuối mà route_command đã lưu cho Terminal/Discord."""
     if last_command_response:
-        speak(last_command_response)
+        speak(last_spoken_response or last_command_response)
 
 
 # ==========================================================
@@ -387,8 +394,123 @@ def choose_chrome_profile(command=""):
 # MỞ CHROME
 # ==========================================================
 
+def _jarvis_debug_port_owner_pid():
+    """Return the PID listening on Jarvis' loopback DevTools port."""
+    try:
+        result = subprocess.run(
+            [
+                "lsof", "-nP",
+                f"-iTCP:{JARVIS_CHROME_DEBUG_PORT}",
+                "-sTCP:LISTEN", "-t",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    try:
+        return int(lines[0])
+    except ValueError:
+        return None
+
+
+def _process_has_jarvis_chrome_args(pid):
+    """Verify the listener belongs to Chrome launched with Jarvis' data dir."""
+    try:
+        command = Path(f"/proc/{int(pid)}/cmdline").read_bytes().replace(b"\0", b" ")
+    except (OSError, TypeError, ValueError):
+        return False
+    expected_data_dir = (
+        f"--user-data-dir={JARVIS_CHROME_DATA_DIR.resolve()}".encode()
+    )
+    expected_port = f"--remote-debugging-port={JARVIS_CHROME_DEBUG_PORT}".encode()
+    tokens = command.split()
+    return expected_data_dir in tokens and expected_port in tokens
+
+
+def _jarvis_chrome_ready():
+    """Return whether the dedicated loopback DevTools endpoint is ready."""
+    owner_pid = _jarvis_debug_port_owner_pid()
+    if owner_pid is None or not _process_has_jarvis_chrome_args(owner_pid):
+        return False
+    try:
+        with urlopen(f"{JARVIS_CHROME_DEBUG_URL}/json/version", timeout=0.5) as response:
+            if response.status != 200:
+                return False
+            metadata = json.loads(response.read().decode("utf-8"))
+            browser = str(metadata.get("Browser", "")).lower()
+            websocket_url = str(metadata.get("webSocketDebuggerUrl", ""))
+            websocket = urlparse(websocket_url)
+            return (
+                ("chrome/" in browser or "chromium/" in browser)
+                and websocket.scheme == "ws"
+                and websocket.hostname == "127.0.0.1"
+                and websocket.port == JARVIS_CHROME_DEBUG_PORT
+            )
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def ensure_jarvis_chrome(url="chrome://newtab/"):
+    """Start or reuse Jarvis' isolated Chrome profile without consent popups."""
+    JARVIS_CHROME_DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    JARVIS_CHROME_DATA_DIR.chmod(0o700)
+    if url == "chrome://newtab/" and _jarvis_chrome_ready():
+        return True
+    args = [
+        "google-chrome",
+        "--ozone-platform=x11",
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={JARVIS_CHROME_DEBUG_PORT}",
+        f"--user-data-dir={JARVIS_CHROME_DATA_DIR}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        url,
+    ]
+    subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _attempt in range(40):
+        if _jarvis_chrome_ready():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _is_automation_url(url):
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except (TypeError, ValueError):
+        return False
+    return (
+        host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "chat.zalo.me"
+    )
+
+
 def open_chrome(profile, url):
     previous_window_ids = CHROME_WINDOWS.snapshot_ids()
+    if _is_automation_url(url):
+        target_hint = "zalo" if (urlparse(url).hostname or "").lower() == "chat.zalo.me" else "youtube"
+        opened = ensure_jarvis_chrome(url)
+        owner_pid = _jarvis_debug_port_owner_pid() if opened else None
+        return bool(
+            owner_pid is not None
+            and CHROME_WINDOWS.activate_automation_window(
+                previous_window_ids, owner_pid, target_hint
+            )
+        )
     subprocess.Popen(
         [
             "google-chrome",
@@ -510,9 +632,16 @@ def handle_chrome_shortcut(command):
         return True
 
     site_name, url = shortcut
-    open_chrome(profile, url)
+    opened = open_chrome(profile, url)
 
-    message = f"✅ Đang mở {site_name} bằng Chrome {profile_name}."
+    if target_text in {"zalo", "zalo web"}:
+        message = "✅ Đã mở Zalo." if opened else "❌ Không thể mở Zalo lúc này."
+    else:
+        message = (
+            f"✅ Đang mở {site_name} bằng Chrome {profile_name}."
+            if opened is not False
+            else f"❌ Không thể mở {site_name} lúc này."
+        )
     print(f"Jarvis: {message}")
     set_command_response(message)
     return True
@@ -791,7 +920,8 @@ def create_mcp_server():
         args=[
             "-y",
             "chrome-devtools-mcp@latest",
-            "--autoConnect",
+            "--browserUrl",
+            JARVIS_CHROME_DEBUG_URL,
             "--no-usage-statistics",
             "--no-performance-crux",
         ],
@@ -810,6 +940,9 @@ async def get_mcp_session():
 
     print()
     print("Jarvis: Đang kết nối Chrome...")
+
+    if not ensure_jarvis_chrome():
+        raise RuntimeError("Không khởi động được Chrome riêng của Jarvis.")
 
     server = create_mcp_server()
 
@@ -986,28 +1119,38 @@ async def summarize_zalo_work(max_chats=20, selected_date=None, group_query=None
             "select_page", arguments={"pageId": page_id, "bringToFront": True}
         )
         prepare_script = r'''async () => {
-            const textLeaf = value => [...document.querySelectorAll('body *')]
-              .find(el => el.childElementCount === 0 && el.textContent.trim() === value);
-            const active = textLeaf('Công việc');
             const open = document.querySelector('[data-id="div_MiniLabel_OpenLabelList"]');
-            if (open) {
-              open.click();
-              await new Promise(r => setTimeout(r, 350));
-              const label = textLeaf('Công việc');
-              if (!label) return {ok:false, error:'Không tìm thấy nhãn Công việc.'};
-              label.click();
-              await new Promise(r => setTimeout(r, 700));
-            } else if (!active) {
+            if (!open) {
               return {ok:false, error:'Không mở được bộ lọc Công việc.'};
             }
-            const rows = [...document.querySelectorAll('[role="grid"] .msg-item')];
+            open.click();
+            await new Promise(r => setTimeout(r, 350));
+            const labels = [...document.querySelectorAll('[data-id="div_DetailLabelList_Label"]')];
+            const label = labels.find(el => (el.textContent || '').trim() === 'Công việc');
+            if (!label) return {ok:false, error:'Không tìm thấy nhãn Công việc.'};
+            if (!label.classList.contains('active')) {
+              label.click();
+              await new Promise(r => setTimeout(r, 700));
+            } else {
+              open.click();
+              await new Promise(r => setTimeout(r, 200));
+            }
+            const rows = [...document.querySelectorAll('[data-id="div_TabMsg_ThrdChItem"].msg-item')];
             return {ok:true, count:rows.length, titles:rows.map(row =>
               (row.querySelector('.conv-item-title__name')?.textContent || '').trim())};
         }'''
-        prepared = _json_from_mcp_result(
-            await session.call_tool("evaluate_script", arguments={"function": prepare_script}),
-            default={},
-        )
+        prepared = {}
+        for prepare_attempt in range(4):
+            prepared = _json_from_mcp_result(
+                await session.call_tool(
+                    "evaluate_script", arguments={"function": prepare_script}
+                ),
+                default={},
+            )
+            if isinstance(prepared, dict) and prepared.get("ok"):
+                break
+            if prepare_attempt < 3:
+                await asyncio.sleep(0.6)
         if not isinstance(prepared, dict) or not prepared.get("ok"):
             detail = prepared.get("error", "Giao diện Zalo đã thay đổi.") if isinstance(prepared, dict) else "Giao diện Zalo đã thay đổi."
             set_command_response(f"❌ Không thể đọc nhãn Công việc: {detail}")
@@ -1031,7 +1174,7 @@ async def summarize_zalo_work(max_chats=20, selected_date=None, group_query=None
         date_text = selected_date.strftime("%d/%m/%Y") if selected_date else ""
         for index in indices:
             script = f'''async () => {{
-              const rows = [...document.querySelectorAll('[role="grid"] .msg-item')];
+              const rows = [...document.querySelectorAll('[data-id="div_TabMsg_ThrdChItem"].msg-item')];
               const row = rows[{index}];
               if (!row) return {{ok:false}};
               const title = (row.querySelector('.conv-item-title__name')?.textContent || 'Nhóm {index + 1}').trim();
@@ -1048,10 +1191,10 @@ async def summarize_zalo_work(max_chats=20, selected_date=None, group_query=None
                 const todayText = `${{pad(today.getDate())}}/${{pad(today.getMonth()+1)}}/${{today.getFullYear()}}`;
                 const blocks = [...area.querySelectorAll('.block-date')];
                 content = blocks.filter(block => {{
-                  const first = (block.innerText || '').split('\n')[0].trim().toLowerCase();
+                  const first = (block.innerText || '').split('\\n')[0].trim().toLowerCase();
                   return first.includes(wantedDate) || first.includes(shortDate) ||
                     (wantedDate === todayText && first.includes('hôm nay'));
-                }}).map(block => block.innerText).join('\n\n');
+                }}).map(block => block.innerText).join('\\n\\n');
               }} else {{
                 content = (area?.innerText || '').trim();
               }}
@@ -1087,11 +1230,14 @@ async def summarize_zalo_work(max_chats=20, selected_date=None, group_query=None
             heading = "📋 **TÓM TẮT ZALO CÔNG VIỆC**"
         scope = f" — {date_text}" if selected_date else ""
         message = f"{heading}{scope}\n\n{summary}"
-        set_command_response(message)
-        print(f"Jarvis: {message}")
+        set_command_response(
+            message,
+            spoken_message="Đã tổng hợp nội dung Zalo theo phạm vi yêu cầu.",
+        )
+        print("Jarvis: Đã tổng hợp nội dung Zalo theo phạm vi yêu cầu.")
         return True
-    except Exception as error:
-        message = f"❌ Không thể tổng hợp Zalo: {error}"
+    except Exception:
+        message = "❌ Không thể tổng hợp Zalo lúc này."
         set_command_response(message)
         print(f"Jarvis: {message}")
         return True
@@ -1201,12 +1347,9 @@ async def open_youtube(command):
     global youtube_videos
     global youtube_page_id
 
-    profile, profile_name = (
-        choose_chrome_profile(command)
-    )
-
-    if profile is None:
-        return
+    # YouTube luôn dùng profile automation riêng, nên không hỏi lại
+    # Chrome Học/Cá nhân cho lệnh không ghi rõ profile.
+    profile, profile_name = JARVIS_CHROME_PROFILE, JARVIS_CHROME_PROFILE_NAME
 
     # Danh sách UID cũ không còn đáng tin khi tab YouTube trước đã bị đóng.
     youtube_videos = []
@@ -1503,6 +1646,172 @@ async def control_youtube_playback(should_play):
         return False
 
 
+def is_youtube_now_playing_command(command):
+    """Recognize read-only questions about the current YouTube player."""
+    plain = re.sub(r"[?!.,;:]+$", "", normalize_core_text(command)).strip()
+    return plain in {
+        "youtube dang phat gi",
+        "dang phat gi",
+        "video dang phat",
+        "video dang phat gi",
+        "bai gi dang phat",
+        "youtube dang mo video gi",
+    }
+
+
+def _format_media_time(value):
+    """Format a media time value as H:MM:SS or M:SS."""
+    try:
+        seconds = max(0, int(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _is_mcp_tool_error(result):
+    """Support the MCP SDK's camelCase error flag and compatible fakes."""
+    return bool(getattr(result, "isError", getattr(result, "is_error", False)))
+
+
+def _is_youtube_watch_url(value):
+    """Accept only HTTP(S) YouTube watch URLs returned by the selected tab."""
+    try:
+        parsed = urlparse(str(value).strip())
+    except (TypeError, ValueError):
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme in {"http", "https"}
+        and (host == "youtube.com" or host.endswith(".youtube.com"))
+        and parsed.path == "/watch"
+    )
+
+
+def _escape_discord_text(value):
+    """Neutralize Markdown and mentions in metadata controlled by YouTube."""
+    text = discord.utils.escape_mentions(clean_title(str(value)))
+    return re.sub(r"([\\`*_{}\[\]()<>#+\-.!|~])", r"\\\1", text)
+
+
+async def report_youtube_now_playing():
+    """Read current YouTube metadata without changing playback or page focus."""
+    global youtube_page_id
+
+    try:
+        session = await get_mcp_session()
+        script = r'''() => {
+            const video = document.querySelector('video.html5-main-video, video');
+            if (!video) {
+                return {ok: false, error: 'Tab YouTube chưa mở video.'};
+            }
+            const text = selector =>
+                (document.querySelector(selector)?.textContent || '')
+                    .replace(/\s+/g, ' ').trim();
+            const meta = selector =>
+                (document.querySelector(selector)?.content || '').trim();
+            const title =
+                text('h1.ytd-watch-metadata yt-formatted-string') ||
+                text('h1.title yt-formatted-string') ||
+                meta('meta[name="title"]') ||
+                document.title.replace(/\s*-\s*YouTube\s*$/, '').trim();
+            const channel =
+                text('ytd-watch-metadata #owner ytd-channel-name a') ||
+                text('#owner-name a') ||
+                meta('meta[itemprop="author"]');
+            return {
+                ok: true,
+                title,
+                channel,
+                paused: Boolean(video.paused),
+                ended: Boolean(video.ended),
+                currentTime: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+                duration: Number.isFinite(video.duration) ? video.duration : 0,
+                url: location.href
+            };
+        }'''
+        state = None
+        page_id = youtube_page_id
+        # First try the remembered page. If selection fails or its evaluated
+        # location is not YouTube /watch, resolve the current YouTube tab once.
+        for attempt in range(2):
+            if page_id is None:
+                page_id = await find_youtube_page(session)
+            if page_id is None:
+                break
+            try:
+                selected = await session.call_tool(
+                    "select_page",
+                    arguments={"pageId": page_id, "bringToFront": False},
+                )
+                if _is_mcp_tool_error(selected):
+                    raise RuntimeError("MCP select_page failed")
+                result = await session.call_tool(
+                    "evaluate_script", arguments={"function": script}
+                )
+                if _is_mcp_tool_error(result):
+                    raise RuntimeError("MCP evaluate_script failed")
+                candidate = _json_from_mcp_result(result, default={})
+                if isinstance(candidate, dict) and _is_youtube_watch_url(
+                    candidate.get("url", "")
+                ):
+                    youtube_page_id = page_id
+                    state = candidate
+                    break
+            except Exception:
+                pass
+            youtube_page_id = None
+            page_id = None
+
+        if state is None:
+            message = "❌ Không tìm thấy tab YouTube đang mở."
+            set_command_response(message)
+            print(f"Jarvis: {message}")
+            return True
+
+        if not isinstance(state, dict) or not state.get("ok"):
+            detail = state.get("error") if isinstance(state, dict) else None
+            message = detail or "Không đọc được trạng thái video YouTube."
+            message = f"ℹ️ {message}"
+        else:
+            title = _escape_discord_text(state.get("title", "")) or "Không rõ tiêu đề"
+            channel = _escape_discord_text(state.get("channel", ""))
+            if state.get("ended"):
+                playback = "Đã kết thúc"
+            elif state.get("paused"):
+                playback = "Tạm dừng"
+            else:
+                playback = "Đang phát"
+            current = _format_media_time(state.get("currentTime"))
+            duration = _format_media_time(state.get("duration"))
+            timing = current or ""
+            if current and duration and float(state.get("duration") or 0) > 0:
+                timing = f"{current} / {duration}"
+            lines = [f"🎵 **{title}**"]
+            if channel:
+                lines.append(f"Kênh: {channel}")
+            lines.append(f"Trạng thái: {playback}")
+            if timing:
+                lines.append(f"Thời gian: {timing}")
+            url = str(state.get("url", "")).strip()
+            if _is_youtube_watch_url(url):
+                lines.append(f"Link: {url}")
+            message = "\n".join(lines)
+
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+    except Exception:
+        print("Jarvis: Lỗi nội bộ khi đọc trạng thái YouTube.")
+        message = "❌ Không thể đọc trạng thái YouTube lúc này."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+
+
 # ==========================================================
 # TÌM KIẾM VIDEO TRÊN YOUTUBE
 # ==========================================================
@@ -1589,10 +1898,11 @@ async def search_youtube(command):
             )
         else:
             # Chỉ khi thật sự không còn tab YouTube mới mở tab mới.
-            profile, profile_name = choose_chrome_profile(command)
-
-            if profile is None:
-                return False
+            # YouTube luôn dùng Chrome automation riêng, không hỏi profile.
+            profile, profile_name = (
+                JARVIS_CHROME_PROFILE,
+                JARVIS_CHROME_PROFILE_NAME,
+            )
 
             youtube_profile = profile
             youtube_profile_name = profile_name
@@ -2746,10 +3056,11 @@ def show_desktop():
 # PHẢN HỒI DÙNG CHUNG CHO DISCORD
 # ==========================================================
 
-def set_command_response(message):
+def set_command_response(message, *, spoken_message=None):
     """Lưu phản hồi cuối để Discord có thể gửi lại cho người dùng."""
-    global last_command_response
+    global last_command_response, last_spoken_response
     last_command_response = message
+    last_spoken_response = spoken_message or message
 
 
 def format_youtube_list(title, videos):
@@ -4102,6 +4413,9 @@ COMMAND_SUGGESTION_CATALOG = (
     ("phat tiep video", "phát tiếp video"),
     ("tiep tuc video", "phát tiếp video"),
     ("resume video", "phát tiếp video"),
+    ("youtube dang phat gi", "youtube đang phát gì"),
+    ("video dang phat", "youtube đang phát gì"),
+    ("bai gi dang phat", "youtube đang phát gì"),
     ("lam moi youtube", "làm mới youtube"),
     ("quay lai youtube", "quay lại youtube"),
     ("hien youtube", "hiện youtube"),
@@ -4310,6 +4624,11 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
     if handle_reminder_command(command, source=source):
         print(f"Jarvis: {last_command_response}")
         return True
+
+    # Truy vấn chỉ đọc phải được nhận diện trước local AI. Hàm này không
+    # phát/dừng video, reload trang hoặc đưa Chrome ra trước màn hình.
+    if is_youtube_now_playing_command(command):
+        return await report_youtube_now_playing()
 
     # Lõi module hóa xử lý memory, tìm file thông minh, natural-language
     # aliases và system monitoring. Lệnh chưa nhận diện tiếp tục qua router 1.0.
@@ -5210,6 +5529,21 @@ def _discord_command_needs_profile(command):
     """Tránh Jarvis chờ input() trên Terminal khi lệnh đến từ Discord."""
     command_lower = command.strip().lower()
 
+    # YouTube luôn dùng Chrome automation riêng của Jarvis. Cả lệnh mở và
+    # tìm kiếm đều không còn cần chọn profile Học/Cá nhân.
+    bare_youtube_commands = {
+        "youtube", "mở youtube", "mo youtube", "vào youtube", "vao youtube",
+    }
+    youtube_search_prefixes = (
+        "tìm youtube ", "tim youtube ",
+        "youtube tìm ", "youtube tim ",
+        "tìm video ", "tim video ",
+    )
+    if command_lower in bare_youtube_commands or command_lower.startswith(
+        youtube_search_prefixes
+    ):
+        return False
+
     profile_words = (
         "cá nhân", "ca nhan", "personal",
         "học", "hoc", "study", "chatgpt",
@@ -5218,18 +5552,6 @@ def _discord_command_needs_profile(command):
     if any(word in command_lower for word in profile_words):
         return False
 
-    if command_lower in {"youtube", "mở youtube", "mo youtube", "vào youtube", "vao youtube"}:
-        return True
-
-    youtube_search_prefixes = (
-        "tìm youtube ", "tim youtube ",
-        "youtube tìm ", "youtube tim ",
-        "tìm video ", "tim video ",
-    )
-
-    if command_lower.startswith(youtube_search_prefixes):
-        # Nếu chưa có tab YouTube, search_youtube() sẽ cần chọn profile.
-        return youtube_page_id is None
 
     if command_lower.startswith(("tìm ", "tim ")):
         google_search_prefixes = (

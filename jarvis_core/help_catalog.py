@@ -56,6 +56,7 @@ HELP_CATEGORIES = {
             ("Tìm video", "tìm youtube nhạc thư giãn"),
             ("Mở video", "mở video 1"),
             ("Dừng video", "dừng video"),
+            ("Video đang phát", "youtube đang phát gì"),
             ("Google", "google thời tiết hôm nay"),
             ("ChatGPT", "mở chatgpt học"),
         ),
