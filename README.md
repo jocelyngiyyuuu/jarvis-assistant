@@ -66,53 +66,108 @@ lsof -v
 
 - VieNeu-TTS cho giọng nói tiếng Việt. Đây là submodule có dependency và môi trường riêng; xem tài liệu trong `tts/VieNeu-TTS` trước khi cài vì yêu cầu CPU/GPU phụ thuộc máy.
 
-## 3. Tải mã nguồn
+## 3. Tải và cài nhánh YouTube/Zalo
 
-Repository GitHub:
+Trang dự án:
+
+<https://github.com/jocelyngiyyuuu/jarvis-assistant>
+
+### Cách dễ nhất: dùng Git
+
+Cách này tải đúng nhánh có tính năng YouTube/Zalo và lấy luôn TTS submodule.
+
+1. Mở Terminal.
+2. Sao chép toàn bộ khối lệnh dưới đây, dán vào Terminal rồi nhấn Enter. Khối
+   lệnh sẽ dừng ngay nếu thư mục đích đã tồn tại hoặc một bước cài đặt thất bại;
+   nó không đóng cửa sổ Terminal hiện tại.
+
+   ```bash
+   (
+     set -e
+     TARGET="$HOME/Projects/jarvis"
+
+     if [ -e "$TARGET" ]; then
+       printf 'DỪNG: %s đã tồn tại. Không có file nào trong đó bị thay đổi.\n' "$TARGET"
+       exit 1
+     fi
+
+     sudo apt update
+     sudo apt install -y git python3 python3-venv python3-pip nodejs npm \
+       wmctrl x11-utils lsof
+
+     mkdir -p "$HOME/Projects"
+     git clone --recurse-submodules \
+       --branch agent/jarvis-v1.0.21-tts --single-branch \
+       https://github.com/jocelyngiyyuuu/jarvis-assistant.git \
+       "$TARGET"
+
+     cd "$TARGET"
+     bash scripts/repair-jarvis-env.sh
+   )
+   ```
+
+3. Khi Terminal trở lại dấu nhắc mà không báo lỗi, chạy:
+
+   ```bash
+   cd "$HOME/Projects/jarvis"
+   .venv/bin/python -c 'import discord, dotenv, mcp; print("Cài đặt Python: OK")'
+   .venv/bin/python -m unittest discover -s tests -q
+   ```
+
+Kết quả đúng có dòng `Cài đặt Python: OK`, một dòng `Ran ... tests in ...` và
+kết thúc bằng `OK`:
 
 ```text
-https://github.com/jocelyngiyyuuu/jarvis-assistant
+Cài đặt Python: OK
+Ran ... tests in ...
+OK
 ```
 
-### Cách 1 — Clone bằng Git (khuyến nghị)
+Sau đó chuyển đến mục [Cấu hình `.env`](#5-cấu-hình-env).
 
-Cách này tải cả lịch sử Git và TTS submodule:
+Nếu khối lệnh báo `DỪNG`, không xóa thư mục cũ. Kiểm tra nó bằng:
 
 ```bash
-git clone --recurse-submodules \
-  https://github.com/jocelyngiyyuuu/jarvis-assistant.git \
-  ~/Projects/jarvis
-cd ~/Projects/jarvis
+cd "$HOME/Projects/jarvis"
+git status --short
 ```
 
-Để tải trực tiếp nhánh phát triển có tính năng YouTube/Zalo mới nhất:
+Nếu đây là một bản Jarvis cũ, hãy backup rồi làm theo mục
+[Backup, cập nhật và rollback](#14-backup-cập-nhật-và-rollback). Nếu không biết
+thư mục đó là gì, dừng tại đây thay vì xóa hoặc ghi đè.
+
+### Nếu đã clone nhưng thiếu TTS
+
+Chạy trong thư mục Jarvis:
 
 ```bash
-git clone --recurse-submodules \
-  --branch agent/jarvis-v1.0.21-tts --single-branch \
-  https://github.com/jocelyngiyyuuu/jarvis-assistant.git \
-  ~/Projects/jarvis
-cd ~/Projects/jarvis
-```
-
-Nếu đã clone mà thiếu TTS submodule:
-
-```bash
+cd "$HOME/Projects/jarvis"
 git submodule update --init --recursive
 ```
 
-### Cách 2 — Tải file ZIP
+### Tải ZIP để xem mã nguồn
 
-1. Mở <https://github.com/jocelyngiyyuuu/jarvis-assistant>.
-2. Chọn **Code → Download ZIP**.
-3. Giải nén và đổi tên thư mục thành `jarvis` nếu cần.
-4. Mở Terminal tại thư mục vừa giải nén.
+Bản ZIP chỉ phù hợp để đọc hoặc tham khảo mã nguồn. Không dùng bản ZIP cho các
+bước cài đặt và vận hành phía dưới vì:
 
-ZIP của repository không tự chứa nội dung Git submodule. Nếu cần VieNeu-TTS,
-khuyến nghị dùng cách clone Git ở trên; nếu không, phải tải submodule riêng theo
-URL trong `.gitmodules`.
+- ZIP không tải VieNeu-TTS submodule;
+- ZIP không có lịch sử Git để cập nhật an toàn;
+- các lệnh còn lại trong README dùng đường dẫn `~/Projects/jarvis` được tạo bởi
+  cách Git ở trên.
 
-Không dùng `git reset --hard` hoặc `git clean` nếu thư mục TTS đang có thay đổi cục bộ cần giữ lại.
+Cách tải:
+
+1. Mở trang <https://github.com/jocelyngiyyuuu/jarvis-assistant>.
+2. Bấm danh sách nhánh đang hiện tên `main`.
+3. Chọn nhánh `agent/jarvis-v1.0.21-tts`.
+4. Bấm **Code**, sau đó bấm **Download ZIP**.
+5. Giải nén vào một thư mục mới để xem mã nguồn.
+6. Không kéo hoặc chép nội dung ZIP vào một bản Jarvis đã cài.
+
+Muốn cài, chạy service, dùng YouTube/Zalo hoặc cập nhật về sau, hãy quay lại
+[Cách dễ nhất: dùng Git](#cách-dễ-nhất-dùng-git).
+
+Không chạy `git reset --hard` hoặc `git clean` khi chưa kiểm tra thay đổi cục bộ.
 
 ## 4. Tạo môi trường Python
 
