@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -511,20 +512,35 @@ def open_chrome(profile, url):
                 previous_window_ids, owner_pid, target_hint
             )
         )
-    subprocess.Popen(
-        [
+    chrome_args = [
             "google-chrome",
             # Jarvis đóng riêng từng profile bằng wmctrl. Trên phiên Wayland,
             # buộc cửa sổ Chrome qua XWayland để wmctrl nhìn thấy window ID.
             "--ozone-platform=x11",
             f"--profile-directory={profile}",
             "--new-window",
-            url,
-        ],
+        ]
+    if (urlparse(url).hostname or "").lower() == "github.com":
+        chrome_args.append(f"--app={url}")
+    else:
+        chrome_args.append(url)
+    subprocess.Popen(
+        chrome_args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    return CHROME_WINDOWS.track_profile_window(profile, previous_window_ids)
+    host = (urlparse(url).hostname or "").lower()
+    site_key = {
+        "chatgpt.com": "chatgpt",
+        "mail.google.com": "gmail",
+        "drive.google.com": "drive",
+        "calendar.google.com": "calendar",
+        "github.com": "github",
+        "www.google.com": "google",
+    }.get(host)
+    return CHROME_WINDOWS.track_profile_window(
+        profile, previous_window_ids, site_key=site_key
+    )
 
 
 # ==========================================================
@@ -617,9 +633,9 @@ def handle_chrome_shortcut(command):
 
     profile, profile_name = _chrome_profile_from_explicit_command(command)
 
-    # Zalo mặc định là tài khoản công việc trong Chrome học. Người dùng vẫn
-    # có thể nói rõ "mở zalo cá nhân" để ghi đè quy tắc này.
-    if profile is None and target_text in {"zalo", "zalo web"}:
+    # Zalo và GitHub mặc định dùng Profile 1 (học). Người dùng vẫn có thể
+    # nói rõ "cá nhân" để ghi đè quy tắc này.
+    if profile is None and target_text in {"zalo", "zalo web", "github"}:
         profile, profile_name = STUDY_PROFILE, "Học / ChatGPT"
 
     if profile is None:
@@ -638,12 +654,60 @@ def handle_chrome_shortcut(command):
         message = "✅ Đã mở Zalo." if opened else "❌ Không thể mở Zalo lúc này."
     else:
         message = (
-            f"✅ Đang mở {site_name} bằng Chrome {profile_name}."
+            f"✅ Đã mở {site_name} bằng Chrome {profile_name}."
             if opened is not False
             else f"❌ Không thể mở {site_name} lúc này."
         )
     print(f"Jarvis: {message}")
     set_command_response(message)
+    return True
+
+
+def handle_chrome_shortcut_close(command):
+    """Close only a tracked window paired with a Chrome website shortcut."""
+    command_clean = normalize_core_text(command)
+    match = re.match(
+        r"^(?:tắt|tat|đóng|dong|thoát|thoat|close)(?:\s+tab)?\s+(.+)$",
+        command_clean,
+    )
+    if not match:
+        return False
+    target_text = re.sub(
+        r"\s+(?:bằng\s+)?(?:tài\s+khoản\s+)?(?:cá nhân|ca nhan|personal|học tập|hoc tap|học|hoc|study|công việc|cong viec|work)\s*$",
+        "",
+        match.group(1).strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    shortcut = CHROME_SHORTCUTS.get(target_text)
+    if shortcut is None or target_text in {"zalo", "zalo web", "chrome"}:
+        return False
+    profile, _ = _chrome_profile_from_explicit_command(command)
+    if profile is None and target_text == "github":
+        profile = STUDY_PROFILE
+    if profile is None:
+        message = (
+            f"ℹ️ Hãy nói rõ profile, ví dụ: `tắt {target_text} học` "
+            f"hoặc `tắt {target_text} cá nhân`."
+        )
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+    site_name, url = shortcut
+    site_key = {
+        "chatgpt.com": "chatgpt",
+        "mail.google.com": "gmail",
+        "drive.google.com": "drive",
+        "calendar.google.com": "calendar",
+        "github.com": "github",
+        "www.google.com": "google",
+    }.get((urlparse(url).hostname or "").lower())
+    if site_key is None:
+        return False
+    success, detail = CHROME_WINDOWS.close_site_window(profile, site_key, site_name)
+    icon = "✅" if success else "ℹ️"
+    message = f"{icon} {detail}"
+    set_command_response(message)
+    print(f"Jarvis: {message}")
     return True
 
 
@@ -1054,6 +1118,69 @@ async def find_zalo_page(session):
         if page_id is not None:
             zalo_pages.append(page_id)
     return zalo_pages[-1] if zalo_pages else None
+
+
+async def close_managed_web_tab(site_key, site_name, url_needles):
+    """Close all exact matching page tabs in Jarvis' CDP Chrome only."""
+    try:
+        session = await get_mcp_session()
+        pages_result = await session.call_tool("list_pages", arguments={})
+        if _is_mcp_tool_error(pages_result):
+            raise RuntimeError("list_pages failed")
+        page_rows = []
+        matching_ids = []
+        needles = tuple(str(value).casefold().rstrip("/") for value in url_needles)
+        for line in result_to_text(pages_result).splitlines():
+            page_id = extract_page_id(line)
+            if page_id is None:
+                continue
+            page_rows.append(page_id)
+            url_match = re.search(r"https?://[^\s]+", line, re.IGNORECASE)
+            page_url = url_match.group(0).rstrip("/").casefold() if url_match else ""
+            if any(page_url == needle or page_url.startswith(f"{needle}/") for needle in needles):
+                matching_ids.append(page_id)
+
+        if not matching_ids:
+            message = f"ℹ️ Không tìm thấy tab {site_name} đang mở."
+            set_command_response(message)
+            print(f"Jarvis: {message}")
+            return False
+
+        nonmatching_ids = [page_id for page_id in page_rows if page_id not in matching_ids]
+        close_ids = list(matching_ids)
+        navigate_id = None
+        if not nonmatching_ids:
+            navigate_id = close_ids.pop()
+
+        for target_id in close_ids:
+            result = await session.call_tool(
+                "close_page", arguments={"pageId": target_id}
+            )
+            if _is_mcp_tool_error(result):
+                raise RuntimeError("close_page failed")
+
+        if navigate_id is not None:
+            selected = await session.call_tool(
+                "select_page",
+                arguments={"pageId": navigate_id, "bringToFront": False},
+            )
+            if _is_mcp_tool_error(selected):
+                raise RuntimeError("select_page failed")
+            result = await session.call_tool(
+                "navigate_page",
+                arguments={"type": "url", "url": "chrome://newtab/"},
+            )
+            if _is_mcp_tool_error(result):
+                raise RuntimeError("navigate_page failed")
+        message = f"✅ Đã đóng {site_name}."
+        set_command_response(message, spoken_message=message)
+        print(f"Jarvis: {message}")
+        return True
+    except Exception:
+        message = f"❌ Không thể đóng {site_name} lúc này."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
 
 
 def parse_zalo_date(value):
@@ -2397,12 +2524,9 @@ def search_google(command):
 # ==========================================================
 
 def open_github(command):
-    profile, profile_name = (
-        choose_chrome_profile(command)
-    )
-
+    profile, profile_name = _chrome_profile_from_explicit_command(command)
     if profile is None:
-        return
+        profile, profile_name = STUDY_PROFILE, "Học / ChatGPT"
 
     print(
         "Jarvis: Đang mở GitHub bằng "
@@ -2436,34 +2560,54 @@ def open_vscode():
 # ==========================================================
 
 def open_terminal():
+    previous_window_ids = FILE_WINDOWS.snapshot_ids()
     terminals = [
-        "gnome-terminal",
-        "kgx",
-        "x-terminal-emulator",
+        ("gnome-terminal", ["gnome-terminal", "--window", "--title", "Jarvis Terminal"]),
+        ("kgx", ["kgx", "--title", "Jarvis Terminal"]),
+        (
+            "x-terminal-emulator",
+            [
+                "x-terminal-emulator", "--standalone", "--new-window",
+                "--title", "Jarvis Terminal",
+            ],
+        ),
     ]
 
-    for terminal in terminals:
+    for terminal, argv in terminals:
 
         try:
 
-            subprocess.Popen(
-                [terminal],
+            process = subprocess.Popen(
+                argv,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
 
-            print(
-                "Jarvis: Đã mở Terminal."
+            resolved = shutil.which(argv[0])
+            executable = Path(resolved).resolve().name.casefold() if resolved else ""
+            if executable == "ptyxis":
+                FILE_WINDOWS.track_process("terminal", process)
+                tracked = process.poll() is None
+            else:
+                tracked = FILE_WINDOWS.track_opened_window(
+                    "terminal", previous_window_ids, expected_title="Jarvis Terminal"
+                )
+            message = (
+                "✅ Đã mở Terminal."
+                if tracked
+                else "⚠️ Đã yêu cầu mở Terminal nhưng không theo dõi được cửa sổ để đóng sau."
             )
-
-            return
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return True
 
         except FileNotFoundError:
             continue
 
-    print(
-        "Jarvis: Không tìm thấy Terminal."
-    )
+    message = "❌ Không tìm thấy Terminal."
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return False
 
 
 # ==========================================================
@@ -2474,15 +2618,13 @@ def open_folder(path, name):
     path = Path(path)
 
     if not path.exists():
-        print(
-            f"Jarvis: Không tìm thấy {name}."
-        )
-        return
+        message = f"❌ Không tìm thấy {name}."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
 
-    print(
-        f"Jarvis: Đang mở {name}..."
-    )
-
+    print(f"Jarvis: Đang mở {name}...")
+    previous_window_ids = FILE_WINDOWS.snapshot_ids()
     subprocess.Popen(
         [
             "xdg-open",
@@ -2491,6 +2633,15 @@ def open_folder(path, name):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    tracked = FILE_WINDOWS.track_opened_path(path, previous_window_ids)
+    message = (
+        f"✅ Đã mở {name}."
+        if tracked
+        else f"⚠️ Đã yêu cầu mở {name} nhưng không theo dõi được cửa sổ để đóng sau."
+    )
+    set_command_response(message)
+    print(f"Jarvis: {message}")
+    return tracked
 
 
 def open_downloads():
@@ -2909,7 +3060,7 @@ def handle_filesystem_command(command):
 
     # Chỉ đóng cửa sổ file gần nhất do Jarvis mở, không kill toàn bộ ứng dụng.
     if re.fullmatch(
-        r"(?:tắt|tat|đóng|dong)\s+(?:cửa\s*sổ\s+)?file(?:\s+gần\s+nhất)?",
+        r"(?:tắt|tat|đóng|dong|thoát|thoat|close)\s+(?:cửa\s*sổ\s+)?file(?:\s+gần\s+nhất)?",
         command_clean,
         re.IGNORECASE,
     ):
@@ -2921,7 +3072,7 @@ def handle_filesystem_command(command):
         return True
 
     if re.fullmatch(
-        r"(?:tắt|tat|đóng|dong)\s+(?:cửa\s*sổ\s+)?(?:thư\s*mục|thu\s*muc|project)(?:\s+gần\s+nhất)?",
+        r"(?:tắt|tat|đóng|dong|thoát|thoat|close)\s+(?:cửa\s*sổ\s+)?(?:thư\s*mục|thu\s*muc|project)(?:\s+gần\s+nhất)?",
         command_clean,
         re.IGNORECASE,
     ):
@@ -4436,6 +4587,9 @@ COMMAND_SUGGESTION_CATALOG = (
     ("mo zalo web", "mở zalo"),
     ("mo zalo cong viec", "mở zalo công việc"),
     ("vao zalo", "mở zalo"),
+    ("tat zalo", "tắt zalo"),
+    ("dong zalo", "đóng zalo"),
+    ("thoat zalo", "thoát zalo"),
     ("tom tat zalo cong viec", "tóm tắt zalo công việc"),
     ("tong hop zalo cong viec", "tóm tắt zalo công việc"),
     ("tom tat zalo hom nay", "tóm tắt zalo hôm nay"),
@@ -4449,18 +4603,29 @@ COMMAND_SUGGESTION_CATALOG = (
     ("mo github ca nhan", "mở github cá nhân"),
     ("mo chrome hoc", "mở chrome học"),
     ("mo chrome ca nhan", "mở chrome cá nhân"),
+    ("tat chatgpt hoc", "tắt chatgpt học"),
+    ("tat gmail hoc", "tắt gmail học"),
+    ("tat drive hoc", "tắt drive học"),
+    ("tat calendar hoc", "tắt calendar học"),
+    ("tat github hoc", "tắt github học"),
     ("tat chrome hoc", "tắt chrome học"),
     ("tat chrome ca nhan", "tắt chrome cá nhân"),
     # Ứng dụng và cửa sổ
     ("mo github", "mở github"),
+    ("tat github", "tắt github"),
+    ("dong github", "đóng github"),
+    ("thoat github", "thoát github"),
     ("mo vscode", "mở vscode"),
     ("tat vscode", "tắt vscode"),
     ("mo terminal", "mở terminal"),
+    ("tat terminal", "tắt terminal"),
+    ("dong terminal", "đóng terminal"),
     ("tat chrome", "tắt chrome <học hoặc cá nhân>"),
     ("tat file manager", "tắt file manager"),
     ("tat tat ca", "tắt tất cả"),
     # Thư mục, file và project
     ("mo downloads", "mở downloads"),
+    ("tat downloads", "tắt downloads"),
     ("mo documents", "mở documents"),
     ("mo pictures", "mở pictures"),
     ("mo home", "mở home"),
@@ -4736,8 +4901,26 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         return True
 
     # ------------------------------------------------------
+    # TẮT / ĐÓNG WEBSITE JARVIS QUẢN LÝ
+    # ------------------------------------------------------
+
+    close_zalo_commands = {
+        "tắt zalo", "tat zalo", "đóng zalo", "dong zalo",
+        "thoát zalo", "thoat zalo", "close zalo",
+        "tắt zalo web", "tat zalo web", "đóng zalo web", "dong zalo web",
+    }
+    if command_lower in close_zalo_commands:
+        await close_managed_web_tab(
+            "zalo", "Zalo", ("https://chat.zalo.me/",)
+        )
+        return True
+
+    # ------------------------------------------------------
     # MỞ NHANH WEBSITE TRONG CHROME THEO PROFILE
     # ------------------------------------------------------
+
+    if handle_chrome_shortcut_close(command):
+        return True
 
     if handle_chrome_shortcut(command):
         return True
@@ -4869,6 +5052,8 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         "đóng tab youtube",
         "dong tab youtube",
         "close youtube",
+        "thoát youtube",
+        "thoat youtube",
     }:
         await close_youtube()
         return True
@@ -4917,6 +5102,51 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         await close_all_managed_apps()
         return True
 
+    # ------------------------------------------------------
+    # TẮT THƯ MỤC SHORTCUT - CHỈ CỬA SỔ GẦN NHẤT JARVIS MỞ
+    # ------------------------------------------------------
+
+    folder_shortcut_close = re.fullmatch(
+        r"(?:tắt|tat|đóng|dong|thoát|thoat|close)\s+"
+        r"(?:downloads?|documents?|pictures?|home)",
+        command_lower,
+    )
+    if folder_shortcut_close:
+        target = folder_shortcut_close.group(0).split()[-1]
+        folder_path = {
+            "download": Path.home() / "Downloads",
+            "downloads": Path.home() / "Downloads",
+            "document": Path.home() / "Documents",
+            "documents": Path.home() / "Documents",
+            "picture": Path.home() / "Pictures",
+            "pictures": Path.home() / "Pictures",
+            "home": Path.home(),
+        }[target]
+        success, detail = FILE_WINDOWS.close_path(folder_path)
+        message = f"{'✅' if success else 'ℹ️'} {detail}"
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+
+    # ------------------------------------------------------
+    # TẮT TERMINAL - CHỈ CỬA SỔ JARVIS VỪA MỞ
+    # ------------------------------------------------------
+
+    if command_lower in {
+        "tắt terminal", "tat terminal", "đóng terminal", "dong terminal",
+        "thoát terminal", "thoat terminal", "close terminal",
+        "tắt cửa sổ terminal", "tat cua so terminal",
+    }:
+        success, detail = FILE_WINDOWS.close_last("terminal")
+        if not success:
+            success, process_detail = FILE_WINDOWS.close_process("terminal", "Terminal")
+            if success or "do Jarvis theo dõi" not in detail:
+                detail = process_detail
+        message = f"{'✅' if success else 'ℹ️'} {detail}"
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+
 
     # ------------------------------------------------------
     # TẮT VS CODE
@@ -4933,6 +5163,10 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         "dong vs code",
         "close vscode",
         "close vs code",
+        "thoát vscode",
+        "thoat vscode",
+        "thoát vs code",
+        "thoat vs code",
     }:
         close_vscode()
         return True
@@ -5563,12 +5797,13 @@ def _discord_command_needs_profile(command):
         if not command_lower.startswith(google_search_prefixes):
             return youtube_page_id is None
 
-    if "github" in command_lower and (
-        command_lower.startswith("mở")
-        or command_lower.startswith("mo")
-        or command_lower == "github"
-    ):
-        return True
+    bare_github_commands = {
+        "github", "mở github", "mo github", "vào github", "vao github",
+        "tắt github", "tat github", "đóng github", "dong github",
+        "thoát github", "thoat github",
+    }
+    if command_lower in bare_github_commands:
+        return False
 
     google_prefixes = (
         "google", "tìm google", "tim google",

@@ -6,6 +6,14 @@ import jarvis
 
 
 class ChromeAutomationProfileTests(unittest.TestCase):
+    def test_discord_bare_github_open_and_close_do_not_require_profile(self):
+        for command in (
+            "github", "mở github", "mo github",
+            "tắt github", "đóng github", "thoát github",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(jarvis._discord_command_needs_profile(command))
+
     def test_discord_bare_youtube_commands_do_not_require_profile(self):
         with patch.object(jarvis, "youtube_page_id", None):
             for command in (
@@ -161,6 +169,20 @@ class ChromeAutomationProfileTests(unittest.TestCase):
         args = popen.call_args.args[0]
         self.assertIn("--profile-directory=Profile 1", args)
         self.assertNotIn("--remote-debugging-port=9223", args)
+
+    def test_github_uses_dedicated_app_window_for_exact_tracking(self):
+        with patch("jarvis.subprocess.Popen") as popen, patch.object(
+            jarvis.CHROME_WINDOWS, "snapshot_ids", return_value=set()
+        ), patch.object(
+            jarvis.CHROME_WINDOWS, "track_profile_window", return_value=True
+        ):
+            self.assertTrue(jarvis.open_chrome(
+                jarvis.STUDY_PROFILE, "https://github.com/"
+            ))
+        args = popen.call_args.args[0]
+        self.assertIn("--profile-directory=Profile 1", args)
+        self.assertIn("--app=https://github.com/", args)
+        self.assertNotIn("https://github.com/", args)
 
     def test_dedicated_chrome_is_bound_to_loopback_with_separate_data_dir(self):
         with patch("jarvis.subprocess.Popen") as popen, \

@@ -1,11 +1,353 @@
 import unittest
 import ctypes
-from unittest.mock import patch
+import subprocess
+from unittest.mock import Mock, patch
 
-from jarvis_core.window_manager import ChromeWindowManager
+from jarvis_core.window_manager import ChromeWindowManager, FileWindowManager
+
+
+class ManagedDesktopWindowTests(unittest.TestCase):
+    def test_wmctrl_parser_excludes_hostname_from_title(self):
+        rows = FileWindowManager._parse_windows(
+            "0x0180003b  0 github.com.Google-chrome  Moriarty GitHub\n"
+        )
+        self.assertEqual(rows, [{
+            "id": "0x0180003b", "class": "github.com.Google-chrome",
+            "title": "GitHub",
+        }])
+
+    def test_folder_tracking_rejects_unrelated_new_window(self):
+        manager = FileWindowManager()
+        with patch("pathlib.Path.is_dir", return_value=True), patch.object(
+            manager, "list_windows", return_value=[
+                {"id": "0x2", "class": "org.gnome.Terminal", "title": "Downloads"},
+            ]
+        ):
+            self.assertFalse(manager.track_opened_path("/tmp/Downloads", set(), timeout=0.01))
+
+    def test_file_manager_class_allowlist_rejects_fileshare_substring(self):
+        manager = FileWindowManager()
+        self.assertFalse(manager._is_file_manager({
+            "class": "org.example.Fileshare", "title": "Downloads"
+        }))
+        self.assertTrue(manager._is_file_manager({
+            "class": "org.gnome.Nautilus", "title": "Downloads"
+        }))
+
+    def test_preexisting_matching_folder_window_is_never_adopted(self):
+        manager = FileWindowManager()
+        existing = {
+            "id": "0x2", "class": "org.gnome.Nautilus", "title": "Downloads"
+        }
+        with patch("pathlib.Path.is_dir", return_value=True), patch.object(
+            manager, "list_windows", return_value=[existing]
+        ), patch.object(manager, "_window_pid", return_value=222), patch.object(
+            manager, "_process_start_time", return_value="100"
+        ):
+            self.assertFalse(manager.track_opened_path(
+                "/tmp/Downloads", {"0x2"}, timeout=0.01
+            ))
+        self.assertNotIn(str(__import__("pathlib").Path("/tmp/Downloads").resolve()), manager.path_windows)
+
+    def test_named_folders_are_tracked_and_closed_independently(self):
+        manager = FileWindowManager()
+        downloads = {"id": "0x2", "class": "org.gnome.Nautilus", "title": "Downloads"}
+        pictures = {"id": "0x3", "class": "org.gnome.Nautilus", "title": "Pictures"}
+        with patch("pathlib.Path.is_dir", return_value=True), patch.object(
+            manager, "list_windows", return_value=[downloads]
+        ), patch.object(manager, "_window_pid", return_value=222), patch.object(
+            manager, "_process_start_time", return_value="100"
+        ):
+            self.assertTrue(manager.track_opened_path("/tmp/Downloads", set(), timeout=0.01))
+        with patch("pathlib.Path.is_dir", return_value=True), patch.object(
+            manager, "list_windows", return_value=[downloads, pictures]
+        ), patch.object(manager, "_window_pid", return_value=222), patch.object(
+            manager, "_process_start_time", return_value="100"
+        ):
+            self.assertTrue(manager.track_opened_path("/tmp/Pictures", {"0x2"}, timeout=0.01))
+        with patch.object(manager, "list_windows", side_effect=[[downloads, pictures], [pictures]]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_start_time", return_value="100"), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            run.return_value.returncode = 0
+            success, _ = manager.close_path("/tmp/Downloads")
+        self.assertTrue(success)
+        self.assertEqual(run.call_args.args[0], ["wmctrl", "-ic", "0x2"])
+        self.assertIn(str(__import__("pathlib").Path("/tmp/Pictures").resolve()), manager.path_windows)
+
+    def test_reused_desktop_window_id_is_not_closed(self):
+        manager = FileWindowManager()
+        manager.last_windows["terminal"] = {
+            "id": "0x2", "class": "org.gnome.Terminal", "title": "Jarvis Terminal",
+            "path": "Jarvis Terminal", "pid": 222,
+        }
+        with patch.object(manager, "list_windows", return_value=[
+            {"id": "0x2", "class": "org.gnome.Nautilus", "title": "Downloads"},
+        ]), patch.object(manager, "_window_pid", return_value=333), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            success, _ = manager.close_last("terminal")
+        self.assertFalse(success)
+        run.assert_not_called()
+
+    def test_reused_desktop_pid_start_time_is_not_closed(self):
+        manager = FileWindowManager()
+        manager.last_windows["terminal"] = {
+            "id": "0x2", "class": "org.gnome.Terminal", "title": "Jarvis Terminal",
+            "path": "Jarvis Terminal", "pid": 222, "start_time": "100",
+        }
+        current = {"id": "0x2", "class": "org.gnome.Terminal", "title": "Jarvis Terminal"}
+        with patch.object(manager, "list_windows", return_value=[current]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_start_time", return_value="200"), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            success, _ = manager.close_last("terminal")
+        self.assertFalse(success)
+        run.assert_not_called()
+
+    def test_desktop_title_substring_change_is_not_accepted(self):
+        manager = FileWindowManager()
+        manager.last_windows["terminal"] = {
+            "id": "0x2", "class": "org.gnome.Terminal", "title": "Jarvis Terminal",
+            "path": "Jarvis Terminal", "pid": 222, "start_time": "100",
+        }
+        current = {
+            "id": "0x2", "class": "org.gnome.Terminal",
+            "title": "Unrelated Jarvis Terminal Window",
+        }
+        with patch.object(manager, "list_windows", return_value=[current]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_start_time", return_value="100"), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            success, _ = manager.close_last("terminal")
+        self.assertFalse(success)
+        run.assert_not_called()
+
+    def test_closes_only_tracked_terminal_process(self):
+        manager = FileWindowManager()
+        process = Mock()
+        process.poll.return_value = None
+        manager.track_process("terminal", process)
+        success, _ = manager.close_process("terminal", "Terminal")
+        self.assertTrue(success)
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once()
+
+    def test_tracks_and_closes_only_unique_terminal_window(self):
+        manager = FileWindowManager()
+        windows = [
+            {"id": "0x1", "class": "org.gnome.Terminal", "title": "Old"},
+            {"id": "0x2", "class": "org.gnome.Terminal", "title": "Terminal"},
+        ]
+        with patch.object(manager, "list_windows", return_value=windows), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_start_time", return_value="100"):
+            self.assertTrue(manager.track_opened_window("terminal", {"0x1"}))
+        with patch.object(manager, "list_windows", side_effect=[windows, []]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_start_time", return_value="100"), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            run.return_value.returncode = 0
+            success, _ = manager.close_last("terminal")
+        self.assertTrue(success)
+        self.assertEqual(run.call_args.args[0], ["wmctrl", "-ic", "0x2"])
+
+    def test_ambiguous_terminal_windows_are_not_tracked(self):
+        manager = FileWindowManager()
+        with patch.object(manager, "list_windows", return_value=[
+            {"id": "0x2", "class": "terminal", "title": "A"},
+            {"id": "0x3", "class": "terminal", "title": "B"},
+        ]):
+            self.assertFalse(manager.track_opened_window("terminal", set(), timeout=0.01))
+        self.assertIsNone(manager.last_windows.get("terminal"))
+
+    def test_unrelated_new_window_is_not_tracked_as_terminal(self):
+        manager = FileWindowManager()
+        with patch.object(manager, "list_windows", return_value=[
+            {"id": "0x2", "class": "org.gnome.Nautilus", "title": "Downloads"},
+        ]):
+            self.assertFalse(manager.track_opened_window("terminal", set(), timeout=0.01))
+        self.assertIsNone(manager.last_windows["terminal"])
+
+    def test_terminal_tracking_requires_expected_title_marker(self):
+        manager = FileWindowManager()
+        with patch.object(manager, "list_windows", return_value=[
+            {"id": "0x2", "class": "org.gnome.Ptyxis", "title": "User Terminal"},
+        ]):
+            self.assertFalse(manager.track_opened_window(
+                "terminal", set(), timeout=0.01, expected_title="Jarvis Terminal"
+            ))
 
 
 class ChromeAutomationWindowTests(unittest.TestCase):
+    def test_site_close_requires_exact_stored_class_and_title(self):
+        manager = ChromeWindowManager()
+        manager.site_windows[("Profile 1", "github")] = {
+            "id": "0x2", "class": "github.com.Google-chrome",
+            "title": "GitHub", "pid": 222,
+        }
+        lookalike = {
+            "id": "0x2", "class": "github.com.evil.Google-chrome",
+            "title": "Unrelated GitHub",
+        }
+        with patch.object(manager, "list_windows", return_value=[lookalike]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_has_profile", return_value=True), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            success, _ = manager.close_site_window("Profile 1", "github", "GitHub")
+        self.assertFalse(success)
+        run.assert_not_called()
+
+    def test_github_tracking_ignores_unrelated_profile_window_until_app_marker(self):
+        manager = ChromeWindowManager()
+        unrelated = {
+            "id": "0x2", "class": "google-chrome.Google-chrome", "title": "Google"
+        }
+        github = {
+            "id": "0x3", "class": "github.com.Google-chrome", "title": "GitHub"
+        }
+        with patch.object(
+            manager, "list_windows", side_effect=[
+                [unrelated], [unrelated, github], [unrelated, github], [unrelated, github]
+            ]
+        ), patch.object(manager, "_window_pid", return_value=222), patch.object(
+            manager, "_process_has_profile", return_value=True
+        ):
+            self.assertTrue(manager.track_profile_window(
+                "Profile 1", set(), site_key="github", timeout=0.5
+            ))
+        self.assertEqual(
+            manager.site_windows[("Profile 1", "github")]["id"], "0x3"
+        )
+
+    def test_github_tracking_rejects_lookalike_app_class(self):
+        manager = ChromeWindowManager()
+        lookalike = {
+            "id": "0x2", "class": "github.com.evil.Google-chrome", "title": "GitHub"
+        }
+        with patch.object(manager, "list_windows", return_value=[lookalike]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_has_profile", return_value=True):
+            self.assertFalse(manager.track_profile_window(
+                "Profile 1", set(), site_key="github", timeout=0.01
+            ))
+
+    def test_github_tracking_waits_for_stable_final_title(self):
+        manager = ChromeWindowManager()
+        initial = {
+            "id": "0x2", "class": "github.com.Google-chrome", "title": "github.com_/"
+        }
+        stable = {
+            "id": "0x2", "class": "github.com.Google-chrome", "title": "GitHub"
+        }
+        with patch.object(
+            manager, "list_windows", side_effect=[
+                [initial], [initial], [initial], [stable], [stable], [stable]
+            ]
+        ), patch.object(manager, "_window_pid", return_value=222), patch.object(
+            manager, "_process_has_profile", return_value=True
+        ):
+            self.assertTrue(manager.track_profile_window(
+                "Profile 1", set(), site_key="github", timeout=1.0
+            ))
+        self.assertEqual(
+            manager.site_windows[("Profile 1", "github")]["title"], "GitHub"
+        )
+
+    def test_process_profile_accepts_chrome_rewritten_single_argv(self):
+        manager = ChromeWindowManager()
+        raw = (
+            b"/opt/google/chrome/chrome --ozone-platform=x11 "
+            b"--profile-directory=Profile 1 --new-window\0"
+        )
+        with patch("pathlib.Path.read_bytes", return_value=raw):
+            self.assertTrue(manager._process_has_profile(123, "Profile 1"))
+            self.assertFalse(manager._process_has_profile(123, "Default"))
+
+    def test_tracks_unique_site_window_and_closes_only_that_window(self):
+        manager = ChromeWindowManager()
+        windows = [
+            {"id": "0x1", "class": "google-chrome", "title": "Old"},
+            {"id": "0x2", "class": "google-chrome", "title": "Gmail"},
+        ]
+        with patch.object(manager, "list_windows", return_value=windows), patch.object(
+            manager, "_window_pid", return_value=111
+        ), patch.object(manager, "_process_has_profile", return_value=True):
+            self.assertTrue(manager.track_profile_window(
+                "Default", {"0x1"}, site_key="gmail"
+            ))
+        with patch.object(manager, "list_windows", side_effect=[windows, []]), patch.object(
+            manager, "_window_pid", return_value=111
+        ), patch.object(manager, "_process_has_profile", return_value=True), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            run.return_value.returncode = 0
+            success, _ = manager.close_site_window("Default", "gmail", "Gmail")
+        self.assertTrue(success)
+        run.assert_called_once_with(
+            ["wmctrl", "-ic", "0x2"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+
+    def test_does_not_track_ambiguous_new_site_windows(self):
+        manager = ChromeWindowManager()
+        windows = [
+            {"id": "0x2", "class": "google-chrome", "title": "Gmail A"},
+            {"id": "0x3", "class": "google-chrome", "title": "Gmail B"},
+        ]
+        with patch.object(manager, "list_windows", return_value=windows):
+            self.assertFalse(manager.track_profile_window(
+                "Default", set(), site_key="gmail", timeout=0.01
+            ))
+        self.assertEqual(manager.site_windows, {})
+
+    def test_reused_x11_id_with_different_identity_is_not_closed(self):
+        manager = ChromeWindowManager()
+        manager.site_windows[("Default", "gmail")] = "0x2"
+        with patch.object(manager, "list_windows", return_value=[
+            {"id": "0x2", "class": "org.gnome.Nautilus", "title": "Downloads"},
+        ]), patch.object(manager, "_window_pid", return_value=333), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            success, _ = manager.close_site_window("Default", "gmail", "Gmail")
+        self.assertFalse(success)
+        run.assert_not_called()
+
+    def test_close_site_does_not_claim_success_while_window_still_exists(self):
+        manager = ChromeWindowManager()
+        identity = {
+            "id": "0x2", "class": "google-chrome", "title": "GitHub", "pid": 222
+        }
+        manager.site_windows[("Profile 1", "github")] = identity
+        with patch.object(manager, "list_windows", return_value=[identity]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_has_profile", return_value=True), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            run.return_value.returncode = 0
+            success, _ = manager.close_site_window("Profile 1", "github", "GitHub")
+        self.assertFalse(success)
+
+    def test_site_tracking_rejects_new_window_from_wrong_profile(self):
+        manager = ChromeWindowManager()
+        stable = {"id": "0x9", "class": "google-chrome", "title": "GitHub - Google Chrome"}
+        with patch.object(manager, "list_windows", return_value=[stable]), patch.object(
+            manager, "_window_pid", return_value=999
+        ), patch.object(
+            manager, "_process_has_profile", return_value=False
+        ):
+            self.assertFalse(manager.track_profile_window(
+                "Profile 1", set(), site_key="github", timeout=0.01
+            ))
+
     def test_activates_new_automation_window_by_id(self):
         manager = ChromeWindowManager()
         windows = [

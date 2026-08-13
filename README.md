@@ -385,6 +385,41 @@ hỏi zalo nhóm <tên nhóm> hôm nay về <câu hỏi>
 đóng zalo
 ```
 
+`tắt zalo`, `đóng zalo` và `thoát zalo` chỉ đóng các tab có URL chính xác của
+Zalo trong Chrome Jarvis; tab YouTube và website khác không bị đóng. Nếu Zalo là
+toàn bộ tab còn lại, Jarvis chuyển tab Zalo cuối cùng về New Tab để giữ Chrome
+và phiên đăng nhập.
+
+### Cặp lệnh mở và đóng
+
+Khi Jarvis có lệnh mở một cửa sổ hoặc website, hãy dùng `tắt`, `đóng` hoặc
+`thoát` với cùng tên. Ví dụ:
+
+```text
+mở terminal                 → tắt terminal
+mở downloads                → tắt downloads
+mở vscode                   → tắt vscode
+mở chatgpt học              → tắt chatgpt học
+mở gmail cá nhân            → đóng gmail cá nhân
+mở drive học                → thoát drive học
+mở calendar học             → tắt calendar học
+mở github                   → tắt github
+mở github cá nhân           → đóng github cá nhân
+mở youtube                  → tắt youtube
+mở zalo                     → tắt zalo
+```
+
+GitHub không ghi profile sẽ mặc định dùng Profile 1 (học) cho cả mở và đóng;
+bạn vẫn có thể nói rõ `github cá nhân` để dùng profile cá nhân. Jarvis mở GitHub
+trong một app window riêng để `tắt github` chỉ đóng đúng window Jarvis vừa mở,
+không đóng cửa sổ GitHub có sẵn của bạn. Các website
+Chrome khác phải nói đúng profile `học` hoặc `cá nhân`; Jarvis không đoán profile
+khi đóng. Jarvis chỉ đóng cửa sổ/tab đã xác định được duy nhất. Terminal và thư
+mục cũng chỉ đóng cửa sổ mà Jarvis vừa mở và theo dõi, không dùng `pkill` để
+đóng tất cả cửa sổ cùng loại. Với file manager native Wayland không cung cấp
+window identity cho `wmctrl`, Jarvis sẽ báo không theo dõi được và từ chối lệnh
+đóng thay vì đoán hoặc đóng nhầm cửa sổ.
+
 Tóm tắt Zalo chỉ đọc các hội thoại trong phạm vi được yêu cầu. Jarvis trả nội
 dung cho kênh yêu cầu nhưng stdout/systemd journal chỉ ghi trạng thái hoàn thành,
 không ghi nội dung chat hay bản tóm tắt. Dù vậy, không chia sẻ journal hoặc dữ

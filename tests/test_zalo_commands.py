@@ -11,6 +11,92 @@ from jarvis import parse_zalo_request
 
 
 class ZaloCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_managed_zalo_tab_closes_unique_match_only(self):
+        session = AsyncMock()
+        session.call_tool.side_effect = [
+            type("Result", (), {"content": [type("Text", (), {"text": (
+                "1: https://chat.zalo.me/ Zalo\n2: https://www.youtube.com/ YouTube"
+            )})()], "isError": False})(),
+            type("Result", (), {"content": [], "isError": False})(),
+        ]
+        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)):
+            self.assertTrue(await jarvis.close_managed_web_tab(
+                "zalo", "Zalo", ("https://chat.zalo.me/",)
+            ))
+        self.assertEqual(
+            session.call_tool.await_args_list[-1].args[0], "close_page"
+        )
+        self.assertEqual(session.call_tool.await_args_list[-1].kwargs["arguments"], {"pageId": 1})
+
+    async def test_close_managed_zalo_tab_closes_all_exact_matches(self):
+        session = AsyncMock()
+        session.call_tool.side_effect = [
+            type("Result", (), {"content": [type("Text", (), {"text": (
+                "1: https://chat.zalo.me/ Zalo A\n"
+                "2: https://chat.zalo.me/ Zalo B\n"
+                "3: https://www.youtube.com/ YouTube"
+            )})()], "isError": False})(),
+            type("Result", (), {"content": [], "isError": False})(),
+            type("Result", (), {"content": [], "isError": False})(),
+        ]
+        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)):
+            self.assertTrue(await jarvis.close_managed_web_tab(
+                "zalo", "Zalo", ("https://chat.zalo.me/",)
+            ))
+        close_calls = [
+            call.kwargs["arguments"] for call in session.call_tool.await_args_list
+            if call.args[0] == "close_page"
+        ]
+        self.assertEqual(close_calls, [{"pageId": 1}, {"pageId": 2}])
+
+    async def test_close_zalo_matches_page_url_not_url_text_in_title(self):
+        session = AsyncMock()
+        session.call_tool.return_value = type("Result", (), {"content": [
+            type("Text", (), {"text": (
+                "1: https://example.com/ Article about https://chat.zalo.me/"
+            )})()
+        ], "isError": False})()
+        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)):
+            self.assertFalse(await jarvis.close_managed_web_tab(
+                "zalo", "Zalo", ("https://chat.zalo.me/",)
+            ))
+        self.assertEqual(session.call_tool.await_count, 1)
+
+    async def test_close_last_zalo_tab_navigates_without_closing_chrome(self):
+        session = AsyncMock()
+        session.call_tool.side_effect = [
+            type("Result", (), {"content": [type("Text", (), {
+                "text": "1: https://chat.zalo.me/ Zalo"
+            })()], "isError": False})(),
+            type("Result", (), {"content": [], "isError": False})(),
+            type("Result", (), {"content": [], "isError": False})(),
+        ]
+        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)):
+            self.assertTrue(await jarvis.close_managed_web_tab(
+                "zalo", "Zalo", ("https://chat.zalo.me/",)
+            ))
+        tools = [call.args[0] for call in session.call_tool.await_args_list]
+        self.assertEqual(tools, ["list_pages", "select_page", "navigate_page"])
+        self.assertNotIn("close_page", tools)
+
+    async def test_close_zalo_command_closes_only_zalo_tab(self):
+        with patch("jarvis.close_managed_web_tab", new=AsyncMock(return_value=True)) as close:
+            handled = await jarvis.route_command("tắt zalo", allow_local_ai=False)
+
+        self.assertTrue(handled)
+        close.assert_awaited_once_with(
+            "zalo", "Zalo", ("https://chat.zalo.me/",)
+        )
+
+    async def test_close_zalo_aliases_do_not_fall_through_to_open_suggestion(self):
+        for command in ("đóng zalo", "thoát zalo", "tat zalo", "dong zalo"):
+            with self.subTest(command=command), patch(
+                "jarvis.close_managed_web_tab", new=AsyncMock(return_value=True)
+            ) as close:
+                handled = await jarvis.route_command(command, allow_local_ai=False)
+                self.assertTrue(handled)
+                close.assert_awaited_once()
+
     def test_summary_uses_current_zalo_conversation_row_selector(self):
         source = inspect.getsource(jarvis.summarize_zalo_work)
         self.assertIn('[data-id="div_TabMsg_ThrdChItem"].msg-item', source)

@@ -45,6 +45,16 @@ class HelpCatalogTests(unittest.TestCase):
         self.assertIn("youtube đang phát gì", web)
         self.assertIn("Zalo công việc", format_category_choices())
 
+    def test_open_features_document_paired_close_commands(self):
+        web = "\n".join(command for _label, command in HELP_CATEGORIES["web"]["commands"])
+        zalo = "\n".join(command for _label, command in HELP_CATEGORIES["zalo"]["commands"])
+        apps = "\n".join(command for _label, command in HELP_CATEGORIES["apps"]["commands"])
+        self.assertIn("tắt youtube", web)
+        self.assertIn("tắt chatgpt học", web)
+        self.assertIn("tắt zalo", zalo)
+        self.assertIn("tắt terminal", apps)
+        self.assertIn("tắt downloads", apps)
+
 
 if __name__ == "__main__":
     unittest.main()
