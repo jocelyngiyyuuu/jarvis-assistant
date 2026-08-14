@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import jarvis
 
@@ -55,6 +55,87 @@ class ChromeShortcutTests(unittest.TestCase):
 
 
 class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
+    def test_terminal_rolls_back_untracked_new_window(self):
+        process = Mock()
+        process.poll.return_value = None
+        with patch.object(
+            jarvis.FILE_WINDOWS, "snapshot_ids", return_value={"0x1"}
+        ), patch("jarvis.subprocess.Popen", return_value=process), patch(
+            "jarvis.shutil.which", return_value="/usr/bin/gnome-terminal"
+        ), patch.object(
+            jarvis.FILE_WINDOWS, "track_opened_window", return_value=False
+        ), patch.object(
+            jarvis.FILE_WINDOWS, "close_new_window", return_value=True
+        ) as rollback:
+            self.assertFalse(jarvis.open_terminal())
+        rollback.assert_called_once_with({"0x1"})
+        self.assertIn("đã hoàn tác", jarvis.last_command_response)
+
+    def test_open_folder_handles_missing_launcher_and_rolls_back_untracked_window(self):
+        path = jarvis.Path("/tmp/example")
+        with patch.object(path.__class__, "exists", return_value=True), patch.object(
+            jarvis.FILE_WINDOWS, "snapshot_ids", return_value={"0x1"}
+        ), patch("jarvis.subprocess.Popen", side_effect=FileNotFoundError):
+            self.assertFalse(jarvis.open_folder(path, "Example"))
+        self.assertIn("Không tìm thấy trình mở", jarvis.last_command_response)
+
+        with patch.object(path.__class__, "exists", return_value=True), patch.object(
+            jarvis.FILE_WINDOWS, "snapshot_ids", return_value={"0x1"}
+        ), patch("jarvis.subprocess.Popen"), patch.object(
+            jarvis.FILE_WINDOWS, "track_opened_path", return_value=False
+        ), patch.object(
+            jarvis.FILE_WINDOWS, "close_new_window", return_value=True
+        ) as rollback:
+            self.assertFalse(jarvis.open_folder(path, "Example"))
+        rollback.assert_called_once_with({"0x1"}, file_manager_only=True)
+
+    def test_open_vscode_tracks_exact_new_window_and_handles_missing_binary(self):
+        with patch.object(
+            jarvis.FILE_WINDOWS, "snapshot_ids", return_value={"0x1"}
+        ), patch("jarvis.subprocess.Popen") as popen, patch.object(
+            jarvis.FILE_WINDOWS, "track_opened_window", return_value=True
+        ) as track:
+            self.assertTrue(jarvis.open_vscode())
+        self.assertIn("--new-window", popen.call_args.args[0])
+        track.assert_called_once_with(
+            "vscode", {"0x1"}, allowed_classes={"code"}
+        )
+
+        with patch.object(
+            jarvis.FILE_WINDOWS, "snapshot_ids", return_value=set()
+        ), patch("jarvis.subprocess.Popen", side_effect=FileNotFoundError):
+            self.assertFalse(jarvis.open_vscode())
+        self.assertIn("Không tìm thấy VS Code", jarvis.last_command_response)
+
+    def test_individual_vscode_close_uses_only_exact_window_manager(self):
+        with patch.object(
+            jarvis.FILE_WINDOWS, "close_last",
+            return_value=(True, "Đã đóng VS Code"),
+        ) as close, patch("jarvis._terminate_processes") as terminate:
+            self.assertTrue(jarvis.close_vscode())
+        close.assert_called_once_with("vscode")
+        terminate.assert_not_called()
+
+    def test_individual_file_manager_close_never_quits_or_pkills_process(self):
+        with patch.object(
+            jarvis.FILE_WINDOWS, "close_all_paths",
+            return_value=(True, "Đã đóng 2 cửa sổ File Manager"),
+        ) as close, patch("jarvis.subprocess.run") as run:
+            self.assertTrue(jarvis.close_file_manager())
+        close.assert_called_once()
+        run.assert_not_called()
+
+    async def test_google_search_from_ipc_never_prompts_for_profile(self):
+        with patch("builtins.input") as prompt, patch.object(
+            jarvis, "open_chrome"
+        ) as open_chrome:
+            self.assertTrue(await jarvis.route_command(
+                "google thời tiết", allow_local_ai=False, source="gtk"
+            ))
+        prompt.assert_not_called()
+        open_chrome.assert_not_called()
+        self.assertIn("Hãy nói rõ profile", jarvis.last_command_response)
+
     async def test_bare_github_close_defaults_to_profile_1_without_prompt(self):
         with patch.object(
             jarvis.CHROME_WINDOWS,

@@ -547,11 +547,14 @@ Không đổi remote debugging sang `0.0.0.0` để “sửa nhanh”; việc đ
 
 ### TTS không hoạt động
 
+Lệnh từ Discord và GUI/Terminal đều phải được đọc trên loa máy. Nếu chỉ Discord có tiếng, restart `jarvis.service` sau khi cập nhật.
+
 Kiểm tra:
 
 ```bash
 test -x tts/VieNeu-TTS/.venv/bin/python && echo 'TTS Python OK'
 test -f tts/tts_engine.py && echo 'TTS engine OK'
+command -v paplay || command -v pw-play || command -v aplay
 journalctl --user -u jarvis.service -n 120 --no-pager
 ```
 

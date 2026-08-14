@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
-import subprocess
 import sys
+
+from tts_playback import play_wav
+from tts_limits import max_new_frames_for_text
 
 
 # ==========================================================
 # PATH
 # ==========================================================
 
-BASE_DIR = Path.home() / "Projects" / "jarvis"
-TTS_DIR = BASE_DIR / "tts"
+TTS_DIR = Path(__file__).resolve().parent
 VIE_NEU_DIR = TTS_DIR / "VieNeu-TTS"
 
+sys.path.insert(0, str(TTS_DIR))
 sys.path.insert(0, str(VIE_NEU_DIR / "src"))
 
 from vieneu import Vieneu
@@ -50,18 +52,22 @@ def speak(text):
     print(f"Jarvis TTS: {text}", flush=True)
 
     try:
+        max_new_frames = max_new_frames_for_text(text)
         audio = tts.infer(
             text,
-            ref_audio=str(VOICE_FILE),
+            ref_audio=str(VOICE_FILE) if VOICE_FILE.exists() else None,
             denoise=False,
+            use_ref_codes=False,
+            max_new_frames=max_new_frames,
         )
 
         tts.save(audio, str(OUTPUT_FILE))
-
-        subprocess.run(
-            ["aplay", "-q", str(OUTPUT_FILE)],
-            check=False,
+        duration = len(audio) / getattr(tts, "sample_rate", 48000)
+        print(
+            f"Jarvis TTS: {duration:.1f}s ({max_new_frames} frames)",
+            flush=True,
         )
+        play_wav(OUTPUT_FILE)
 
     except Exception as error:
         print(f"Jarvis TTS ERROR: {error}", flush=True)

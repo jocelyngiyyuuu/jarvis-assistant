@@ -1,6 +1,8 @@
+import gc
 import sqlite3
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 from jarvis_core.brain import NaturalLanguageRouter
@@ -74,6 +76,21 @@ class MemoryStoreTests(unittest.TestCase):
         row = migrated.recall("ký ức")[0]
         self.assertEqual(row["category"], "general")
         self.assertEqual(row["content"], "Ký ức cũ")
+
+    def test_database_connections_are_closed_after_each_operation(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            leaked = MemoryStore(self.database)
+            leaked.remember("Kiểm tra connection")
+            leaked.recall("connection")
+            del leaked
+            gc.collect()
+        database_warnings = [
+            item for item in caught
+            if issubclass(item.category, ResourceWarning)
+            and "unclosed database" in str(item.message)
+        ]
+        self.assertEqual(database_warnings, [])
 
 
 class MemoryRouterTests(unittest.TestCase):

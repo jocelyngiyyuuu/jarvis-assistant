@@ -127,6 +127,26 @@ class ChromeAutomationProfileTests(unittest.TestCase):
         self.assertTrue(result)
         ensure.assert_called_once_with("https://chat.zalo.me/")
 
+    def test_personal_zalo_does_not_use_study_automation_profile(self):
+        with patch("jarvis.ensure_jarvis_chrome", return_value=True) as automation, patch(
+            "jarvis._jarvis_debug_port_owner_pid", return_value=321
+        ), patch("jarvis.subprocess.Popen") as popen, patch.object(
+            jarvis.CHROME_WINDOWS, "activate_automation_window", return_value=True
+        ), patch.object(
+            jarvis.CHROME_WINDOWS, "snapshot_ids", return_value=set()
+        ), patch.object(
+            jarvis.CHROME_WINDOWS, "track_profile_window", return_value=True
+        ) as track:
+            self.assertTrue(jarvis.open_chrome(
+                jarvis.PERSONAL_PROFILE, "https://chat.zalo.me/"
+            ))
+        automation.assert_not_called()
+        args = popen.call_args.args[0]
+        self.assertIn(f"--profile-directory={jarvis.PERSONAL_PROFILE}", args)
+        track.assert_called_once_with(
+            jarvis.PERSONAL_PROFILE, set(), site_key="zalo"
+        )
+
     def test_opening_managed_site_activates_dedicated_window(self):
         with patch("jarvis.ensure_jarvis_chrome", return_value=True), \
              patch("jarvis._jarvis_debug_port_owner_pid", return_value=321), \

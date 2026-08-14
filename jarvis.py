@@ -283,6 +283,7 @@ async def _handle_ipc_client(reader, writer):
                         await route_command(command, source=source)
                     response = last_command_response or "✅ Jarvis đã xử lý lệnh."
                 CORE.conversation.add(source, "assistant", response)
+                speak_last_response()
                 payload = {"ok": True, "response": response}
             except Exception as error:
                 payload = {"ok": False, "response": f"Không thể xử lý lệnh: {error}"}
@@ -488,7 +489,7 @@ def ensure_jarvis_chrome(url="chrome://newtab/"):
     return False
 
 
-def _is_automation_url(url):
+def _is_automation_url(url, profile=None):
     try:
         host = (urlparse(url).hostname or "").lower()
     except (TypeError, ValueError):
@@ -496,13 +497,13 @@ def _is_automation_url(url):
     return (
         host == "youtube.com"
         or host.endswith(".youtube.com")
-        or host == "chat.zalo.me"
+        or (host == "chat.zalo.me" and profile == STUDY_PROFILE)
     )
 
 
 def open_chrome(profile, url):
     previous_window_ids = CHROME_WINDOWS.snapshot_ids()
-    if _is_automation_url(url):
+    if _is_automation_url(url, profile):
         target_hint = "zalo" if (urlparse(url).hostname or "").lower() == "chat.zalo.me" else "youtube"
         opened = ensure_jarvis_chrome(url)
         owner_pid = _jarvis_debug_port_owner_pid() if opened else None
@@ -536,6 +537,7 @@ def open_chrome(profile, url):
         "drive.google.com": "drive",
         "calendar.google.com": "calendar",
         "github.com": "github",
+        "chat.zalo.me": "zalo",
         "www.google.com": "google",
     }.get(host)
     return CHROME_WINDOWS.track_profile_window(
@@ -679,9 +681,11 @@ def handle_chrome_shortcut_close(command):
         flags=re.IGNORECASE,
     ).strip()
     shortcut = CHROME_SHORTCUTS.get(target_text)
-    if shortcut is None or target_text in {"zalo", "zalo web", "chrome"}:
+    if shortcut is None or target_text == "chrome":
         return False
     profile, _ = _chrome_profile_from_explicit_command(command)
+    if target_text in {"zalo", "zalo web"} and profile != PERSONAL_PROFILE:
+        return False
     if profile is None and target_text == "github":
         profile = STUDY_PROFILE
     if profile is None:
@@ -699,6 +703,7 @@ def handle_chrome_shortcut_close(command):
         "drive.google.com": "drive",
         "calendar.google.com": "calendar",
         "github.com": "github",
+        "chat.zalo.me": "zalo",
         "www.google.com": "google",
     }.get((urlparse(url).hostname or "").lower())
     if site_key is None:
@@ -2479,7 +2484,7 @@ def extract_google_query(command):
     return ""
 
 
-def search_google(command):
+def search_google(command, *, allow_prompt=True):
     query = extract_google_query(
         command
     )
@@ -2489,19 +2494,27 @@ def search_google(command):
             "Jarvis: Bạn muốn tìm gì?"
         )
 
-        query = input(
-            "Tìm kiếm: "
-        ).strip()
+        if not allow_prompt:
+            message = "ℹ️ Hãy thêm nội dung cần tìm sau lệnh Google."
+            set_command_response(message)
+            return False
+        query = input("Tìm kiếm: ").strip()
 
     if not query:
         return
 
-    profile, profile_name = (
-        choose_chrome_profile(command)
-    )
+    profile, profile_name = _chrome_profile_from_explicit_command(command)
+    if profile is None and allow_prompt:
+        profile, profile_name = choose_chrome_profile(command)
 
     if profile is None:
-        return
+        message = (
+            "ℹ️ Hãy nói rõ profile, ví dụ: `google thời tiết học` "
+            "hoặc `google thời tiết cá nhân`."
+        )
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
 
     url = (
         "https://www.google.com/search?q="
@@ -2513,7 +2526,7 @@ def search_google(command):
         f"bằng {profile_name}..."
     )
 
-    open_chrome(
+    return open_chrome(
         profile,
         url,
     )
@@ -2544,15 +2557,30 @@ def open_github(command):
 # ==========================================================
 
 def open_vscode():
-    message = "Đang mở VS Code."
+    previous_window_ids = FILE_WINDOWS.snapshot_ids()
+    try:
+        subprocess.Popen(
+            ["code", "--new-window", "--profile", "Jarvis"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        message = "❌ Không tìm thấy VS Code trên hệ thống."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
+
+    tracked = FILE_WINDOWS.track_opened_window(
+        "vscode", previous_window_ids, allowed_classes={"code"}
+    )
+    message = (
+        "✅ Đã mở VS Code."
+        if tracked
+        else "❌ Không xác minh được cửa sổ VS Code mới; Jarvis sẽ không nhận quyền đóng."
+    )
     print(f"Jarvis: {message}")
     set_command_response(message)
-
-    subprocess.Popen(
-        ["code"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    return tracked
 
 
 # ==========================================================
@@ -2625,20 +2653,29 @@ def open_folder(path, name):
 
     print(f"Jarvis: Đang mở {name}...")
     previous_window_ids = FILE_WINDOWS.snapshot_ids()
-    subprocess.Popen(
-        [
-            "xdg-open",
-            str(path),
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.Popen(
+            ["xdg-open", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        message = "❌ Không tìm thấy trình mở file/thư mục trên hệ thống."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
     tracked = FILE_WINDOWS.track_opened_path(path, previous_window_ids)
-    message = (
-        f"✅ Đã mở {name}."
-        if tracked
-        else f"⚠️ Đã yêu cầu mở {name} nhưng không theo dõi được cửa sổ để đóng sau."
-    )
+    if not tracked:
+        rolled_back = FILE_WINDOWS.close_new_window(
+            previous_window_ids, file_manager_only=True
+        )
+        message = (
+            f"❌ Không xác minh được cửa sổ {name} mới; đã hoàn tác việc mở."
+            if rolled_back else
+            f"❌ Không xác minh được cửa sổ {name} mới; không đóng bừa cửa sổ khác."
+        )
+    else:
+        message = f"✅ Đã mở {name}."
     set_command_response(message)
     print(f"Jarvis: {message}")
     return tracked
@@ -2711,53 +2748,18 @@ def _terminate_processes(patterns, app_name):
 
 
 def close_vscode():
-    """Đóng toàn bộ tiến trình VS Code của người dùng hiện tại."""
-    return _terminate_processes(
-        [
-            r"/usr/share/code/code",
-            r"/snap/code/",
-            r"(^|/)code( |$)",
-        ],
-        "VS Code",
-    )
+    """Close only the exact VS Code window Jarvis previously opened."""
+    success, detail = FILE_WINDOWS.close_last("vscode")
+    message = f"{'✅' if success else '❌'} {detail}"
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return True
 
 
 def close_file_manager():
-    """Đóng File Manager/Nautilus, bao gồm các cửa sổ Downloads/Documents/Pictures/Home."""
-    closed_any = False
-
-    # Nautilus có lệnh quit riêng, sạch hơn pkill.
-    try:
-        result = subprocess.run(
-            ["nautilus", "-q"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if result.returncode == 0:
-            closed_any = True
-    except FileNotFoundError:
-        pass
-
-    # Một số Ubuntu dùng process/file manager khác; thử các tên phổ biến.
-    for process_name in ("nautilus", "nemo", "thunar"):
-        try:
-            result = subprocess.run(
-                ["pkill", "-TERM", "-x", process_name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            if result.returncode == 0:
-                closed_any = True
-        except FileNotFoundError:
-            break
-
-    if closed_any:
-        message = "✅ Đã tắt File Manager."
-    else:
-        message = "ℹ️ File Manager hiện không chạy."
-
+    """Close only exact file-manager windows tracked by Jarvis."""
+    success, detail = FILE_WINDOWS.close_all_paths()
+    message = f"{'✅' if success else '❌'} {detail}"
     print(f"Jarvis: {message}")
     set_command_response(message)
     return True
@@ -5443,7 +5445,10 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         for prefix in google_prefixes
     ):
 
-        search_google(command)
+        search_google(
+            command,
+            allow_prompt=(source == "terminal" and sys.stdin.isatty()),
+        )
 
         return True
 

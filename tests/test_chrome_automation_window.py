@@ -7,6 +7,37 @@ from jarvis_core.window_manager import ChromeWindowManager, FileWindowManager
 
 
 class ManagedDesktopWindowTests(unittest.TestCase):
+    def test_named_app_tracking_filters_exact_allowed_class_components(self):
+        manager = FileWindowManager()
+        windows = [
+            {"id": "0x2", "class": "code.evil.App", "title": "Jarvis VS Code"},
+            {"id": "0x3", "class": "code.Code", "title": "Jarvis VS Code"},
+        ]
+        with patch.object(manager, "list_windows", return_value=windows), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_start_time", return_value="100"):
+            self.assertTrue(manager.track_opened_window(
+                "vscode", set(), expected_title="Jarvis VS Code",
+                allowed_classes={"code"}, timeout=0.01,
+            ))
+        self.assertEqual(manager.last_windows["vscode"]["id"], "0x3")
+
+    def test_named_app_close_reuses_exact_identity_validation(self):
+        manager = FileWindowManager()
+        manager.last_windows["vscode"] = {
+            "id": "0x3", "class": "code.Code", "title": "Jarvis VS Code",
+            "path": "VS Code", "pid": 222, "start_time": "100",
+        }
+        reused = {"id": "0x3", "class": "code.Code", "title": "User VS Code"}
+        with patch.object(manager, "list_windows", return_value=[reused]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_start_time", return_value="100"), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            success, _ = manager.close_last("vscode")
+        self.assertFalse(success)
+        run.assert_not_called()
+
     def test_wmctrl_parser_excludes_hostname_from_title(self):
         rows = FileWindowManager._parse_windows(
             "0x0180003b  0 github.com.Google-chrome  Moriarty GitHub\n"
@@ -203,6 +234,25 @@ class ChromeAutomationWindowTests(unittest.TestCase):
         self.assertFalse(success)
         run.assert_not_called()
 
+    def test_profile_close_refuses_reused_or_changed_window_identity(self):
+        manager = ChromeWindowManager()
+        manager.profile_windows["Profile 1"] = [{
+            "id": "0x2", "class": "google-chrome.Google-chrome",
+            "title": "Gmail", "pid": 222,
+        }]
+        reused = {
+            "id": "0x2", "class": "org.gnome.Nautilus", "title": "Gmail",
+        }
+        with patch.object(manager, "list_windows", return_value=[reused]), patch.object(
+            manager, "_window_pid", return_value=333
+        ), patch.object(manager, "_process_has_profile", return_value=False), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            success, _ = manager.close_profile("Profile 1", "Học")
+        self.assertFalse(success)
+        run.assert_not_called()
+        self.assertEqual(manager.profile_windows["Profile 1"], [])
+
     def test_github_tracking_ignores_unrelated_profile_window_until_app_marker(self):
         manager = ChromeWindowManager()
         unrelated = {
@@ -216,6 +266,8 @@ class ChromeAutomationWindowTests(unittest.TestCase):
                 [unrelated], [unrelated, github], [unrelated, github], [unrelated, github]
             ]
         ), patch.object(manager, "_window_pid", return_value=222), patch.object(
+            manager, "_process_start_time", return_value="100"
+        ), patch.object(
             manager, "_process_has_profile", return_value=True
         ):
             self.assertTrue(manager.track_profile_window(
@@ -250,6 +302,8 @@ class ChromeAutomationWindowTests(unittest.TestCase):
                 [initial], [initial], [initial], [stable], [stable], [stable]
             ]
         ), patch.object(manager, "_window_pid", return_value=222), patch.object(
+            manager, "_process_start_time", return_value="100"
+        ), patch.object(
             manager, "_process_has_profile", return_value=True
         ):
             self.assertTrue(manager.track_profile_window(

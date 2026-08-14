@@ -97,6 +97,21 @@ class ZaloCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(handled)
                 close.assert_awaited_once()
 
+    async def test_personal_zalo_close_uses_exact_personal_profile_window(self):
+        with patch.object(
+            jarvis.CHROME_WINDOWS, "close_site_window",
+            return_value=(True, "Đã đóng Zalo."),
+        ) as close, patch(
+            "jarvis.close_managed_web_tab", new=AsyncMock()
+        ) as cdp_close:
+            self.assertTrue(await jarvis.route_command(
+                "tắt zalo cá nhân", allow_local_ai=False
+            ))
+        close.assert_called_once_with(
+            jarvis.PERSONAL_PROFILE, "zalo", "Zalo công việc"
+        )
+        cdp_close.assert_not_awaited()
+
     def test_summary_uses_current_zalo_conversation_row_selector(self):
         source = inspect.getsource(jarvis.summarize_zalo_work)
         self.assertIn('[data-id="div_TabMsg_ThrdChItem"].msg-item', source)

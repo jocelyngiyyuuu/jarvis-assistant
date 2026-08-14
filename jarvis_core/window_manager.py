@@ -14,7 +14,10 @@ class FileWindowManager:
     """Best-effort window tracking through wmctrl, without killing an app."""
 
     def __init__(self):
-        self.last_windows = {"file": None, "folder": None, "terminal": None}
+        self.last_windows = {
+            "file": None, "folder": None, "terminal": None,
+            "vscode": None, "system-monitor": None,
+        }
         self.path_windows = {}
         self.processes = {}
 
@@ -82,6 +85,32 @@ class FileWindowManager:
     def snapshot_ids(self):
         return {window["id"] for window in self.list_windows()}
 
+    def close_new_window(self, previous_ids, *, file_manager_only=False):
+        """Rollback one unambiguous new X11 window without adopting it."""
+        candidates = [
+            window for window in self.list_windows()
+            if window["id"] not in previous_ids
+            and (not file_manager_only or self._is_file_manager(window))
+        ]
+        if len(candidates) != 1:
+            return False
+        window_id = candidates[0]["id"]
+        try:
+            result = subprocess.run(
+                ["wmctrl", "-ic", window_id], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False, timeout=2,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return False
+        if result.returncode != 0:
+            return False
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if window_id not in self.snapshot_ids():
+                return True
+            time.sleep(0.1)
+        return False
+
     def track_opened_path(self, path, previous_ids, timeout=3.0):
         """Find the new window created after xdg-open and remember only that window."""
         path = Path(path)
@@ -129,7 +158,8 @@ class FileWindowManager:
         return True
 
     def track_opened_window(
-        self, kind, previous_ids, timeout=3.0, expected_title=None
+        self, kind, previous_ids, timeout=3.0, expected_title=None,
+        allowed_classes=None,
     ):
         """Remember one newly-created desktop window for a named managed kind."""
         deadline = time.monotonic() + timeout
@@ -149,6 +179,16 @@ class FileWindowManager:
             candidates = [
                 window for window in candidates
                 if any(token in window.get("class", "").casefold() for token in terminal_tokens)
+            ]
+        if allowed_classes:
+            allowed = {str(value).casefold() for value in allowed_classes}
+            candidates = [
+                window for window in candidates
+                if {
+                    part for part in re.split(
+                        r"[.\s]+", window.get("class", "").casefold()
+                    ) if part
+                } == allowed
             ]
         if expected_title:
             expected = str(expected_title).casefold()
@@ -216,6 +256,8 @@ class FileWindowManager:
             "folder": "thư mục/project",
             "file": "file",
             "terminal": "Terminal",
+            "vscode": "VS Code",
+            "system-monitor": "System Monitor",
         }.get(kind, kind)
         if tracked is None:
             return False, f"Không có cửa sổ {kind_label} nào do Jarvis theo dõi."
@@ -240,6 +282,48 @@ class FileWindowManager:
 
     def close_last_folder(self):
         return self.close_last("folder")
+
+    def close_all_paths(self):
+        """Close every still-tracked file/folder window, never the whole manager."""
+        identities = []
+        seen = set()
+        for identity in [
+            *self.path_windows.values(),
+            self.last_windows.get("file"),
+            self.last_windows.get("folder"),
+        ]:
+            if not identity:
+                continue
+            key = (
+                identity.get("id"), identity.get("pid"),
+                identity.get("start_time"),
+            )
+            if key not in seen:
+                seen.add(key)
+                identities.append(identity)
+        if not identities:
+            return False, "Không có cửa sổ File Manager nào do Jarvis theo dõi."
+
+        closed = 0
+        failed = 0
+        for identity in identities:
+            def clear(target=identity):
+                for path, tracked in list(self.path_windows.items()):
+                    if tracked is target:
+                        self.path_windows.pop(path, None)
+                for kind in ("file", "folder"):
+                    if self.last_windows.get(kind) is target:
+                        self.last_windows[kind] = None
+
+            success, _ = self._close_identity(identity, "File Manager", clear)
+            closed += int(success)
+            failed += int(not success)
+        if failed:
+            return False, (
+                f"Đã đóng {closed} cửa sổ File Manager; "
+                f"{failed} cửa sổ không còn xác minh được chính xác."
+            )
+        return True, f"Đã đóng {closed} cửa sổ File Manager do Jarvis mở."
 
     def track_process(self, kind, process):
         """Track an exact child process created for one managed app window."""
@@ -486,10 +570,15 @@ class ChromeWindowManager(FileWindowManager):
                     ):
                         continue
                 pid = self._window_pid(window["id"])
-                if pid is None or not self._process_has_profile(pid, profile):
+                start_time = self._process_start_time(pid) if pid is not None else None
+                if (
+                    pid is None or start_time is None
+                    or not self._process_has_profile(pid, profile)
+                ):
                     continue
                 candidate = dict(window)
                 candidate["pid"] = pid
+                candidate["start_time"] = start_time
                 candidates.append(candidate)
             if site_key == "github" and len(candidates) == 1:
                 identity = (
@@ -586,10 +675,36 @@ class ChromeWindowManager(FileWindowManager):
         if not tracked:
             return False, f"Không có cửa sổ Chrome {profile_name} nào do Jarvis theo dõi."
 
-        current_ids = {window["id"] for window in self.list_windows()}
-        closable = [window for window in tracked if window["id"] in current_ids]
+        current_by_id = {
+            self._normalize_window_id(window["id"]): window
+            for window in self.list_windows()
+        }
+        closable = []
+        for identity in tracked:
+            window_id = self._normalize_window_id(identity.get("id"))
+            current = current_by_id.get(window_id)
+            current_pid = self._window_pid(identity.get("id")) if current else None
+            current_start = (
+                self._process_start_time(current_pid) if current_pid is not None else None
+            )
+            if (
+                current is None
+                or current.get("class", "").casefold()
+                != identity.get("class", "").casefold()
+                or normalize_text(current.get("title", ""))
+                != normalize_text(identity.get("title", ""))
+                or current_pid != identity.get("pid")
+                or current_start != identity.get("start_time")
+                or not self._process_has_profile(current_pid, profile)
+            ):
+                continue
+            closable.append(identity)
         if not closable:
             self.profile_windows[profile] = []
+            self.site_windows = {
+                key: value for key, value in self.site_windows.items()
+                if key[0] != profile
+            }
             return False, f"Các cửa sổ Chrome {profile_name} đã được đóng trước đó."
 
         failed = 0
@@ -608,7 +723,25 @@ class ChromeWindowManager(FileWindowManager):
 
         if failed:
             return False, f"Không thể đóng riêng {failed} cửa sổ Chrome {profile_name}."
+        deadline = time.monotonic() + 2.0
+        closing_ids = {
+            self._normalize_window_id(window["id"]) for window in closable
+        }
+        while time.monotonic() < deadline:
+            remaining = {
+                self._normalize_window_id(window["id"])
+                for window in self.list_windows()
+            }
+            if closing_ids.isdisjoint(remaining):
+                break
+            time.sleep(0.1)
+        else:
+            return False, f"Một số cửa sổ Chrome {profile_name} vẫn còn mở."
         self.profile_windows[profile] = []
+        self.site_windows = {
+            key: value for key, value in self.site_windows.items()
+            if key[0] != profile
+        }
         return True, f"Đã đóng {len(closable)} cửa sổ Chrome {profile_name} do Jarvis mở."
 
     def clear(self):
