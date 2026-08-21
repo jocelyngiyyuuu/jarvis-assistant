@@ -53,6 +53,8 @@ def classify_remote_command(command):
         "tom tat mail", "doc mail", "mail co gi", "tong hop mail", "kiem tra mail",
         "tom tat thu dien tu", "doc thu dien tu", "thu dien tu co gi",
         "tong hop thu dien tu", "kiem tra thu dien tu",
+        "help gmail", "help email", "help mail", "help thu dien tu",
+        "tro giup gmail", "tro giup email", "tro giup mail", "tro giup thu dien tu",
         "tom tat thu rac", "doc thu rac", "kiem tra thu rac",
         "tom tat spam", "doc spam", "kiem tra spam",
     )

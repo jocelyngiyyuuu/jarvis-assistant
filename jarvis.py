@@ -3033,7 +3033,7 @@ def open_vscode():
         set_command_response("❌ Không thể xác minh danh sách cửa sổ; chưa mở VS Code.")
         return False
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             ["code", "--new-window", "--profile", "Jarvis"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -3047,10 +3047,14 @@ def open_vscode():
     tracked = FILE_WINDOWS.track_opened_window(
         "vscode", previous_window_ids, allowed_classes={"code"}
     )
+    rolled_back = False if tracked else FILE_WINDOWS.close_new_window(
+        previous_window_ids, expected_pid=process.pid
+    )
     message = (
-        "✅ Đã mở VS Code."
-        if tracked
-        else "❌ Không xác minh được cửa sổ VS Code mới; Jarvis sẽ không nhận quyền đóng."
+        "✅ Đã mở VS Code." if tracked else
+        "❌ Không xác minh được cửa sổ VS Code mới; đã hoàn tác việc mở."
+        if rolled_back else
+        "❌ Không xác minh được cửa sổ VS Code mới; không đóng bừa cửa sổ khác."
     )
     print(f"Jarvis: {message}")
     set_command_response(message)
@@ -3073,7 +3077,7 @@ def open_system_monitor():
             )
             return False
         try:
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [executable], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
         except OSError:
@@ -3081,12 +3085,14 @@ def open_system_monitor():
         tracked = FILE_WINDOWS.track_opened_window(
             "system-monitor", previous_ids, allowed_classes=allowed_classes
         )
-        if not tracked:
-            FILE_WINDOWS.close_new_window(previous_ids)
+        rolled_back = False if tracked else FILE_WINDOWS.close_new_window(
+            previous_ids, expected_pid=process.pid
+        )
         message = (
-            "✅ Đã mở System Monitor."
-            if tracked else
-            "❌ Không xác minh được cửa sổ System Monitor mới; đã thử hoàn tác."
+            "✅ Đã mở System Monitor." if tracked else
+            "❌ Không xác minh được cửa sổ System Monitor mới; đã hoàn tác việc mở."
+            if rolled_back else
+            "❌ Không xác minh được cửa sổ System Monitor mới; không đóng bừa cửa sổ khác."
         )
         print(f"Jarvis: {message}")
         set_command_response(message)
@@ -3148,7 +3154,9 @@ def open_terminal():
             if tracked:
                 message = "✅ Đã mở Terminal."
             else:
-                rolled_back = FILE_WINDOWS.close_new_window(previous_window_ids)
+                rolled_back = FILE_WINDOWS.close_new_window(
+                    previous_window_ids, expected_pid=process.pid
+                )
                 message = (
                     "❌ Không xác minh được cửa sổ Terminal mới; đã hoàn tác việc mở."
                     if rolled_back else
@@ -3188,7 +3196,7 @@ def open_folder(path, name):
         set_command_response(message)
         return False
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             ["xdg-open", str(path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -3201,7 +3209,7 @@ def open_folder(path, name):
     tracked = FILE_WINDOWS.track_opened_path(path, previous_window_ids)
     if not tracked:
         rolled_back = FILE_WINDOWS.close_new_window(
-            previous_window_ids, file_manager_only=True
+            previous_window_ids, file_manager_only=True, expected_pid=process.pid
         )
         message = (
             f"❌ Không xác minh được cửa sổ {name} mới; đã hoàn tác việc mở."
@@ -3515,7 +3523,7 @@ def open_filesystem_path(path):
             print(f"Jarvis: {message}")
             set_command_response(message)
             return False
-        subprocess.Popen(
+        process = subprocess.Popen(
             ["xdg-open", str(resolved)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -3525,7 +3533,7 @@ def open_filesystem_path(path):
         kind = "thư mục" if resolved.is_dir() else "file"
         if not tracked:
             rolled_back = FILE_WINDOWS.close_new_window(
-                previous_window_ids, file_manager_only=True
+                previous_window_ids, file_manager_only=True, expected_pid=process.pid
             )
             message = (
                 f"❌ Không xác minh được cửa sổ {kind} mới; đã hoàn tác việc mở."

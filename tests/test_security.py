@@ -29,6 +29,8 @@ class SecurityPolicyTests(unittest.TestCase):
         for command in (
             "đọc gmail", "gmail có gì", "tổng hợp gmail", "kiểm tra email",
             "tóm tắt mail", "tóm tắt thư điện tử",
+            "help gmail", "help email", "help mail", "help thư điện tử",
+            "trợ giúp gmail", "trợ giúp mail", "trợ giúp thư điện tử",
         ):
             self.assertEqual(classify_remote_command(command), "sensitive", command)
 

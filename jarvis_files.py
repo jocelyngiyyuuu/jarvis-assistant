@@ -137,7 +137,7 @@ def open_path(path):
         if previous_ids is None:
             print("Jarvis: Không thể xác minh danh sách cửa sổ; chưa mở đường dẫn.")
             return False
-        subprocess.Popen(
+        process = subprocess.Popen(
             ["xdg-open", str(path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -145,8 +145,14 @@ def open_path(path):
         )
         tracked = WINDOWS.track_opened_path(path, previous_ids)
         if not tracked:
-            WINDOWS.close_new_window(previous_ids, file_manager_only=True)
-            print("Jarvis: Không xác minh được cửa sổ mới; đã thử hoàn tác.")
+            rolled_back = WINDOWS.close_new_window(
+                previous_ids, file_manager_only=True, expected_pid=process.pid
+            )
+            print(
+                "Jarvis: Không xác minh được cửa sổ mới; đã hoàn tác."
+                if rolled_back else
+                "Jarvis: Không xác minh được cửa sổ mới; không đóng bừa cửa sổ khác."
+            )
             return False
 
         print()

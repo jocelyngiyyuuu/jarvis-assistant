@@ -155,6 +155,7 @@ class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
 
     def test_terminal_rolls_back_untracked_new_window(self):
         process = Mock()
+        process.pid = 4242
         process.poll.return_value = None
         with patch.object(
             jarvis.FILE_WINDOWS, "snapshot_ids", return_value={"0x1"}
@@ -166,7 +167,7 @@ class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
             jarvis.FILE_WINDOWS, "close_new_window", return_value=True
         ) as rollback:
             self.assertFalse(jarvis.open_terminal())
-        rollback.assert_called_once_with({"0x1"})
+        rollback.assert_called_once_with({"0x1"}, expected_pid=4242)
         self.assertIn("đã hoàn tác", jarvis.last_command_response)
 
     def test_system_monitor_open_and_close_use_exact_window_identity(self):
@@ -188,6 +189,21 @@ class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(jarvis.close_system_monitor())
         close.assert_called_once_with("system-monitor")
 
+    def test_system_monitor_rollback_uses_exact_launched_pid(self):
+        process = Mock(pid=4343)
+        with patch.object(
+            jarvis.FILE_WINDOWS, "snapshot_ids", return_value={"0x1"}
+        ), patch("jarvis.shutil.which", return_value="/usr/bin/gnome-system-monitor"), patch(
+            "jarvis.subprocess.Popen", return_value=process
+        ), patch.object(
+            jarvis.FILE_WINDOWS, "track_opened_window", return_value=False
+        ), patch.object(
+            jarvis.FILE_WINDOWS, "close_new_window", return_value=True
+        ) as rollback:
+            self.assertFalse(jarvis.open_system_monitor())
+        rollback.assert_called_once_with({"0x1"}, expected_pid=4343)
+        self.assertIn("đã hoàn tác", jarvis.last_command_response)
+
     def test_open_folder_handles_missing_launcher_and_rolls_back_untracked_window(self):
         path = jarvis.Path("/tmp/example")
         with patch.object(path.__class__, "exists", return_value=True), patch.object(
@@ -198,13 +214,15 @@ class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(path.__class__, "exists", return_value=True), patch.object(
             jarvis.FILE_WINDOWS, "snapshot_ids", return_value={"0x1"}
-        ), patch("jarvis.subprocess.Popen"), patch.object(
+        ), patch("jarvis.subprocess.Popen", return_value=Mock(pid=4444)), patch.object(
             jarvis.FILE_WINDOWS, "track_opened_path", return_value=False
         ), patch.object(
             jarvis.FILE_WINDOWS, "close_new_window", return_value=True
         ) as rollback:
             self.assertFalse(jarvis.open_folder(path, "Example"))
-        rollback.assert_called_once_with({"0x1"}, file_manager_only=True)
+        rollback.assert_called_once_with(
+            {"0x1"}, file_manager_only=True, expected_pid=4444
+        )
 
     def test_open_vscode_tracks_exact_new_window_and_handles_missing_binary(self):
         with patch.object(
@@ -223,6 +241,19 @@ class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
         ), patch("jarvis.subprocess.Popen", side_effect=FileNotFoundError):
             self.assertFalse(jarvis.open_vscode())
         self.assertIn("Không tìm thấy VS Code", jarvis.last_command_response)
+
+    def test_vscode_failed_tracking_rolls_back_only_exact_launched_pid(self):
+        process = Mock(pid=4545)
+        with patch.object(
+            jarvis.FILE_WINDOWS, "snapshot_ids", return_value={"0x1"}
+        ), patch("jarvis.subprocess.Popen", return_value=process), patch.object(
+            jarvis.FILE_WINDOWS, "track_opened_window", return_value=False
+        ), patch.object(
+            jarvis.FILE_WINDOWS, "close_new_window", return_value=True
+        ) as rollback:
+            self.assertFalse(jarvis.open_vscode())
+        rollback.assert_called_once_with({"0x1"}, expected_pid=4545)
+        self.assertIn("đã hoàn tác", jarvis.last_command_response)
 
     def test_individual_vscode_close_uses_only_exact_window_manager(self):
         with patch.object(
