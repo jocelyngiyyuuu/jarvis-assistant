@@ -4,80 +4,59 @@ import inspect
 import io
 import json
 from contextlib import redirect_stdout
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import jarvis
 from jarvis import parse_zalo_request
 
 
 class ZaloCommandTests(unittest.IsolatedAsyncioTestCase):
-    async def test_close_managed_zalo_tab_closes_unique_match_only(self):
-        session = AsyncMock()
-        session.call_tool.side_effect = [
-            type("Result", (), {"content": [type("Text", (), {"text": (
-                "1: https://chat.zalo.me/ Zalo\n2: https://www.youtube.com/ YouTube"
-            )})()], "isError": False})(),
-            type("Result", (), {"content": [], "isError": False})(),
+    def setUp(self):
+        jarvis.managed_cdp_targets["zalo"] = {"owned-zalo"}
+        patcher = patch("jarvis._cdp_pages", return_value=[{
+            "id": "owned-zalo", "type": "page", "url": "https://chat.zalo.me/",
+        }])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_close_zalo_closes_only_stored_cdp_target(self):
+        jarvis.managed_cdp_targets["zalo"].add("owned-zalo")
+        pages_before = [
+            {"id": "owned-zalo", "type": "page", "url": "https://chat.zalo.me/"},
+            {"id": "user-zalo", "type": "page", "url": "https://chat.zalo.me/"},
         ]
-        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)):
+        pages_after = [pages_before[1]]
+        response = Mock(status=200)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch("jarvis._cdp_pages", side_effect=[pages_before, pages_after]), patch(
+            "jarvis.urlopen", return_value=response
+        ) as close:
             self.assertTrue(await jarvis.close_managed_web_tab(
                 "zalo", "Zalo", ("https://chat.zalo.me/",)
             ))
-        self.assertEqual(
-            session.call_tool.await_args_list[-1].args[0], "close_page"
-        )
-        self.assertEqual(session.call_tool.await_args_list[-1].kwargs["arguments"], {"pageId": 1})
+        self.assertIn("/json/close/owned-zalo", close.call_args.args[0])
+        self.assertNotIn("user-zalo", close.call_args.args[0])
+        self.assertEqual(jarvis.managed_cdp_targets["zalo"], set())
 
-    async def test_close_managed_zalo_tab_closes_all_exact_matches(self):
-        session = AsyncMock()
-        session.call_tool.side_effect = [
-            type("Result", (), {"content": [type("Text", (), {"text": (
-                "1: https://chat.zalo.me/ Zalo A\n"
-                "2: https://chat.zalo.me/ Zalo B\n"
-                "3: https://www.youtube.com/ YouTube"
-            )})()], "isError": False})(),
-            type("Result", (), {"content": [], "isError": False})(),
-            type("Result", (), {"content": [], "isError": False})(),
-        ]
-        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)):
-            self.assertTrue(await jarvis.close_managed_web_tab(
-                "zalo", "Zalo", ("https://chat.zalo.me/",)
-            ))
-        close_calls = [
-            call.kwargs["arguments"] for call in session.call_tool.await_args_list
-            if call.args[0] == "close_page"
-        ]
-        self.assertEqual(close_calls, [{"pageId": 1}, {"pageId": 2}])
-
-    async def test_close_zalo_matches_page_url_not_url_text_in_title(self):
-        session = AsyncMock()
-        session.call_tool.return_value = type("Result", (), {"content": [
-            type("Text", (), {"text": (
-                "1: https://example.com/ Article about https://chat.zalo.me/"
-            )})()
-        ], "isError": False})()
-        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)):
+    async def test_close_zalo_without_registry_fails_closed_without_url_scan(self):
+        jarvis.managed_cdp_targets["zalo"].clear()
+        with patch("jarvis._cdp_pages") as pages, patch("jarvis.urlopen") as close:
             self.assertFalse(await jarvis.close_managed_web_tab(
                 "zalo", "Zalo", ("https://chat.zalo.me/",)
             ))
-        self.assertEqual(session.call_tool.await_count, 1)
+        pages.assert_not_called()
+        close.assert_not_called()
 
-    async def test_close_last_zalo_tab_navigates_without_closing_chrome(self):
-        session = AsyncMock()
-        session.call_tool.side_effect = [
-            type("Result", (), {"content": [type("Text", (), {
-                "text": "1: https://chat.zalo.me/ Zalo"
-            })()], "isError": False})(),
-            type("Result", (), {"content": [], "isError": False})(),
-            type("Result", (), {"content": [], "isError": False})(),
-        ]
-        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)):
-            self.assertTrue(await jarvis.close_managed_web_tab(
+    async def test_close_zalo_cdp_outage_retains_registry_for_retry(self):
+        with patch("jarvis._cdp_pages", return_value=None), patch(
+            "jarvis.urlopen"
+        ) as close:
+            self.assertFalse(await jarvis.close_managed_web_tab(
                 "zalo", "Zalo", ("https://chat.zalo.me/",)
             ))
-        tools = [call.args[0] for call in session.call_tool.await_args_list]
-        self.assertEqual(tools, ["list_pages", "select_page", "navigate_page"])
-        self.assertNotIn("close_page", tools)
+        close.assert_not_called()
+        self.assertEqual(jarvis.managed_cdp_targets["zalo"], {"owned-zalo"})
 
     async def test_close_zalo_command_closes_only_zalo_tab(self):
         with patch("jarvis.close_managed_web_tab", new=AsyncMock(return_value=True)) as close:
@@ -178,6 +157,11 @@ class ZaloCommandTests(unittest.IsolatedAsyncioTestCase):
         output = io.StringIO()
         with redirect_stdout(output), \
              patch.object(jarvis, "get_mcp_session", AsyncMock(return_value=Session())), \
+             patch.object(
+                 jarvis.asyncio,
+                 "to_thread",
+                 AsyncMock(side_effect=lambda function, *args: function(*args)),
+             ), \
              patch.object(
                  jarvis.CORE.local_ai,
                  "summarize_zalo_work",

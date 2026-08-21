@@ -20,6 +20,7 @@ class FileWindowManager:
         }
         self.path_windows = {}
         self.processes = {}
+        self._last_enumeration_ok = True
 
     @staticmethod
     def _window_pid(window_id):
@@ -77,20 +78,41 @@ class FileWindowManager:
                 ["wmctrl", "-lx"], capture_output=True, text=True, check=False, timeout=2
             )
         except (FileNotFoundError, subprocess.SubprocessError):
+            self._last_enumeration_ok = False
             return []
         if result.returncode != 0:
+            self._last_enumeration_ok = False
             return []
+        self._last_enumeration_ok = True
         return self._parse_windows(result.stdout)
 
-    def snapshot_ids(self):
-        return {window["id"] for window in self.list_windows()}
+    def _verified_windows(self):
+        windows = self.list_windows()
+        return windows if self._last_enumeration_ok else None
 
-    def close_new_window(self, previous_ids, *, file_manager_only=False):
-        """Rollback one unambiguous new X11 window without adopting it."""
+    def snapshot_ids(self):
+        return self._verified_snapshot_ids()
+
+    def _verified_snapshot_ids(self):
+        windows = self._verified_windows()
+        if windows is None:
+            return None
+        return {window["id"] for window in windows}
+
+    def close_new_window(
+        self, previous_ids, *, file_manager_only=False, expected_pid=None
+    ):
+        """Rollback only a new window tied to the exact launched process."""
+        if expected_pid is None:
+            return False
+        windows = self._verified_windows()
+        if windows is None:
+            return False
         candidates = [
-            window for window in self.list_windows()
+            window for window in windows
             if window["id"] not in previous_ids
             and (not file_manager_only or self._is_file_manager(window))
+            and self._window_pid(window["id"]) == int(expected_pid)
         ]
         if len(candidates) != 1:
             return False
@@ -106,7 +128,10 @@ class FileWindowManager:
             return False
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            if window_id not in self.snapshot_ids():
+            current_ids = self._verified_snapshot_ids()
+            if current_ids is None:
+                return False
+            if window_id not in current_ids:
                 return True
             time.sleep(0.1)
         return False
@@ -137,6 +162,7 @@ class FileWindowManager:
 
         if len(candidates) != 1:
             self.last_windows[kind] = None
+            self.path_windows.pop(str(path.resolve()), None)
             return False
 
         selected = candidates[0]
@@ -144,6 +170,7 @@ class FileWindowManager:
         start_time = self._process_start_time(pid) if pid is not None else None
         if pid is None or start_time is None:
             self.last_windows[kind] = None
+            self.path_windows.pop(str(path.resolve()), None)
             return False
         identity = {
             "id": selected["id"],
@@ -216,8 +243,11 @@ class FileWindowManager:
         return True
 
     def _close_identity(self, tracked, kind_label, clear):
+        windows = self._verified_windows()
+        if windows is None:
+            return False, "Không thể xác minh danh sách cửa sổ; không đóng bừa."
         current = next((
-            window for window in self.list_windows() if window["id"] == tracked["id"]
+            window for window in windows if window["id"] == tracked["id"]
         ), None)
         current_pid = self._window_pid(tracked["id"]) if current else None
         current_start_time = (
@@ -244,7 +274,10 @@ class FileWindowManager:
             return False, f"Desktop không cho phép đóng riêng cửa sổ {kind_label} này."
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            if tracked["id"] not in self.snapshot_ids():
+            current_ids = self._verified_snapshot_ids()
+            if current_ids is None:
+                return False, "Không thể xác minh cửa sổ đã đóng; giữ ownership để thử lại."
+            if tracked["id"] not in current_ids:
                 clear()
                 return True, f"Đã đóng cửa sổ {kind_label}: {tracked['path']}"
             time.sleep(0.1)
@@ -324,6 +357,77 @@ class FileWindowManager:
                 f"{failed} cửa sổ không còn xác minh được chính xác."
             )
         return True, f"Đã đóng {closed} cửa sổ File Manager do Jarvis mở."
+
+    def window_ids_for_pid_ancestry(self, pid):
+        """Return hosting windows, or None when preservation cannot be proven."""
+        ancestry = set()
+        current = int(pid)
+        while current > 1 and current not in ancestry:
+            ancestry.add(current)
+            try:
+                stat = Path(f"/proc/{current}/stat").read_text()
+                current = int(stat.rsplit(") ", 1)[1].split()[1])
+            except (OSError, IndexError, TypeError, ValueError):
+                return None
+        windows = self._verified_windows()
+        if windows is None:
+            return None
+        preserved = set()
+        for window in windows:
+            window_pid = self._window_pid(window["id"])
+            if window_pid is None:
+                return None
+            if window_pid in ancestry:
+                preserved.add(window["id"])
+        return preserved
+
+    def close_all_gui_windows(
+        self, *, preserved_class_components=None, preserved_window_ids=None
+    ):
+        """Deliberately close every visible GUI window except preserved apps."""
+        preserved = {
+            str(value).casefold() for value in (preserved_class_components or set())
+        }
+        preserved_ids = set(preserved_window_ids or set())
+        windows = self._verified_windows()
+        if windows is None:
+            return False, 0, ["unverifiable-window-enumeration"]
+        targets = []
+        for window in windows:
+            if window["id"] in preserved_ids:
+                continue
+            components = {
+                part for part in re.split(
+                    r"[.\s]+", window.get("class", "").casefold()
+                ) if part
+            }
+            if components & preserved:
+                continue
+            targets.append(window["id"])
+        if not targets:
+            return True, 0, []
+
+        for window_id in targets:
+            try:
+                subprocess.run(
+                    ["wmctrl", "-ic", window_id], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False, timeout=2,
+                )
+            except (FileNotFoundError, subprocess.SubprocessError):
+                pass
+
+        deadline = time.monotonic() + 5.0
+        remaining = set(targets)
+        while time.monotonic() < deadline:
+            current_ids = self._verified_snapshot_ids()
+            if current_ids is None:
+                return False, len(targets) - len(remaining), sorted(remaining)
+            remaining = set(targets) & current_ids
+            if not remaining:
+                break
+            time.sleep(0.1)
+        closed = len(targets) - len(remaining)
+        return not remaining, closed, sorted(remaining)
 
     def track_process(self, kind, process):
         """Track an exact child process created for one managed app window."""
@@ -621,13 +725,20 @@ class ChromeWindowManager(FileWindowManager):
             expected_class = identity.get("class", "").casefold()
             expected_title = normalize_text(identity.get("title", ""))
         expected_pid = identity.get("pid") if isinstance(identity, dict) else None
+        expected_start = identity.get("start_time") if isinstance(identity, dict) else None
+        windows = self._verified_windows()
+        if windows is None:
+            return False, f"Không thể xác minh cửa sổ {site_name}; giữ ownership để thử lại."
         current = next((
-            window for window in self.list_windows()
+            window for window in windows
             if self._normalize_window_id(window["id"]) == self._normalize_window_id(window_id)
         ), None)
         current_class = current.get("class", "").casefold() if current else ""
         current_title = normalize_text(current.get("title", "")) if current else ""
         current_pid = self._window_pid(window_id) if current else None
+        current_start = (
+            self._process_start_time(current_pid) if current_pid is not None else None
+        )
         title_matches = bool(expected_title and current_title == expected_title)
         if (
             current is None
@@ -635,6 +746,8 @@ class ChromeWindowManager(FileWindowManager):
             or not title_matches
             or expected_pid is None
             or current_pid != expected_pid
+            or expected_start is None
+            or current_start != expected_start
             or not self._process_has_profile(current_pid, profile)
         ):
             self.site_windows.pop((profile, site_key), None)
@@ -653,9 +766,12 @@ class ChromeWindowManager(FileWindowManager):
             return False, f"Desktop không cho phép đóng cửa sổ {site_name}."
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
+            windows = self._verified_windows()
+            if windows is None:
+                return False, f"Không thể xác minh cửa sổ {site_name} đã đóng."
             remaining_ids = {
                 self._normalize_window_id(window["id"])
-                for window in self.list_windows()
+                for window in windows
             }
             if self._normalize_window_id(window_id) not in remaining_ids:
                 break
@@ -675,9 +791,12 @@ class ChromeWindowManager(FileWindowManager):
         if not tracked:
             return False, f"Không có cửa sổ Chrome {profile_name} nào do Jarvis theo dõi."
 
+        windows = self._verified_windows()
+        if windows is None:
+            return False, f"Không thể xác minh cửa sổ Chrome {profile_name}; giữ ownership."
         current_by_id = {
             self._normalize_window_id(window["id"]): window
-            for window in self.list_windows()
+            for window in windows
         }
         closable = []
         for identity in tracked:
@@ -699,6 +818,11 @@ class ChromeWindowManager(FileWindowManager):
             ):
                 continue
             closable.append(identity)
+        if len(closable) != len(tracked):
+            return False, (
+                f"Không thể xác minh toàn bộ cửa sổ Chrome {profile_name}; "
+                "không đóng một phần và giữ ownership để thử lại."
+            )
         if not closable:
             self.profile_windows[profile] = []
             self.site_windows = {
@@ -728,9 +852,12 @@ class ChromeWindowManager(FileWindowManager):
             self._normalize_window_id(window["id"]) for window in closable
         }
         while time.monotonic() < deadline:
+            windows = self._verified_windows()
+            if windows is None:
+                return False, f"Không thể xác minh cửa sổ Chrome {profile_name} đã đóng."
             remaining = {
                 self._normalize_window_id(window["id"])
-                for window in self.list_windows()
+                for window in windows
             }
             if closing_ids.isdisjoint(remaining):
                 break
@@ -743,6 +870,23 @@ class ChromeWindowManager(FileWindowManager):
             if key[0] != profile
         }
         return True, f"Đã đóng {len(closable)} cửa sổ Chrome {profile_name} do Jarvis mở."
+
+    def close_all_tracked(self):
+        """Close every revalidated normal-Chrome window tracked by Jarvis."""
+        profiles = list(self.profile_windows)
+        if not profiles:
+            return False, "Không có cửa sổ Chrome thường nào do Jarvis theo dõi."
+        closed_profiles = 0
+        failures = []
+        for profile in profiles:
+            success, detail = self.close_profile(profile, profile)
+            if success:
+                closed_profiles += 1
+            else:
+                failures.append(detail)
+        if failures:
+            return False, "; ".join(failures)
+        return True, f"Đã đóng Chrome ở {closed_profiles} profile do Jarvis theo dõi."
 
     def clear(self):
         self.profile_windows.clear()

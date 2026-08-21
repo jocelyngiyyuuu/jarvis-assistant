@@ -1,6 +1,6 @@
 # Jarvis
 
-Jarvis là trợ lý AI chạy cục bộ trên Linux, nhận lệnh từ Terminal, giao diện GTK và Discord. Jarvis có thể quản lý file/cửa sổ, nhắc việc, điều khiển YouTube, mở Zalo, tóm tắt các hội thoại Zalo mang nhãn **Công việc**, và dùng mô hình Ollama làm AI cục bộ.
+Jarvis là trợ lý AI chạy cục bộ trên Linux, nhận lệnh từ Terminal, giao diện GTK và Discord. Jarvis có thể quản lý file/cửa sổ, nhắc việc, điều khiển YouTube, tóm tắt Zalo/Gmail, báo Gmail mới qua Discord và dùng mô hình Ollama làm AI cục bộ.
 
 > **Phạm vi hỗ trợ:** hướng dẫn này dành cho Ubuntu/Linux chạy X11 hoặc XWayland và `systemd --user`.
 
@@ -10,7 +10,7 @@ Jarvis là trợ lý AI chạy cục bộ trên Linux, nhận lệnh từ Termin
 - `jarvis_gui.py`: giao diện GTK kết nối đến tiến trình nền qua Unix socket.
 - `jarvis_core/`: lưu trữ hội thoại, bộ nhớ, bảo mật, AI cục bộ và quản lý cửa sổ.
 - `tts/VieNeu-TTS`: submodule TTS tiếng Việt, có môi trường Python riêng.
-- Chrome YouTube/Zalo: profile riêng tại `~/.config/jarvis-chrome`.
+- Chrome YouTube/Zalo/Gmail: profile riêng tại `~/.config/jarvis-chrome`.
 - Chrome DevTools: chỉ mở trên loopback `127.0.0.1:9223`.
 
 Jarvis giữ khóa một tiến trình. Không chạy đồng thời `jarvis.py` trong Terminal và `jarvis.service`.
@@ -302,7 +302,7 @@ Nếu `.venv` bị thiếu hoặc hỏng:
 bash scripts/repair-jarvis-env.sh
 ```
 
-## 9. Chrome riêng cho YouTube và Zalo
+## 9. Chrome riêng cho YouTube, Zalo và Gmail
 
 Jarvis tự tạo profile:
 
@@ -333,7 +333,7 @@ thay thế việc kiểm soát các tiến trình của chính tài khoản hi�
 
 ### Đăng nhập lần đầu
 
-1. Gửi `mở zalo` hoặc `mở youtube`.
+1. Gửi `mở zalo`, `mở youtube` hoặc `mở gmail`.
 2. Đăng nhập trong đúng cửa sổ Chrome Jarvis vừa mở.
 3. Không xóa `~/.config/jarvis-chrome` nếu muốn giữ phiên đăng nhập.
 
@@ -341,7 +341,7 @@ Không tự động click hộp quyền, nhập mật khẩu hoặc vượt qua 
 
 ### Kiểm tra bảo mật profile
 
-Trước tiên gửi `mở youtube` hoặc `mở zalo` để Chrome Jarvis khởi động, sau đó chạy:
+Trước tiên gửi `mở youtube`, `mở zalo` hoặc `mở gmail` để Chrome Jarvis khởi động, sau đó chạy:
 
 ```bash
 stat -c '%a %n' ~/.config/jarvis-chrome
@@ -390,6 +390,34 @@ Zalo trong Chrome Jarvis; tab YouTube và website khác không bị đóng. Nế
 toàn bộ tab còn lại, Jarvis chuyển tab Zalo cuối cùng về New Tab để giữ Chrome
 và phiên đăng nhập.
 
+### Gmail
+
+```text
+mở gmail
+tóm tắt gmail
+tóm tắt gmail chưa đọc
+gmail mới
+tóm tắt thư rác
+tắt gmail
+```
+
+Lần đầu, hãy đăng nhập Google trực tiếp trong cửa sổ Chrome Jarvis. Jarvis không
+nhập hoặc lưu mật khẩu. Sau khi tab Gmail đã mở và đăng nhập, Jarvis kiểm tra thư
+chưa đọc khoảng mỗi 2 phút. Lần quét đầu chỉ tạo mốc và không báo hàng loạt thư
+cũ; những thư chưa đọc xuất hiện sau đó sẽ được tóm tắt bằng Ollama local, kèm
+việc cần làm và gửi đến `DISCORD_CHANNEL_ID` (hoặc kênh Discord hợp lệ gần nhất).
+Sau khi bản tóm tắt đã được trả hoặc gửi thành công, Jarvis đánh dấu đúng các thư
+vừa xử lý là đã đọc để không tóm tắt lại. Lệnh `tóm tắt gmail` mặc định chỉ lấy
+thư chưa đọc; dùng `tóm tắt gmail gần đây` nếu muốn xem cả thư đã đọc.
+
+Jarvis chỉ đọc các dòng đang hiện gồm người gửi, tiêu đề, đoạn xem trước và thời
+gian; không mở nội dung đầy đủ, xóa hoặc di chuyển thư. Với Spam, Jarvis lọc các
+thư có ý nghĩa như bảo mật, giao dịch, học tập hoặc công việc rồi quay lại Inbox.
+File trạng thái
+`.jarvis_data/gmail_state.json` chỉ lưu tối đa 500 mã thư đã thấy, không lưu tiêu
+đề hoặc nội dung. Bản tóm tắt Gmail không được ghi vào stdout hay lịch sử hội
+thoại local.
+
 ### Cặp lệnh mở và đóng
 
 Khi Jarvis có lệnh mở một cửa sổ hoặc website, hãy dùng `tắt`, `đóng` hoặc
@@ -399,8 +427,10 @@ Khi Jarvis có lệnh mở một cửa sổ hoặc website, hãy dùng `tắt`, 
 mở terminal                 → tắt terminal
 mở downloads                → tắt downloads
 mở vscode                   → tắt vscode
+mở system monitor           → tắt system monitor
+mở đường dẫn /home/...      → tắt đường dẫn /home/...
 mở chatgpt học              → tắt chatgpt học
-mở gmail cá nhân            → đóng gmail cá nhân
+mở gmail                    → đóng gmail
 mở drive học                → thoát drive học
 mở calendar học             → tắt calendar học
 mở github                   → tắt github
@@ -419,6 +449,11 @@ mục cũng chỉ đóng cửa sổ mà Jarvis vừa mở và theo dõi, không 
 đóng tất cả cửa sổ cùng loại. Với file manager native Wayland không cung cấp
 window identity cho `wmctrl`, Jarvis sẽ báo không theo dõi được và từ chối lệnh
 đóng thay vì đoán hoặc đóng nhầm cửa sổ.
+
+`tắt tất cả` là ngoại lệ phá hủy có chủ đích: lệnh này đóng mọi cửa sổ ứng dụng
+GUI và toàn bộ tab nằm trong các cửa sổ trình duyệt đó, kể cả tài nguyên người
+dùng tự mở. Jarvis, TTS và Discord được giữ lại khi có thể. Các lệnh đóng riêng
+lẻ vẫn chỉ đóng exact target Jarvis đã ghi nhận trong lifecycle hiện tại.
 
 Tóm tắt Zalo chỉ đọc các hội thoại trong phạm vi được yêu cầu. Jarvis trả nội
 dung cho kênh yêu cầu nhưng stdout/systemd journal chỉ ghi trạng thái hoàn thành,

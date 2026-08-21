@@ -45,7 +45,17 @@ def classify_remote_command(command):
         return "confirm"
     if any(pattern in plain for pattern in dangerous):
         return "confirm"
-    sensitive = ("xem bo nho", "nho lai", "phan tich file")
+    sensitive = (
+        "xem bo nho", "nho lai", "phan tich file", "tom tat gmail",
+        "tom tat email", "gmail moi", "email moi", "kiem tra gmail",
+        "doc gmail", "doc email", "gmail co gi", "email co gi",
+        "tong hop gmail", "tong hop email", "kiem tra email",
+        "tom tat mail", "doc mail", "mail co gi", "tong hop mail", "kiem tra mail",
+        "tom tat thu dien tu", "doc thu dien tu", "thu dien tu co gi",
+        "tong hop thu dien tu", "kiem tra thu dien tu",
+        "tom tat thu rac", "doc thu rac", "kiem tra thu rac",
+        "tom tat spam", "doc spam", "kiem tra spam",
+    )
     if any(pattern in plain for pattern in sensitive):
         return "sensitive"
     return "normal"

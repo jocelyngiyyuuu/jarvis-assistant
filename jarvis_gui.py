@@ -470,6 +470,9 @@ class JarvisWindow(Gtk.ApplicationWindow):
         open_button = Gtk.Button(label="Mở đường dẫn")
         open_button.connect("clicked", self._open_path)
         path_bar.append(open_button)
+        close_button = Gtk.Button(label="Đóng đường dẫn")
+        close_button.connect("clicked", self._close_path)
+        path_bar.append(close_button)
         page.append(path_bar)
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -824,16 +827,11 @@ class JarvisWindow(Gtk.ApplicationWindow):
         if not path.exists():
             self._set_file_result(f"Không tìm thấy đường dẫn: {path}")
             return
-        try:
-            subprocess.Popen(
-                ["xdg-open", str(path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            self._set_file_result(f"Đã mở: {path}")
-        except OSError as error:
-            self._set_file_result(f"Không thể mở đường dẫn: {error}")
+        self._send_command_text(f"mở đường dẫn {path}")
+
+    def _close_path(self, _button):
+        path = Path(self.path_entry.get_text().strip()).expanduser()
+        self._send_command_text(f"tắt đường dẫn {path}")
 
     def _system_page(self):
         page = self._page("Hệ thống", "CPU, RAM, ổ đĩa và các dịch vụ của Jarvis.")
@@ -902,6 +900,11 @@ class JarvisWindow(Gtk.ApplicationWindow):
         open_monitor = Gtk.Button(label="Mở System Monitor")
         open_monitor.connect("clicked", self._open_system_monitor)
         actions.append(open_monitor)
+        close_monitor = Gtk.Button(label="Đóng System Monitor")
+        close_monitor.connect(
+            "clicked", lambda _button: self._send_command_text("tắt system monitor")
+        )
+        actions.append(close_monitor)
         page.append(actions)
 
         self.system_status = Gtk.Label(
@@ -990,15 +993,7 @@ class JarvisWindow(Gtk.ApplicationWindow):
         self._run_background(work, done)
 
     def _open_system_monitor(self, _button):
-        try:
-            subprocess.Popen(
-                ["gnome-system-monitor"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError as error:
-            self.system_status.set_text(f"Không thể mở System Monitor: {error}")
+        self._send_command_text("mở system monitor")
 
     def _toggle_discord_control(self, switch, _parameter):
         enabled = switch.get_active()

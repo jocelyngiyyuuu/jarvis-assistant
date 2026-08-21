@@ -4,6 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from jarvis_core.window_manager import FileWindowManager
+
 
 # ============================================================
 # CẤU HÌNH
@@ -14,6 +16,7 @@ SEARCH_ROOT = Path("/home")
 
 # Số kết quả tối đa hiển thị
 MAX_RESULTS = 20
+WINDOWS = FileWindowManager()
 
 # Những thư mục không cần quét
 SKIP_DIRS = {
@@ -130,16 +133,21 @@ def open_path(path):
         return False
 
     try:
-
+        previous_ids = WINDOWS.snapshot_ids()
+        if previous_ids is None:
+            print("Jarvis: Không thể xác minh danh sách cửa sổ; chưa mở đường dẫn.")
+            return False
         subprocess.Popen(
-            [
-                "xdg-open",
-                str(path),
-            ],
+            ["xdg-open", str(path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        tracked = WINDOWS.track_opened_path(path, previous_ids)
+        if not tracked:
+            WINDOWS.close_new_window(previous_ids, file_manager_only=True)
+            print("Jarvis: Không xác minh được cửa sổ mới; đã thử hoàn tác.")
+            return False
 
         print()
         print(f"Jarvis: Đã mở:")
@@ -310,6 +318,25 @@ def handle_command(command):
     command = command.strip()
 
     command_lower = command.lower()
+
+    for prefix in (
+        "tắt đường dẫn ", "tat duong dan ", "đóng đường dẫn ",
+        "dong duong dan ", "thoát đường dẫn ", "thoat duong dan ",
+    ):
+        if command_lower.startswith(prefix):
+            _success, detail = WINDOWS.close_path(command[len(prefix):].strip())
+            print(f"Jarvis: {detail}")
+            return True
+
+    close_last = {
+        "tắt file": "file", "đóng file": "file", "thoát file": "file",
+        "tắt thư mục": "folder", "đóng thư mục": "folder",
+        "thoát thư mục": "folder",
+    }
+    if command_lower in close_last:
+        _success, detail = WINDOWS.close_last(close_last[command_lower])
+        print(f"Jarvis: {detail}")
+        return True
 
     # --------------------------------------------------------
     # THOÁT

@@ -4,8 +4,10 @@ import asyncio
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 import fcntl
+import hashlib
 import json
 import os
+import signal
 import re
 import shutil
 import subprocess
@@ -14,7 +16,7 @@ import threading
 import time
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import discord
 from dotenv import load_dotenv
@@ -98,6 +100,13 @@ TTS_PYTHON = TTS_DIR / "VieNeu-TTS" / ".venv" / "bin" / "python"
 TTS_ENGINE = TTS_DIR / "tts_engine.py"
 TTS_ENABLED = True
 tts_process = None
+DISCORD_RECONNECT_DELAY_SECONDS = 15
+GMAIL_STATE_PATH = BASE_DIR / ".jarvis_data" / "gmail_state.json"
+GMAIL_ACCOUNT_PATH = BASE_DIR / ".jarvis_data" / "gmail_account.json"
+try:
+    GMAIL_POLL_SECONDS = max(30, int(os.getenv("GMAIL_POLL_SECONDS", "120")))
+except ValueError:
+    GMAIL_POLL_SECONDS = 120
 
 
 def _clean_tts_text(text):
@@ -282,7 +291,8 @@ async def _handle_ipc_client(reader, writer):
                     else:
                         await route_command(command, source=source)
                     response = last_command_response or "✅ Jarvis đã xử lý lệnh."
-                CORE.conversation.add(source, "assistant", response)
+                if classify_remote_command(command) != "sensitive":
+                    CORE.conversation.add(source, "assistant", response)
                 speak_last_response()
                 payload = {"ok": True, "response": response}
             except Exception as error:
@@ -331,6 +341,7 @@ youtube_videos = []
 youtube_profile = None
 youtube_profile_name = None
 youtube_page_id = None
+managed_cdp_targets = {"youtube": set(), "zalo": set(), "gmail": set()}
 
 
 # ==========================================================
@@ -464,8 +475,8 @@ def ensure_jarvis_chrome(url="chrome://newtab/"):
     """Start or reuse Jarvis' isolated Chrome profile without consent popups."""
     JARVIS_CHROME_DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     JARVIS_CHROME_DATA_DIR.chmod(0o700)
-    if url == "chrome://newtab/" and _jarvis_chrome_ready():
-        return True
+    if _jarvis_chrome_ready():
+        return url == "chrome://newtab/" or _ensure_jarvis_chrome_tab(url)
     args = [
         "google-chrome",
         "--ozone-platform=x11",
@@ -484,9 +495,84 @@ def ensure_jarvis_chrome(url="chrome://newtab/"):
     )
     for _attempt in range(40):
         if _jarvis_chrome_ready():
+            # A newly created browser receives the URL directly in argv. The
+            # CDP fallback above is only needed when Chrome was already alive.
             return True
         time.sleep(0.1)
     return False
+
+
+def _automation_site_key(url):
+    host = (urlparse(url).hostname or "").lower()
+    if host == "chat.zalo.me":
+        return "zalo"
+    if host in {"mail.google.com", "accounts.google.com"}:
+        return "gmail"
+    if host == "youtube.com" or host.endswith(".youtube.com"):
+        return "youtube"
+    return None
+
+
+def _cdp_pages():
+    try:
+        with urlopen(f"{JARVIS_CHROME_DEBUG_URL}/json/list", timeout=2) as response:
+            pages = json.loads(response.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(pages, list):
+        return None
+    return [page for page in pages if isinstance(page, dict) and page.get("type") == "page"]
+
+
+def _record_managed_cdp_target(site_key, before_ids):
+    matching = []
+    pages = _cdp_pages()
+    if pages is None:
+        return False
+    for page in pages:
+        target_id = page.get("id")
+        if not target_id or _automation_site_key(page.get("url", "")) != site_key:
+            continue
+        matching.append(target_id)
+    new_ids = [target_id for target_id in matching if target_id not in before_ids]
+    if len(new_ids) == 1:
+        managed_cdp_targets.setdefault(site_key, set()).add(new_ids[0])
+        return True
+    owned = managed_cdp_targets.setdefault(site_key, set())
+    return bool(owned.intersection(matching))
+
+
+def _ensure_jarvis_chrome_tab(url):
+    """Open an automation URL through the verified loopback CDP browser."""
+    try:
+        target = urlparse(url)
+        if target.scheme not in {"http", "https"}:
+            return False
+        with urlopen(f"{JARVIS_CHROME_DEBUG_URL}/json/list", timeout=2) as response:
+            pages = json.loads(response.read().decode("utf-8"))
+        site_key = _automation_site_key(url)
+        owned = managed_cdp_targets.get(site_key, set()) if site_key else set()
+        target_url = str(url).rstrip("/")
+        for page in pages if isinstance(pages, list) else []:
+            if not isinstance(page, dict) or page.get("id") not in owned:
+                continue
+            page_url = str(page.get("url", "")).rstrip("/")
+            if page_url == target_url:
+                return True
+            page_host = (urlparse(page_url).hostname or "").lower()
+            if site_key == "gmail" and page_host in {
+                "mail.google.com", "accounts.google.com",
+            }:
+                return True
+        encoded_url = quote_plus(str(url))
+        request = Request(
+            f"{JARVIS_CHROME_DEBUG_URL}/json/new?{encoded_url}", method="PUT"
+        )
+        with urlopen(request, timeout=4) as response:
+            created = json.loads(response.read().decode("utf-8"))
+        return isinstance(created, dict) and created.get("type") == "page"
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _is_automation_url(url, profile=None):
@@ -498,17 +584,32 @@ def _is_automation_url(url, profile=None):
         host == "youtube.com"
         or host.endswith(".youtube.com")
         or (host == "chat.zalo.me" and profile == STUDY_PROFILE)
+        or (host == "mail.google.com" and profile == STUDY_PROFILE)
     )
 
 
 def open_chrome(profile, url):
     previous_window_ids = CHROME_WINDOWS.snapshot_ids()
+    if previous_window_ids is None:
+        return False
     if _is_automation_url(url, profile):
-        target_hint = "zalo" if (urlparse(url).hostname or "").lower() == "chat.zalo.me" else "youtube"
+        automation_host = (urlparse(url).hostname or "").lower()
+        target_hint = {
+            "chat.zalo.me": "zalo",
+            "mail.google.com": "gmail",
+        }.get(automation_host, "youtube")
+        before_pages = _cdp_pages() if _jarvis_chrome_ready() else []
+        if before_pages is None:
+            return False
+        before_target_ids = {page.get("id") for page in before_pages if page.get("id")}
         opened = ensure_jarvis_chrome(url)
         owner_pid = _jarvis_debug_port_owner_pid() if opened else None
+        target_owned = (
+            _record_managed_cdp_target(target_hint, before_target_ids)
+            if owner_pid is not None else False
+        )
         return bool(
-            owner_pid is not None
+            target_owned
             and CHROME_WINDOWS.activate_automation_window(
                 previous_window_ids, owner_pid, target_hint
             )
@@ -549,11 +650,35 @@ def open_chrome(profile, url):
 # CHROME SHORTCUTS - MỞ THẲNG WEBSITE THEO PROFILE
 # ==========================================================
 
+def configured_gmail_account():
+    try:
+        data = json.loads(GMAIL_ACCOUNT_PATH.read_text(encoding="utf-8"))
+        account = str(data.get("account", "")).strip().lower()
+    except (OSError, ValueError, AttributeError):
+        account = ""
+    return account if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", account) else ""
+
+
+def configured_gmail_url():
+    account = configured_gmail_account()
+    if not account:
+        return "https://mail.google.com/"
+    return f"https://mail.google.com/mail/u/?authuser={quote_plus(account)}"
+
+
+def configured_gmail_folder_url(folder="inbox"):
+    folder = "spam" if folder == "spam" else "inbox"
+    account = configured_gmail_account()
+    if account:
+        return f"https://mail.google.com/mail/u/?authuser={quote_plus(account)}#{folder}"
+    return f"https://mail.google.com/mail/u/0/#{folder}"
+
+
 CHROME_SHORTCUTS = {
     "chatgpt": ("ChatGPT", "https://chatgpt.com/"),
     "chat gpt": ("ChatGPT", "https://chatgpt.com/"),
-    "gmail": ("Gmail", "https://mail.google.com/"),
-    "mail": ("Gmail", "https://mail.google.com/"),
+    "gmail": ("Gmail", configured_gmail_url()),
+    "mail": ("Gmail", configured_gmail_url()),
     "drive": ("Google Drive", "https://drive.google.com/"),
     "google drive": ("Google Drive", "https://drive.google.com/"),
     "calendar": ("Google Calendar", "https://calendar.google.com/"),
@@ -635,9 +760,9 @@ def handle_chrome_shortcut(command):
 
     profile, profile_name = _chrome_profile_from_explicit_command(command)
 
-    # Zalo và GitHub mặc định dùng Profile 1 (học). Người dùng vẫn có thể
+    # Zalo, Gmail và GitHub mặc định dùng Profile 1 (học). Người dùng vẫn có thể
     # nói rõ "cá nhân" để ghi đè quy tắc này.
-    if profile is None and target_text in {"zalo", "zalo web", "github"}:
+    if profile is None and target_text in {"zalo", "zalo web", "gmail", "mail", "github"}:
         profile, profile_name = STUDY_PROFILE, "Học / ChatGPT"
 
     if profile is None:
@@ -654,6 +779,14 @@ def handle_chrome_shortcut(command):
 
     if target_text in {"zalo", "zalo web"}:
         message = "✅ Đã mở Zalo." if opened else "❌ Không thể mở Zalo lúc này."
+    elif target_text in {"gmail", "mail"}:
+        message = "✅ Đã mở Gmail." if opened else "❌ Không thể mở Gmail lúc này."
+    elif target_text in {"github", "chatgpt", "chat gpt"}:
+        message = (
+            f"✅ Đã mở {site_name}."
+            if opened is not False
+            else f"❌ Không thể mở {site_name} lúc này."
+        )
     else:
         message = (
             f"✅ Đã mở {site_name} bằng Chrome {profile_name}."
@@ -1081,111 +1214,461 @@ async def close_mcp_session():
 # TÌM TAB YOUTUBE
 # ==========================================================
 
-async def find_youtube_page(session):
-    pages_result = await session.call_tool(
-        "list_pages",
-        arguments={},
-    )
-
-    pages_text = result_to_text(
-        pages_result
-    )
-
-    youtube_pages = []
-
-    for line in pages_text.splitlines():
-
-        if "youtube.com" not in line.lower():
-            continue
-
+async def _find_owned_mcp_pages(session, site_key):
+    owned_ids = set(managed_cdp_targets.get(site_key, set()))
+    if not owned_ids:
+        return []
+    pages = _cdp_pages()
+    if pages is None:
+        return []
+    owned_urls = {
+        str(page.get("url", "")).rstrip("/")
+        for page in pages
+        if page.get("id") in owned_ids and page.get("url")
+    }
+    if not owned_urls:
+        return []
+    pages_result = await session.call_tool("list_pages", arguments={})
+    matches = []
+    for line in result_to_text(pages_result).splitlines():
         page_id = extract_page_id(line)
+        url_match = re.search(r"https?://[^\s]+", line, re.IGNORECASE)
+        page_url = url_match.group(0).rstrip("/") if url_match else ""
+        if page_id is not None and page_url in owned_urls:
+            matches.append((page_id, line))
+    return matches
 
-        if page_id is not None:
-            youtube_pages.append(
-                page_id
-            )
 
-    if not youtube_pages:
-        return None
-
-    # Tab YouTube gần nhất
-    return youtube_pages[-1]
+async def find_youtube_page(session):
+    matches = await _find_owned_mcp_pages(session, "youtube")
+    return matches[0][0] if len(matches) == 1 else None
 
 
 async def find_zalo_page(session):
-    """Return the most recently listed Zalo Web page."""
-    pages_result = await session.call_tool("list_pages", arguments={})
-    zalo_pages = []
-    for line in result_to_text(pages_result).splitlines():
-        if "chat.zalo.me" not in line.lower():
+    matches = await _find_owned_mcp_pages(session, "zalo")
+    return matches[0][0] if len(matches) == 1 else None
+
+
+async def find_gmail_page(session):
+    """Return only the unique lifecycle-owned Gmail MCP page."""
+    matches = await _find_owned_mcp_pages(session, "gmail")
+    if len(matches) != 1:
+        return None
+    expected_account = configured_gmail_account()
+    if expected_account:
+        account_matches = [
+            (page_id, line) for page_id, line in matches
+            if expected_account in line.lower()
+        ]
+        return account_matches[0][0] if len(account_matches) == 1 else None
+    return matches[0][0]
+
+
+GMAIL_INBOX_SCRIPT = r'''() => {
+  const host = location.hostname.toLowerCase();
+  if (host === 'accounts.google.com' || document.querySelector('input[type="email"]')) {
+    return {ok:false, loginRequired:true, messages:[]};
+  }
+  const rows = [...document.querySelectorAll('tr.zA')].slice(0, 30);
+  if (!rows.length) {
+    const ready = !!document.querySelector('[role="main"], a[href*="#inbox"]');
+    return {ok:ready, loading:!ready, messages:[]};
+  }
+  const fingerprint = value => {
+    let hash = 0xcbf29ce484222325n;
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= BigInt(value.charCodeAt(index));
+      hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+    }
+    return `fp:${hash.toString(16).padStart(16, '0')}`;
+  };
+  const messages = rows.map((row, index) => {
+    const senderNode = row.querySelector('.yW span[email], .yX.xY span[email], .yW span');
+    const subjectNode = row.querySelector('.bog, [data-thread-id] .bog');
+    const snippetNode = row.querySelector('.y2');
+    const timeNode = row.querySelector('td.xW span[title], td.xW span, td.xW');
+    const link = row.querySelector('a[href]');
+    const sender = (senderNode?.getAttribute('name') || senderNode?.textContent || '').trim();
+    const email = (senderNode?.getAttribute('email') || '').trim();
+    const subject = (subjectNode?.textContent || '').trim();
+    const snippet = (snippetNode?.textContent || '').replace(/^\s*[-–—]\s*/, '').trim();
+    const time = (timeNode?.getAttribute('title') || timeNode?.textContent || '').trim();
+    const id = row.getAttribute('data-legacy-thread-id') ||
+      row.getAttribute('data-thread-id') || link?.getAttribute('href') ||
+      fingerprint([sender, email, subject, snippet, time].join('|'));
+    return {id, sender, email, subject, snippet, time,
+      unread: row.classList.contains('zE') || row.getAttribute('aria-label')?.toLowerCase().includes('unread')};
+  }).filter(item => item.sender || item.subject || item.snippet);
+  return {ok:true, loginRequired:false, messages};
+}'''
+
+
+async def read_gmail_inbox(limit=20, unread_only=False, bring_to_front=False, folder="inbox"):
+    """Read visible Gmail rows without opening individual messages."""
+    session = await get_mcp_session()
+    page_id = await find_gmail_page(session)
+    if page_id is None:
+        return {"ok": False, "reason": "not_open", "messages": []}
+    selected = await session.call_tool(
+        "select_page", arguments={"pageId": page_id, "bringToFront": bring_to_front}
+    )
+    if _is_mcp_tool_error(selected):
+        return {"ok": False, "reason": "unavailable", "messages": []}
+    restore_inbox = folder == "spam"
+    if restore_inbox:
+        navigated = await session.call_tool(
+            "navigate_page", arguments={
+                "type": "url", "url": configured_gmail_folder_url("spam"),
+            },
+        )
+        if _is_mcp_tool_error(navigated):
+            return {"ok": False, "reason": "unavailable", "messages": []}
+    result = {}
+    try:
+        for attempt in range(5):
+            result = _json_from_mcp_result(
+                await session.call_tool(
+                    "evaluate_script", arguments={"function": GMAIL_INBOX_SCRIPT}
+                ),
+                default={},
+            )
+            if isinstance(result, dict) and (result.get("ok") or result.get("loginRequired")):
+                break
+            if attempt < 4:
+                await asyncio.sleep(0.6)
+    finally:
+        if restore_inbox:
+            try:
+                await session.call_tool(
+                    "navigate_page", arguments={
+                        "type": "url", "url": configured_gmail_folder_url("inbox"),
+                    },
+                )
+            except Exception:
+                pass
+    if not isinstance(result, dict):
+        return {"ok": False, "reason": "unavailable", "messages": []}
+    if result.get("loginRequired"):
+        return {"ok": False, "reason": "login", "messages": []}
+    if not result.get("ok"):
+        return {"ok": False, "reason": "loading", "messages": []}
+    messages = []
+    for item in result.get("messages", []):
+        if not isinstance(item, dict) or (unread_only and not item.get("unread")):
             continue
-        page_id = extract_page_id(line)
-        if page_id is not None:
-            zalo_pages.append(page_id)
-    return zalo_pages[-1] if zalo_pages else None
+        clean = {
+            key: str(item.get(key, "")).strip()
+            for key in ("id", "sender", "email", "subject", "snippet", "time")
+        }
+        clean["unread"] = bool(item.get("unread"))
+        if not clean["id"]:
+            raw = "|".join(clean[key] for key in ("sender", "subject", "time", "snippet"))
+            clean["id"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        messages.append(clean)
+        if len(messages) >= max(1, min(int(limit), 30)):
+            break
+    return {"ok": True, "reason": "", "messages": messages}
+
+
+async def mark_gmail_messages_read(messages, folder="inbox"):
+    """Mark only the exact unread rows that Jarvis has just summarized."""
+    ids = [str(item.get("id", "")).strip() for item in messages if item.get("unread")]
+    ids = [value for value in ids if value][:30]
+    if not ids:
+        return 0
+    session = await get_mcp_session()
+    page_id = await find_gmail_page(session)
+    if page_id is None:
+        return 0
+    selected = await session.call_tool(
+        "select_page", arguments={"pageId": page_id, "bringToFront": False}
+    )
+    if _is_mcp_tool_error(selected):
+        return 0
+    restore_inbox = folder == "spam"
+    if restore_inbox:
+        result = await session.call_tool(
+            "navigate_page", arguments={
+                "type": "url", "url": configured_gmail_folder_url("spam"),
+            },
+        )
+        if _is_mcp_tool_error(result):
+            return 0
+    script = f'''async () => {{
+      const wanted = new Set({json.dumps(ids, ensure_ascii=False)});
+      const normalize = value => (value || '').normalize('NFD')
+        .replace(/[\\u0300-\\u036f]/g, '').toLowerCase();
+      const fingerprint = value => {{
+        let hash = 0xcbf29ce484222325n;
+        for (let index = 0; index < value.length; index += 1) {{
+          hash ^= BigInt(value.charCodeAt(index));
+          hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+        }}
+        return `fp:${{hash.toString(16).padStart(16, '0')}}`;
+      }};
+      const rowId = row => {{
+        const senderNode = row.querySelector('.yW span[email], .yX.xY span[email], .yW span');
+        const subjectNode = row.querySelector('.bog, [data-thread-id] .bog');
+        const snippetNode = row.querySelector('.y2');
+        const timeNode = row.querySelector('td.xW span[title], td.xW span, td.xW');
+        const link = row.querySelector('a[href]');
+        const sender = (senderNode?.getAttribute('name') || senderNode?.textContent || '').trim();
+        const email = (senderNode?.getAttribute('email') || '').trim();
+        const subject = (subjectNode?.textContent || '').trim();
+        const snippet = (snippetNode?.textContent || '').replace(/^\\s*[-–—]\\s*/, '').trim();
+        const time = (timeNode?.getAttribute('title') || timeNode?.textContent || '').trim();
+        return row.getAttribute('data-legacy-thread-id') ||
+          row.getAttribute('data-thread-id') || link?.getAttribute('href') ||
+          fingerprint([sender, email, subject, snippet, time].join('|'));
+      }};
+      const rows = [...document.querySelectorAll('tr.zA')]
+        .filter(row => wanted.has(rowId(row)) && row.classList.contains('zE'));
+      const targetIds = rows.map(rowId);
+      const remaining = [];
+      for (const row of rows) {{
+        const button = [...row.querySelectorAll('[data-tooltip], [aria-label], [title]')].find(el => {{
+          const label = normalize(el.getAttribute('data-tooltip') || el.getAttribute('aria-label') || el.title);
+          return label.includes('mark as read') || label.includes('danh dau la da doc') ||
+            label.includes('danh dau da doc');
+        }});
+        if (button) {{ button.click(); }} else {{ remaining.push(row); }}
+      }}
+      if (remaining.length) {{
+        for (const row of remaining) {{
+          const checkbox = row.querySelector('[role="checkbox"]');
+          if (checkbox && checkbox.getAttribute('aria-checked') !== 'true') checkbox.click();
+        }}
+        await new Promise(resolve => setTimeout(resolve, 250));
+        const toolbarRoot = document.querySelector('[gh="mtb"], [role="toolbar"]');
+        const toolbar = [...(toolbarRoot?.querySelectorAll('[data-tooltip], [aria-label], [title]') || [])].find(el => {{
+          const label = normalize(el.getAttribute('data-tooltip') || el.getAttribute('aria-label') || el.title);
+          return label.includes('mark as read') || label.includes('danh dau la da doc') ||
+            label.includes('danh dau da doc');
+        }});
+        if (toolbar) {{ toolbar.click(); }}
+      }}
+      let stillUnread = new Set(targetIds);
+      for (let attempt = 0; attempt < 10 && stillUnread.size; attempt += 1) {{
+        await new Promise(resolve => setTimeout(resolve, 300));
+        stillUnread = new Set(
+          [...document.querySelectorAll('tr.zA.zE')]
+            .map(rowId).filter(id => wanted.has(id))
+        );
+      }}
+      const marked = targetIds.filter(id => !stillUnread.has(id)).length;
+      return {{ok:true, marked}};
+    }}'''
+    try:
+        result = _json_from_mcp_result(
+            await session.call_tool("evaluate_script", arguments={"function": script}),
+            default={},
+        )
+        return int(result.get("marked", 0)) if isinstance(result, dict) else 0
+    finally:
+        if restore_inbox:
+            try:
+                await session.call_tool(
+                    "navigate_page", arguments={
+                        "type": "url", "url": configured_gmail_folder_url("inbox"),
+                    },
+                )
+            except Exception:
+                pass
+
+
+def _gmail_error_message(reason):
+    if reason == "not_open":
+        return "ℹ️ Chưa có tab Gmail của Jarvis. Hãy dùng `mở gmail` trước."
+    if reason == "login":
+        return "🔐 Gmail chưa đăng nhập. Hãy đăng nhập một lần trong cửa sổ Gmail của Jarvis."
+    if reason == "loading":
+        return "⏳ Gmail chưa tải xong. Hãy chờ một chút rồi thử lại."
+    return "❌ Jarvis chưa thể đọc Gmail lúc này."
+
+
+def format_gmail_preview_summary(messages, limit=10):
+    """Provide a bounded useful fallback when the local language model is busy."""
+    lines = []
+    for item in messages[:max(1, limit)]:
+        sender = str(item.get("sender") or item.get("email") or "Không rõ người gửi").strip()
+        subject = str(item.get("subject") or "Không có tiêu đề").strip()
+        snippet = re.sub(r"\s+", " ", str(item.get("snippet", ""))).strip()[:240]
+        time_text = str(item.get("time", "")).strip()
+        heading = f"• **{sender}** — {subject}"
+        if time_text:
+            heading += f" ({time_text})"
+        lines.append(heading + (f"\n  {snippet}" if snippet else ""))
+    remaining = len(messages) - len(lines)
+    if remaining > 0:
+        lines.append(f"• Còn {remaining} thư khác chưa hiển thị.")
+    return "\n\n".join(lines)
+
+
+def meaningful_spam_messages(messages):
+    """Conservative fallback filter used only when Ollama is unavailable."""
+    meaningful = (
+        "bao mat", "security", "dang nhap", "login", "mat khau", "password",
+        "ma xac minh", "verification", "otp", "giao dich", "transaction",
+        "thanh toan", "payment", "hoa don", "invoice", "cong viec", "work",
+        "truong", "school", "deadline", "lich", "schedule", "tai khoan", "account",
+    )
+    promotional = (
+        "giam gia", "sale", "uu dai", "offer", "khuyen mai", "promotion",
+        "unsubscribe", "huy dang ky", "casino", "betting", "crypto bonus",
+    )
+    selected = []
+    for item in messages:
+        text = normalize_core_text(" ".join(
+            str(item.get(key, "")) for key in ("sender", "subject", "snippet")
+        ))
+        if any(term in text for term in meaningful) and not any(term in text for term in promotional):
+            selected.append(item)
+    return selected
+
+
+def fallback_gmail_tasks(messages):
+    """Extract conservative action hints without inventing deadlines or actions."""
+    action_terms = (
+        "can ", "hay ", "vui long", "xac nhan", "hoan thanh", "thanh toan",
+        "kiem tra", "phan hoi", "tra loi", "deadline", "before ", "please ",
+        "confirm", "complete", "payment", "reply", "action required",
+    )
+    tasks = []
+    for item in messages:
+        source = " ".join(str(item.get(key, "")) for key in ("subject", "snippet"))
+        if not any(term in normalize_core_text(source) for term in action_terms):
+            continue
+        sender = str(item.get("sender") or item.get("email") or "người gửi").strip()
+        subject = str(item.get("subject") or "thư không có tiêu đề").strip()
+        tasks.append(f"Kiểm tra yêu cầu trong “{subject}” từ {sender}.")
+        if len(tasks) >= 5:
+            break
+    return tasks
+
+
+async def summarize_gmail(*, unread_only=False, limit=10, folder="inbox", meaningful_only=False):
+    """Summarize inbox previews locally and return private output only to the caller."""
+    try:
+        result = await read_gmail_inbox(
+            limit=limit, unread_only=unread_only, bring_to_front=False, folder=folder
+        )
+        if not result["ok"]:
+            set_command_response(_gmail_error_message(result["reason"]))
+            return True
+        messages = result["messages"]
+        if not messages:
+            label = "thư rác" if folder == "spam" else "thư chưa đọc" if unread_only else "thư"
+            set_command_response(f"📭 Không thấy {label} nào trong danh sách Gmail hiện tại.")
+            return True
+        try:
+            ai_messages = [{
+                **item,
+                "snippet": str(item.get("snippet", ""))[:320],
+            } for item in messages[:10]]
+            summary = await asyncio.to_thread(
+                CORE.local_ai.summarize_gmail, ai_messages,
+                meaningful_only=meaningful_only, folder=folder,
+            )
+            if len(messages) > len(ai_messages):
+                summary += f"\n\nℹ️ Còn {len(messages) - len(ai_messages)} thư khác trong phạm vi đã đọc."
+        except Exception:
+            fallback_messages = meaningful_spam_messages(messages) if meaningful_only else messages
+            if meaningful_only and not fallback_messages:
+                try:
+                    marked = await mark_gmail_messages_read(messages, folder=folder)
+                except Exception:
+                    marked = 0
+                set_command_response(
+                    "📭 Chưa thấy thư rác nào có dấu hiệu chứa nội dung hữu ích hoặc cần hành động."
+                    + (f"\n✅ Đã đánh dấu {marked} thư đã kiểm tra là đã đọc." if marked else "")
+                )
+                return True
+            fallback_tasks = fallback_gmail_tasks(fallback_messages)
+            summary = (
+                "⚠️ AI local chưa hoàn tất kịp; đây là bản tóm lược trực tiếp từ hộp thư:\n\n"
+                + format_gmail_preview_summary(fallback_messages)
+                + "\n\n✅ **VIỆC CẦN LÀM**\n"
+                + ("\n".join(f"• {task}" for task in fallback_tasks)
+                   if fallback_tasks else "• Chưa thấy yêu cầu hành động rõ ràng.")
+            )
+        label = (
+            "THƯ RÁC CÓ Ý NGHĨA" if folder == "spam"
+            else "GMAIL CHƯA ĐỌC" if unread_only else "GMAIL GẦN ĐÂY"
+        )
+        unread_count = sum(1 for item in messages if item.get("unread"))
+        try:
+            marked = await mark_gmail_messages_read(messages, folder=folder)
+        except Exception:
+            marked = 0
+        mark_note = (
+            f"\n\n✅ Đã đánh dấu {marked} thư vừa xử lý là đã đọc."
+            if marked else
+            "\n\n⚠️ Chưa thể đánh dấu thư là đã đọc; Jarvis sẽ không tuyên bố đã làm việc này."
+            if unread_count else ""
+        )
+        set_command_response(
+            f"📧 **TÓM TẮT {label}**\n\n{summary}{mark_note}",
+            spoken_message="Đã tóm tắt Gmail theo phạm vi yêu cầu.",
+        )
+        print("Jarvis: Đã tóm tắt Gmail theo phạm vi yêu cầu.")
+        return True
+    except Exception:
+        set_command_response("❌ Không thể tóm tắt Gmail lúc này.")
+        print("Jarvis: Không thể tóm tắt Gmail lúc này.")
+        return True
 
 
 async def close_managed_web_tab(site_key, site_name, url_needles):
-    """Close all exact matching page tabs in Jarvis' CDP Chrome only."""
-    try:
-        session = await get_mcp_session()
-        pages_result = await session.call_tool("list_pages", arguments={})
-        if _is_mcp_tool_error(pages_result):
-            raise RuntimeError("list_pages failed")
-        page_rows = []
-        matching_ids = []
-        needles = tuple(str(value).casefold().rstrip("/") for value in url_needles)
-        for line in result_to_text(pages_result).splitlines():
-            page_id = extract_page_id(line)
-            if page_id is None:
-                continue
-            page_rows.append(page_id)
-            url_match = re.search(r"https?://[^\s]+", line, re.IGNORECASE)
-            page_url = url_match.group(0).rstrip("/").casefold() if url_match else ""
-            if any(page_url == needle or page_url.startswith(f"{needle}/") for needle in needles):
-                matching_ids.append(page_id)
-
-        if not matching_ids:
-            message = f"ℹ️ Không tìm thấy tab {site_name} đang mở."
-            set_command_response(message)
-            print(f"Jarvis: {message}")
-            return False
-
-        nonmatching_ids = [page_id for page_id in page_rows if page_id not in matching_ids]
-        close_ids = list(matching_ids)
-        navigate_id = None
-        if not nonmatching_ids:
-            navigate_id = close_ids.pop()
-
-        for target_id in close_ids:
-            result = await session.call_tool(
-                "close_page", arguments={"pageId": target_id}
-            )
-            if _is_mcp_tool_error(result):
-                raise RuntimeError("close_page failed")
-
-        if navigate_id is not None:
-            selected = await session.call_tool(
-                "select_page",
-                arguments={"pageId": navigate_id, "bringToFront": False},
-            )
-            if _is_mcp_tool_error(selected):
-                raise RuntimeError("select_page failed")
-            result = await session.call_tool(
-                "navigate_page",
-                arguments={"type": "url", "url": "chrome://newtab/"},
-            )
-            if _is_mcp_tool_error(result):
-                raise RuntimeError("navigate_page failed")
-        message = f"✅ Đã đóng {site_name}."
-        set_command_response(message, spoken_message=message)
-        print(f"Jarvis: {message}")
-        return True
-    except Exception:
-        message = f"❌ Không thể đóng {site_name} lúc này."
+    """Close only exact CDP targets recorded during this service lifecycle."""
+    del url_needles  # Kept for command-call compatibility; URL matching is unsafe.
+    owned = set(managed_cdp_targets.get(site_key, set()))
+    if not owned:
+        message = f"❌ Không còn xác minh được tab {site_name} nào do Jarvis mở."
         set_command_response(message)
         print(f"Jarvis: {message}")
         return False
+    pages = _cdp_pages()
+    if pages is None:
+        message = f"❌ Không thể xác minh tab {site_name}; giữ ownership để thử lại."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
+    current_ids = {page.get("id") for page in pages if page.get("id")}
+    targets = owned & current_ids
+    if not targets:
+        managed_cdp_targets.setdefault(site_key, set()).clear()
+        message = f"ℹ️ Tab {site_name} do Jarvis mở đã được đóng trước đó."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
+    failed = []
+    for target_id in targets:
+        try:
+            with urlopen(
+                f"{JARVIS_CHROME_DEBUG_URL}/json/close/{target_id}", timeout=4
+            ) as response:
+                if response.status >= 400:
+                    failed.append(target_id)
+        except OSError:
+            failed.append(target_id)
+    pages_after = _cdp_pages()
+    if pages_after is None:
+        failed.extend(targets)
+        pages_after = []
+    remaining = {page.get("id") for page in pages_after if page.get("id")}
+    failed.extend(target_id for target_id in targets if target_id in remaining)
+    failed = sorted(set(failed))
+    closed = targets - set(failed)
+    managed_cdp_targets.setdefault(site_key, set()).difference_update(closed)
+    if failed:
+        message = f"❌ Không thể đóng chính xác {len(failed)} tab {site_name}."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
+    message = f"✅ Đã đóng {site_name}."
+    set_command_response(message, spoken_message=message)
+    print(f"Jarvis: {message}")
+    return True
 
 
 def parse_zalo_date(value):
@@ -1399,9 +1882,7 @@ async def read_youtube_videos(
         videos = []
 
         for attempt in range(1, retries + 1):
-            found_page_id = await find_youtube_page(session)
-            if found_page_id is not None:
-                youtube_page_id = found_page_id
+            youtube_page_id = await find_youtube_page(session)
 
             if youtube_page_id is None:
                 if attempt < retries:
@@ -1516,10 +1997,8 @@ async def open_youtube(command):
 async def get_current_youtube_videos(session, limit=20):
     global youtube_page_id
 
-    # Ưu tiên đúng tab Jarvis đã ghi nhớ. Chỉ tìm lại nếu tab đó
-    # không còn tồn tại (ví dụ người dùng đã đóng tab YouTube).
-    if youtube_page_id is None:
-        youtube_page_id = await find_youtube_page(session)
+    # Re-resolve through lifecycle-owned CDP targets before every mutation.
+    youtube_page_id = await find_youtube_page(session)
 
     if youtube_page_id is None:
         return None, []
@@ -1635,8 +2114,7 @@ async def open_video(number):
             print('Jarvis: Dùng "làm mới youtube" để cập nhật danh sách.')
             return
 
-        if youtube_page_id is None:
-            youtube_page_id = await find_youtube_page(session)
+        youtube_page_id = await find_youtube_page(session)
         if youtube_page_id is None:
             message = "❌ Không tìm thấy tab YouTube để mở video."
             print(f"Jarvis: {message}")
@@ -1719,8 +2197,7 @@ async def control_youtube_playback(should_play):
 
     try:
         session = await get_mcp_session()
-        if youtube_page_id is None:
-            youtube_page_id = await find_youtube_page(session)
+        youtube_page_id = await find_youtube_page(session)
         if youtube_page_id is None:
             message = "❌ Không tìm thấy tab YouTube đang mở."
             print(f"Jarvis: {message}")
@@ -1866,9 +2343,8 @@ async def report_youtube_now_playing():
             };
         }'''
         state = None
-        page_id = youtube_page_id
-        # First try the remembered page. If selection fails or its evaluated
-        # location is not YouTube /watch, resolve the current YouTube tab once.
+        page_id = await find_youtube_page(session)
+        # Resolve only the lifecycle-owned page. Never try a stale cached ID.
         for attempt in range(2):
             if page_id is None:
                 page_id = await find_youtube_page(session)
@@ -1899,6 +2375,7 @@ async def report_youtube_now_playing():
             page_id = None
 
         if state is None:
+            youtube_page_id = None
             message = "❌ Không tìm thấy tab YouTube đang mở."
             set_command_response(message)
             print(f"Jarvis: {message}")
@@ -2000,8 +2477,7 @@ async def search_youtube(command):
 
         # Luôn ưu tiên đúng tab YouTube đang được Jarvis điều khiển.
         # Không gọi google-chrome nếu tab này vẫn còn tồn tại.
-        if youtube_page_id is None:
-            youtube_page_id = await find_youtube_page(session)
+        youtube_page_id = await find_youtube_page(session)
 
         if youtube_page_id is not None:
             try:
@@ -2137,8 +2613,7 @@ async def show_youtube():
     try:
         session = await get_mcp_session()
 
-        if youtube_page_id is None:
-            youtube_page_id = await find_youtube_page(session)
+        youtube_page_id = await find_youtube_page(session)
 
         if youtube_page_id is None:
             print("Jarvis: Không tìm thấy tab YouTube đang mở.")
@@ -2201,13 +2676,10 @@ async def close_youtube():
     try:
         session = await get_mcp_session()
 
-        # Nếu page ID cũ chưa có hoặc tab cũ đã bị đóng,
-        # tìm lại tab YouTube đang mở.
+        # Ownership is lifecycle-local. Never adopt a URL-matching tab after restart.
+        youtube_page_id = await find_youtube_page(session)
         if youtube_page_id is None:
-            youtube_page_id = await find_youtube_page(session)
-
-        if youtube_page_id is None:
-            print("Jarvis: Không tìm thấy tab YouTube đang mở.")
+            print("Jarvis: Không còn xác minh được tab YouTube nào do Jarvis mở.")
             return False
 
         # Lấy danh sách toàn bộ tab để biết YouTube có phải tab cuối hay không.
@@ -2215,6 +2687,8 @@ async def close_youtube():
             "list_pages",
             arguments={},
         )
+        if _is_mcp_tool_error(pages_result):
+            raise RuntimeError("MCP list_pages failed")
 
         pages_text = result_to_text(pages_result)
         all_page_ids = []
@@ -2232,25 +2706,14 @@ async def close_youtube():
         ]
 
         if other_page_ids:
-            # Tránh để MCP đang chọn chính tab sắp đóng.
-            # Chuyển sang một tab khác trước.
-            try:
-                await session.call_tool(
-                    "select_page",
-                    arguments={
-                        "pageId": other_page_ids[-1],
-                        "bringToFront": True,
-                    },
-                )
-            except Exception:
-                pass
-
-            await session.call_tool(
+            closed_result = await session.call_tool(
                 "close_page",
                 arguments={
                     "pageId": youtube_page_id,
                 },
             )
+            if _is_mcp_tool_error(closed_result):
+                raise RuntimeError("MCP close_page failed")
 
             print("Jarvis: Đã tắt tab YouTube. Chrome vẫn đang chạy.")
 
@@ -2258,21 +2721,25 @@ async def close_youtube():
             # Chrome DevTools MCP không cho close_page() đóng tab cuối cùng.
             # Vì vậy đổi tab YouTube cuối cùng thành New Tab,
             # đạt mục tiêu rời YouTube nhưng vẫn giữ Chrome mở.
-            await session.call_tool(
+            selected_result = await session.call_tool(
                 "select_page",
                 arguments={
                     "pageId": youtube_page_id,
                     "bringToFront": True,
                 },
             )
+            if _is_mcp_tool_error(selected_result):
+                raise RuntimeError("MCP select_page failed")
 
-            await session.call_tool(
+            navigated_result = await session.call_tool(
                 "navigate_page",
                 arguments={
                     "type": "url",
                     "url": "chrome://newtab/",
                 },
             )
+            if _is_mcp_tool_error(navigated_result):
+                raise RuntimeError("MCP navigate_page failed")
 
             print(
                 "Jarvis: YouTube là tab Chrome cuối cùng, "
@@ -2309,8 +2776,7 @@ async def go_youtube_home():
         session = await get_mcp_session()
 
         # Ưu tiên đúng tab YouTube mà Jarvis đang điều khiển.
-        if youtube_page_id is None:
-            youtube_page_id = await find_youtube_page(session)
+        youtube_page_id = await find_youtube_page(session)
 
         if youtube_page_id is not None:
             try:
@@ -2537,19 +3003,24 @@ def search_google(command, *, allow_prompt=True):
 # ==========================================================
 
 def open_github(command):
-    profile, profile_name = _chrome_profile_from_explicit_command(command)
+    profile, _ = _chrome_profile_from_explicit_command(command)
     if profile is None:
-        profile, profile_name = STUDY_PROFILE, "Học / ChatGPT"
+        profile = STUDY_PROFILE
 
-    print(
-        "Jarvis: Đang mở GitHub bằng "
-        f"{profile_name}..."
-    )
+    print("Jarvis: Đang mở GitHub...")
 
-    open_chrome(
+    opened = open_chrome(
         profile,
         "https://github.com/",
     )
+    message = (
+        "✅ Đã mở GitHub."
+        if opened is not False
+        else "❌ Không thể mở GitHub lúc này."
+    )
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return opened is not False
 
 
 # ==========================================================
@@ -2558,6 +3029,9 @@ def open_github(command):
 
 def open_vscode():
     previous_window_ids = FILE_WINDOWS.snapshot_ids()
+    if previous_window_ids is None:
+        set_command_response("❌ Không thể xác minh danh sách cửa sổ; chưa mở VS Code.")
+        return False
     try:
         subprocess.Popen(
             ["code", "--new-window", "--profile", "Jarvis"],
@@ -2583,12 +3057,63 @@ def open_vscode():
     return tracked
 
 
+def open_system_monitor():
+    candidates = [
+        ("gnome-system-monitor", {"gnome-system-monitor"}),
+        ("missioncenter", {"missioncenter"}),
+        ("gnome-usage", {"gnome-usage"}),
+    ]
+    for executable, allowed_classes in candidates:
+        if not shutil.which(executable):
+            continue
+        previous_ids = FILE_WINDOWS.snapshot_ids()
+        if previous_ids is None:
+            set_command_response(
+                "❌ Không thể xác minh danh sách cửa sổ; chưa mở System Monitor."
+            )
+            return False
+        try:
+            subprocess.Popen(
+                [executable], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except OSError:
+            continue
+        tracked = FILE_WINDOWS.track_opened_window(
+            "system-monitor", previous_ids, allowed_classes=allowed_classes
+        )
+        if not tracked:
+            FILE_WINDOWS.close_new_window(previous_ids)
+        message = (
+            "✅ Đã mở System Monitor."
+            if tracked else
+            "❌ Không xác minh được cửa sổ System Monitor mới; đã thử hoàn tác."
+        )
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return tracked
+    message = "❌ Không tìm thấy ứng dụng System Monitor trên hệ thống."
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return False
+
+
+def close_system_monitor():
+    success, detail = FILE_WINDOWS.close_last("system-monitor")
+    message = f"{'✅' if success else '❌'} {detail}"
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return True
+
+
 # ==========================================================
 # TERMINAL
 # ==========================================================
 
 def open_terminal():
     previous_window_ids = FILE_WINDOWS.snapshot_ids()
+    if previous_window_ids is None:
+        set_command_response("❌ Không thể xác minh danh sách cửa sổ; chưa mở Terminal.")
+        return False
     terminals = [
         ("gnome-terminal", ["gnome-terminal", "--window", "--title", "Jarvis Terminal"]),
         ("kgx", ["kgx", "--title", "Jarvis Terminal"]),
@@ -2620,14 +3145,18 @@ def open_terminal():
                 tracked = FILE_WINDOWS.track_opened_window(
                     "terminal", previous_window_ids, expected_title="Jarvis Terminal"
                 )
-            message = (
-                "✅ Đã mở Terminal."
-                if tracked
-                else "⚠️ Đã yêu cầu mở Terminal nhưng không theo dõi được cửa sổ để đóng sau."
-            )
+            if tracked:
+                message = "✅ Đã mở Terminal."
+            else:
+                rolled_back = FILE_WINDOWS.close_new_window(previous_window_ids)
+                message = (
+                    "❌ Không xác minh được cửa sổ Terminal mới; đã hoàn tác việc mở."
+                    if rolled_back else
+                    "❌ Không xác minh được cửa sổ Terminal mới; không đóng bừa cửa sổ khác."
+                )
             print(f"Jarvis: {message}")
             set_command_response(message)
-            return True
+            return tracked
 
         except FileNotFoundError:
             continue
@@ -2653,6 +3182,11 @@ def open_folder(path, name):
 
     print(f"Jarvis: Đang mở {name}...")
     previous_window_ids = FILE_WINDOWS.snapshot_ids()
+    if previous_window_ids is None:
+        message = f"❌ Không thể xác minh danh sách cửa sổ; chưa mở {name}."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
     try:
         subprocess.Popen(
             ["xdg-open", str(path)],
@@ -2714,38 +3248,6 @@ def open_home():
 # ĐÓNG / TẮT ỨNG DỤNG
 # ==========================================================
 
-def _terminate_processes(patterns, app_name):
-    """Gửi SIGTERM cho các tiến trình khớp pattern; không dùng SIGKILL trừ khi cần."""
-    closed_any = False
-
-    for pattern in patterns:
-        try:
-            result = subprocess.run(
-                ["pkill", "-TERM", "-f", pattern],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-
-            # pkill: 0 = có tiến trình đã được signal, 1 = không tìm thấy.
-            if result.returncode == 0:
-                closed_any = True
-
-        except FileNotFoundError:
-            message = "❌ Không tìm thấy lệnh pkill trên hệ thống."
-            print(f"Jarvis: {message}")
-            set_command_response(message)
-            return False
-
-    if closed_any:
-        message = f"✅ Đã tắt {app_name}."
-    else:
-        message = f"ℹ️ {app_name} hiện không chạy."
-
-    print(f"Jarvis: {message}")
-    set_command_response(message)
-    return True
-
 
 def close_vscode():
     """Close only the exact VS Code window Jarvis previously opened."""
@@ -2765,8 +3267,36 @@ def close_file_manager():
     return True
 
 
+def _terminate_jarvis_chrome():
+    """Terminate only the validated browser owning Jarvis' loopback CDP port."""
+    pid = _jarvis_debug_port_owner_pid()
+    if pid is None:
+        return False
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        args = [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+    except OSError:
+        return False
+    required = {
+        f"--remote-debugging-port={JARVIS_CHROME_DEBUG_PORT}",
+        f"--user-data-dir={JARVIS_CHROME_DATA_DIR}",
+    }
+    if not required.issubset(set(args)):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        return False
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not Path(f"/proc/{pid}").exists():
+            return True
+        time.sleep(0.1)
+    return False
+
+
 async def close_chrome():
-    """Đóng Chrome sạch và reset MCP/YouTube để lần mở sau kết nối lại từ đầu."""
+    """Close only Chrome resources whose ownership Jarvis can prove."""
     global youtube_videos
     global youtube_profile
     global youtube_profile_name
@@ -2775,19 +3305,25 @@ async def close_chrome():
     # Đóng MCP trước, tránh giữ session DevTools đã chết sau khi Chrome bị tắt.
     await close_mcp_session()
 
-    youtube_videos = []
-    youtube_profile = None
-    youtube_profile_name = None
-    youtube_page_id = None
-    CHROME_WINDOWS.clear()
-
-    return _terminate_processes(
-        [
-            r"google-chrome",
-            r"chrome --type=",
-        ],
-        "Chrome",
-    )
+    normal_success, normal_detail = CHROME_WINDOWS.close_all_tracked()
+    automation_success = _terminate_jarvis_chrome()
+    if automation_success:
+        youtube_videos = []
+        youtube_profile = None
+        youtube_profile_name = None
+        youtube_page_id = None
+    success = normal_success or automation_success
+    details = []
+    if normal_success:
+        details.append(normal_detail)
+    if automation_success:
+        details.append("đã đóng Chrome automation riêng của Jarvis")
+    if not details:
+        details.append("không có Chrome nào còn được Jarvis xác minh quyền sở hữu")
+    message = f"{'✅' if success else '❌'} {'; '.join(details)}."
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return True
 
 
 async def close_chrome_profile(profile, profile_name):
@@ -2813,24 +3349,33 @@ async def close_chrome_profile(profile, profile_name):
 
 
 async def close_all_managed_apps():
-    """
-    Đóng các ứng dụng GUI mà Jarvis đang quản lý.
-
-    CỐ Ý KHÔNG đóng Terminal vì Jarvis thường đang chạy ngay trong Terminal đó.
-    TTS/Jarvis/Discord cũng được giữ nguyên.
-    """
-    print("Jarvis: Đang tắt các ứng dụng...")
-
-    # VS Code và File Manager không phụ thuộc MCP.
-    close_vscode()
-    close_file_manager()
-
-    # Chrome cần đóng MCP sạch trước khi terminate process.
-    await close_chrome()
-
+    """Deliberate override: close all GUI windows, including user-owned ones."""
+    print("Jarvis: Đang đóng toàn bộ tab và ứng dụng GUI...")
+    await close_mcp_session()
+    hosting_window_ids = FILE_WINDOWS.window_ids_for_pid_ancestry(os.getpid())
+    if hosting_window_ids is None:
+        message = (
+            "⚠️ Không thể xác minh cửa sổ đang chạy Jarvis; "
+            "đã hủy tắt tất cả để không tự đóng Jarvis."
+        )
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return True
+    success, closed, remaining = FILE_WINDOWS.close_all_gui_windows(
+        preserved_class_components={"discord", "jarvis"},
+        preserved_window_ids=hosting_window_ids,
+    )
+    if success:
+        CHROME_WINDOWS.clear()
+        FILE_WINDOWS.last_windows = {
+            key: None for key in FILE_WINDOWS.last_windows
+        }
+        FILE_WINDOWS.path_windows.clear()
     message = (
-        "✅ Đã tắt các ứng dụng Jarvis quản lý: VS Code, Chrome và File Manager. "
-        "Terminal/Jarvis vẫn được giữ để tôi tiếp tục nhận lệnh."
+        f"✅ Đã đóng {closed} cửa sổ GUI cùng toàn bộ tab bên trong; "
+        "Jarvis/Discord/TTS được giữ lại."
+        if success else
+        f"⚠️ Đã đóng {closed} cửa sổ GUI nhưng còn {len(remaining)} cửa sổ chưa đóng được."
     )
     print(f"Jarvis: {message}")
     set_command_response(message)
@@ -2965,6 +3510,11 @@ def open_filesystem_path(path):
 
     try:
         previous_window_ids = FILE_WINDOWS.snapshot_ids()
+        if previous_window_ids is None:
+            message = f"❌ Không thể xác minh danh sách cửa sổ; chưa mở {resolved.name}."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return False
         subprocess.Popen(
             ["xdg-open", str(resolved)],
             stdout=subprocess.DEVNULL,
@@ -2973,10 +3523,19 @@ def open_filesystem_path(path):
         )
         tracked = FILE_WINDOWS.track_opened_path(resolved, previous_window_ids)
         kind = "thư mục" if resolved.is_dir() else "file"
-        message = f"✅ Đã mở {kind}: {resolved}"
         if not tracked:
-            close_command = "tắt thư mục" if resolved.is_dir() else "tắt file"
-            message += f"\n⚠️ Desktop không cung cấp mã cửa sổ; có thể chưa dùng được `{close_command}`."
+            rolled_back = FILE_WINDOWS.close_new_window(
+                previous_window_ids, file_manager_only=True
+            )
+            message = (
+                f"❌ Không xác minh được cửa sổ {kind} mới; đã hoàn tác việc mở."
+                if rolled_back else
+                f"❌ Không xác minh được cửa sổ {kind} mới; không đóng bừa cửa sổ khác."
+            )
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return False
+        message = f"✅ Đã mở {kind}: {resolved}"
         print(f"Jarvis: {message}")
         set_command_response(message)
         return True
@@ -4130,6 +4689,113 @@ async def reminder_dispatch_loop():
         await asyncio.sleep(10)
 
 
+def load_gmail_state():
+    """Load only opaque IDs needed to distinguish newly seen Gmail rows."""
+    try:
+        data = json.loads(GMAIL_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"initialized": False, "seen_ids": [], "account_hash": ""}
+    seen_ids = data.get("seen_ids", []) if isinstance(data, dict) else []
+    return {
+        "initialized": bool(data.get("initialized")) if isinstance(data, dict) else False,
+        "seen_ids": [str(value) for value in seen_ids if str(value).strip()][-500:],
+        "account_hash": str(data.get("account_hash", "")) if isinstance(data, dict) else "",
+    }
+
+
+def save_gmail_state(state):
+    GMAIL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = GMAIL_STATE_PATH.with_suffix(".tmp")
+    payload = {
+        "initialized": bool(state.get("initialized")),
+        "seen_ids": [str(value) for value in state.get("seen_ids", [])][-500:],
+        "account_hash": str(state.get("account_hash", "")),
+    }
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.chmod(0o600)
+    temporary.replace(GMAIL_STATE_PATH)
+
+
+async def get_discord_notification_channel():
+    if discord_client is None or discord_client.is_closed() or not discord_client.is_ready():
+        return None
+    channel_id = (
+        _env_int("DISCORD_CHANNEL_ID")
+        or discord_notification_channel_id
+        or CORE.security.last_discord_channel_id()
+    )
+    channel = discord_client.get_channel(channel_id) if channel_id else None
+    if channel is None and channel_id:
+        try:
+            channel = await discord_client.fetch_channel(channel_id)
+        except Exception:
+            return None
+    return channel
+
+
+async def check_gmail_for_notifications():
+    """Poll Gmail once; establish a quiet baseline, then notify only new unread rows."""
+    result = await read_gmail_inbox(limit=30, unread_only=True, bring_to_front=False)
+    if not result["ok"]:
+        return {"status": result["reason"], "new_count": 0}
+    messages = result["messages"]
+    state = load_gmail_state()
+    account = configured_gmail_account()
+    account_hash = hashlib.sha256(account.encode("utf-8")).hexdigest() if account else ""
+    if state.get("account_hash") != account_hash:
+        state = {"initialized": False, "seen_ids": [], "account_hash": account_hash}
+    current_ids = [item["id"] for item in messages]
+    if not state["initialized"]:
+        save_gmail_state({
+            "initialized": True, "seen_ids": current_ids, "account_hash": account_hash,
+        })
+        return {"status": "baseline", "new_count": 0}
+    seen = set(state["seen_ids"])
+    new_messages = [item for item in messages if item["id"] not in seen]
+    merged = list(dict.fromkeys(current_ids + state["seen_ids"]))[:500]
+    if not new_messages:
+        save_gmail_state({
+            "initialized": True, "seen_ids": merged, "account_hash": account_hash,
+        })
+        return {"status": "unchanged", "new_count": 0}
+    channel = await get_discord_notification_channel()
+    if channel is None:
+        return {"status": "no_channel", "new_count": len(new_messages)}
+    try:
+        summary = await asyncio.to_thread(CORE.local_ai.summarize_gmail, new_messages[:10])
+    except Exception:
+        summary = format_gmail_preview_summary(new_messages)
+    message = f"📬 **{len(new_messages)} GMAIL MỚI**\n\n{summary}"
+    chunks = [message[index:index + 1900] for index in range(0, len(message), 1900)]
+    for chunk in chunks:
+        await channel.send(chunk)
+    save_gmail_state({
+        "initialized": True, "seen_ids": merged, "account_hash": account_hash,
+    })
+    try:
+        await mark_gmail_messages_read(new_messages, folder="inbox")
+    except Exception:
+        pass
+    print(f"Jarvis: Đã gửi thông báo {len(new_messages)} Gmail mới qua Discord.")
+    return {"status": "notified", "new_count": len(new_messages)}
+
+
+async def gmail_monitor_loop():
+    """Keep Gmail notification polling isolated from interactive browser commands."""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            async with discord_command_lock:
+                await check_gmail_for_notifications()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            print("Jarvis: Lần kiểm tra Gmail nền chưa thành công; sẽ tự thử lại.")
+        await asyncio.sleep(GMAIL_POLL_SECONDS)
+
+
 # ==========================================================
 # 2 CHẾ ĐỘ SLEEP UBUNTU
 # ==========================================================
@@ -4797,6 +5463,21 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
     if is_youtube_now_playing_command(command):
         return await report_youtube_now_playing()
 
+    command_lower_raw = command.casefold()
+    for prefix in ("mở đường dẫn ", "mo duong dan "):
+        if command_lower_raw.startswith(prefix):
+            return open_filesystem_path(command[len(prefix):].strip())
+    for prefix in (
+        "tắt đường dẫn ", "tat duong dan ", "đóng đường dẫn ",
+        "dong duong dan ", "thoát đường dẫn ", "thoat duong dan ",
+    ):
+        if command_lower_raw.startswith(prefix):
+            success, detail = FILE_WINDOWS.close_path(command[len(prefix):].strip())
+            message = f"{'✅' if success else '❌'} {detail}"
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return True
+
     # Lõi module hóa xử lý memory, tìm file thông minh, natural-language
     # aliases và system monitoring. Lệnh chưa nhận diện tiếp tục qua router 1.0.
     core_response = CORE.handle(command)
@@ -4835,6 +5516,22 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         return True
 
     plain_command = normalize_core_text(command)
+    is_gmail_spam = any(term in plain_command for term in ("thu rac", "spam")) and any(
+        term in plain_command for term in ("tom tat", "tong hop", "doc", "co gi", "kiem tra")
+    )
+    if is_gmail_spam:
+        return await summarize_gmail(
+            folder="spam", meaningful_only=True, unread_only=True
+        )
+
+    is_gmail_summary = any(name in plain_command for name in ("gmail", "email")) and any(
+        term in plain_command for term in ("tom tat", "tong hop", "doc", "co gi", "kiem tra", "moi")
+    )
+    if is_gmail_summary:
+        include_read = any(term in plain_command for term in ("gan day", "tat ca"))
+        unread_only = not include_read
+        return await summarize_gmail(unread_only=unread_only)
+
     is_zalo_analysis = "zalo" in plain_command and any(term in plain_command for term in (
         "tom tat", "tong hop", "doc", "co gi", "viec can lam", "hoi",
         "su kien", "kiem tra", "cho toi biet",
@@ -4914,6 +5611,17 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
     if command_lower in close_zalo_commands:
         await close_managed_web_tab(
             "zalo", "Zalo", ("https://chat.zalo.me/",)
+        )
+        return True
+
+    close_gmail_commands = {
+        "tắt gmail", "tat gmail", "đóng gmail", "dong gmail",
+        "thoát gmail", "thoat gmail", "close gmail",
+        "tắt gmail học", "tat gmail hoc", "đóng gmail học", "dong gmail hoc",
+    }
+    if command_lower in close_gmail_commands:
+        await close_managed_web_tab(
+            "gmail", "Gmail", ("https://mail.google.com/", "https://accounts.google.com/")
         )
         return True
 
@@ -5292,6 +6000,25 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
 
         return True
 
+
+    # ------------------------------------------------------
+    # SYSTEM MONITOR
+    # ------------------------------------------------------
+
+    if command_lower in {
+        "system monitor", "mở system monitor", "mo system monitor",
+        "mở trình giám sát hệ thống", "mo trinh giam sat he thong",
+    }:
+        open_system_monitor()
+        return True
+
+    if command_lower in {
+        "tắt system monitor", "tat system monitor",
+        "đóng system monitor", "dong system monitor",
+        "thoát system monitor", "thoat system monitor",
+    }:
+        close_system_monitor()
+        return True
 
     # ------------------------------------------------------
     # VSCODE
@@ -5810,6 +6537,13 @@ def _discord_command_needs_profile(command):
     if command_lower in bare_github_commands:
         return False
 
+    if command_lower in {
+        "gmail", "mở gmail", "mo gmail", "vào gmail", "vao gmail",
+        "tóm tắt gmail", "tom tat gmail", "tóm tắt email", "tom tat email",
+        "gmail mới", "gmail moi", "email mới", "email moi", "kiểm tra gmail", "kiem tra gmail",
+    }:
+        return False
+
     google_prefixes = (
         "google", "tìm google", "tim google",
         "tìm trên google", "tim tren google",
@@ -5831,12 +6565,12 @@ async def start_discord_bot():
 
     if not token:
         print("Jarvis: Discord chưa chạy vì thiếu DISCORD_TOKEN trong .env.")
-        return
+        return False
 
     if owner_id is None:
         print("Jarvis: Discord chưa chạy vì thiếu DISCORD_USER_ID trong .env.")
         print("Jarvis: Thêm ID Discord của bạn để chỉ bạn có quyền điều khiển máy.")
-        return
+        return False
 
     intents = discord.Intents.default()
     intents.message_content = True
@@ -6023,7 +6757,8 @@ async def start_discord_bot():
                 # Discord giới hạn một message khoảng 2000 ký tự. Bản tổng hợp
                 # Zalo có thể dài vì gồm tới 20 nhóm, nên chia theo dòng thay vì cắt mất.
                 response_text = redact_sensitive(last_command_response)
-                CORE.conversation.add("discord", "assistant", response_text)
+                if risk != "sensitive":
+                    CORE.conversation.add("discord", "assistant", response_text)
                 response_view = None
                 if last_command_response.startswith("🧰 **JARVIS CÓ THỂ"):
                     response_view = DiscordHelpCategoryView(owner_id)
@@ -6072,12 +6807,39 @@ async def start_discord_bot():
 
     try:
         await client.start(token)
+        return True
     except discord.LoginFailure:
         print("Jarvis: DISCORD_TOKEN không hợp lệ. Hãy kiểm tra/reset token.")
+        return False
     except asyncio.CancelledError:
         raise
     except Exception as error:
         print(f"Jarvis: Không thể kết nối Discord: {error}")
+        return True
+    finally:
+        if not client.is_closed():
+            await client.close()
+        if discord_client is client:
+            discord_client = None
+
+
+async def supervise_discord_bot():
+    """Reconnect Discord after transient failures without stopping Jarvis."""
+    while True:
+        try:
+            should_retry = await start_discord_bot()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"Jarvis: Lỗi vòng kết nối Discord: {error}")
+            should_retry = True
+        if not should_retry:
+            return
+        print(
+            "Jarvis: Sẽ thử kết nối lại Discord sau "
+            f"{DISCORD_RECONNECT_DELAY_SECONDS} giây."
+        )
+        await asyncio.sleep(DISCORD_RECONNECT_DELAY_SECONDS)
 
 
 async def stop_discord_bot():
@@ -6143,7 +6905,7 @@ async def main():
 
     # Khi chạy trực tiếp trong Terminal, stdin là TTY và Jarvis giữ nguyên
     # giao diện nhập lệnh cũ. Khi chạy bằng systemd --user, stdin không phải
-    # TTY nên Jarvis không gọi input() và tiếp tục sống nhờ Discord task.
+    # TTY nên Jarvis không gọi input() và tiếp tục sống nhờ lịch nhắc/IPC.
     interactive_terminal = sys.stdin.isatty()
 
     print()
@@ -6156,8 +6918,9 @@ async def main():
         print("Jarvis: Đang chạy nền bằng systemd. Terminal input đã tắt.")
         print("Jarvis: Discord vẫn tiếp tục nhận lệnh.")
 
-    discord_task = asyncio.create_task(start_discord_bot())
+    discord_task = asyncio.create_task(supervise_discord_bot())
     reminder_task = asyncio.create_task(reminder_dispatch_loop())
+    gmail_task = asyncio.create_task(gmail_monitor_loop())
 
     try:
         if interactive_terminal:
@@ -6183,7 +6946,7 @@ async def main():
                         running = True
                     else:
                         running = await route_command(command, source="terminal")
-                    if last_command_response:
+                    if last_command_response and classify_remote_command(command) != "sensitive":
                         CORE.conversation.add(
                             "terminal", "assistant", last_command_response
                         )
@@ -6205,9 +6968,9 @@ async def main():
                     print(error)
 
         else:
-            # Chế độ systemd: không có Terminal để input(). Chờ Discord task
-            # để process chính không kết thúc ngay sau khi boot/login Ubuntu.
-            await discord_task
+            # Chế độ systemd phải tiếp tục phục vụ IPC/TTS/lịch nhắc ngay cả
+            # khi Discord thiếu cấu hình hoặc tạm mất mạng.
+            await reminder_task
 
     finally:
         await stop_ipc_server()
@@ -6217,6 +6980,8 @@ async def main():
             discord_task.cancel()
         if not reminder_task.done():
             reminder_task.cancel()
+        if not gmail_task.done():
+            gmail_task.cancel()
 
         try:
             await discord_task
@@ -6224,6 +6989,10 @@ async def main():
             pass
         try:
             await reminder_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await gmail_task
         except asyncio.CancelledError:
             pass
 

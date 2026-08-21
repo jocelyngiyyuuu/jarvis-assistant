@@ -66,6 +66,39 @@ class LocalAITests(unittest.TestCase):
         self.assertIn("Nhóm yêu cầu", result)
         self.assertIn("Bằng chứng trong nhóm", result)
 
+    def test_gmail_summary_formats_local_structured_result(self):
+        client = LocalAI(model="test")
+        ollama_result = {"message": {"content": json.dumps({
+            "overview": "Có một thư cần chú ý.",
+            "emails": [{
+                "sender": "Trường học",
+                "subject": "Lịch thi",
+                "summary": "Thông báo lịch thi mới.",
+                "action": "Xem lịch trước thứ Hai.",
+                "urgent": True,
+            }],
+            "tasks": [{
+                "task": "Xem lịch thi",
+                "source": "Lịch thi",
+                "deadline": "thứ Hai",
+            }],
+        }, ensure_ascii=False)}}
+
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return json.dumps(ollama_result).encode("utf-8")
+
+        with patch("jarvis_core.local_ai.urlopen", return_value=FakeResponse()):
+            result = client.summarize_gmail([{
+                "sender": "Trường học", "subject": "Lịch thi",
+                "snippet": "Xem lịch trước thứ Hai", "unread": True,
+            }])
+        self.assertIn("Có một thư cần chú ý", result)
+        self.assertIn("Việc cần làm", result)
+        self.assertIn("Xem lịch thi", result)
+        self.assertIn("Hạn: thứ Hai", result)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,7 +54,8 @@ class YouTubeNowPlayingTests(unittest.IsolatedAsyncioTestCase):
             "url": "https://www.youtube.com/watch?v=abc",
         })
 
-        with patch.object(jarvis, "get_mcp_session", AsyncMock(return_value=session)):
+        with patch.object(jarvis, "get_mcp_session", AsyncMock(return_value=session)), \
+             patch.object(jarvis, "find_youtube_page", AsyncMock(return_value=17)):
             handled = await jarvis.report_youtube_now_playing()
 
         self.assertTrue(handled)
@@ -130,7 +131,8 @@ class YouTubeNowPlayingTests(unittest.IsolatedAsyncioTestCase):
             "duration": 0,
             "url": "https://www.youtube.com/watch?v=paused",
         })
-        with patch.object(jarvis, "get_mcp_session", AsyncMock(return_value=session)):
+        with patch.object(jarvis, "get_mcp_session", AsyncMock(return_value=session)), \
+             patch.object(jarvis, "find_youtube_page", AsyncMock(return_value=17)):
             await jarvis.report_youtube_now_playing()
         self.assertIn("Tạm dừng", jarvis.last_command_response)
         self.assertIn("0:03", jarvis.last_command_response)
@@ -145,6 +147,20 @@ class YouTubeNowPlayingTests(unittest.IsolatedAsyncioTestCase):
             jarvis.last_command_response,
             "❌ Không tìm thấy tab YouTube đang mở.",
         )
+
+    async def test_video_reader_never_uses_stale_cached_page_id(self):
+        jarvis.youtube_page_id = 17
+        session = AsyncMock()
+        with patch.object(
+            jarvis, "get_mcp_session", AsyncMock(return_value=session)
+        ), patch.object(
+            jarvis, "find_youtube_page", AsyncMock(return_value=None)
+        ):
+            self.assertFalse(await jarvis.read_youtube_videos(
+                jarvis.STUDY_PROFILE, "Học", retries=1
+            ))
+        session.call_tool.assert_not_awaited()
+        self.assertIsNone(jarvis.youtube_page_id)
 
     async def test_route_dispatches_now_playing_before_local_ai(self):
         with patch.object(

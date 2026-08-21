@@ -24,6 +24,13 @@ class SecurityPolicyTests(unittest.TestCase):
         )
         self.assertEqual(classify_remote_command("đọc .env"), "forbidden")
         self.assertEqual(classify_remote_command("xóa vĩnh viễn file"), "forbidden")
+        self.assertEqual(classify_remote_command("tóm tắt gmail"), "sensitive")
+        self.assertEqual(classify_remote_command("gmail mới"), "sensitive")
+        for command in (
+            "đọc gmail", "gmail có gì", "tổng hợp gmail", "kiểm tra email",
+            "tóm tắt mail", "tóm tắt thư điện tử",
+        ):
+            self.assertEqual(classify_remote_command(command), "sensitive", command)
 
     def test_redacts_tokens_and_passwords(self):
         sample = "DISCORD_" + "TOKEN=" + "abc.def.123456789 " + "pass" + "word=hunter2"

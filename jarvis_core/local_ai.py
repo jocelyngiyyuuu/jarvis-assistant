@@ -282,6 +282,127 @@ Dữ liệu: {source[:30000]}
                 lines.extend(["", "Bằng chứng trong nhóm:", *(f"• {item}" for item in valid)])
         return "\n".join(lines)[:3500]
 
+    def summarize_gmail(self, messages, *, meaningful_only=False, folder="inbox"):
+        """Summarize Gmail inbox previews locally without adding them to history."""
+        source = json.dumps(messages, ensure_ascii=False)
+        schema = {
+            "type": "object",
+            "properties": {
+                "overview": {"type": "string"},
+                "emails": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sender": {"type": "string"},
+                            "subject": {"type": "string"},
+                            "summary": {"type": "string"},
+                            "action": {"type": "string"},
+                            "urgent": {"type": "boolean"},
+                            "meaningful": {"type": "boolean"},
+                        },
+                        "required": ["sender", "subject", "summary", "action", "urgent", "meaningful"],
+                    },
+                },
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task": {"type": "string"},
+                            "source": {"type": "string"},
+                            "deadline": {"type": "string"},
+                        },
+                        "required": ["task", "source", "deadline"],
+                    },
+                },
+            },
+            "required": ["overview", "emails", "tasks"],
+        }
+        prompt = f"""/no_think
+Tóm tắt các dòng thư mục {folder} của Gmail bằng tiếng Việt. Chỉ dựa vào người gửi, tiêu đề và
+đoạn xem trước; không suy đoán phần nội dung chưa được cung cấp. Action để chuỗi rỗng
+nếu không thấy việc cần làm. Đánh dấu urgent chỉ khi dữ liệu nói rõ tính khẩn cấp.
+Đánh dấu meaningful=true cho thư có giá trị thực tế như bảo mật tài khoản, giao dịch,
+công việc, học tập, hóa đơn, lịch hoặc việc cần làm. Quảng cáo, lừa đảo và nội dung
+vô nghĩa phải là false. Chế độ chỉ lấy nội dung có ý nghĩa: {meaningful_only}.
+Khi chế độ này là true, overview và emails chỉ được nhắc tới các thư meaningful=true;
+nếu không có thì overview nói không tìm thấy nội dung có ý nghĩa và emails để trống.
+Tạo tasks từ các yêu cầu hành động được nói rõ trong thư. Mỗi task phải có nguồn là
+người gửi hoặc tiêu đề; deadline để trống nếu thư không nói rõ. Không tự suy đoán việc
+cần làm hoặc thời hạn. Nếu không có việc cụ thể thì tasks để trống.
+Dữ liệu: {source[:30000]}
+"""
+        payload = json.dumps({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "Bạn là trợ lý tóm tắt email riêng tư chạy local. Chỉ xuất JSON schema."},
+                {"role": "user", "content": prompt},
+            ],
+            "format": schema,
+            "think": False,
+            "options": {"temperature": 0.1, "num_predict": 450, "num_ctx": 4096},
+            "stream": False,
+        }, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            f"{self.base_url}/api/chat", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urlopen(request, timeout=min(self.timeout, 45)) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            data = json.loads(self._strip_thinking(result.get("message", {}).get("content", "")))
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"Không thể tóm tắt Gmail bằng Ollama: {error}") from error
+        emails = data.get("emails", [])
+        if not isinstance(emails, list):
+            raise RuntimeError("Ollama không trả về bản tóm tắt Gmail đúng định dạng.")
+        lines = []
+        overview = str(data.get("overview", "")).strip()
+        if overview:
+            lines.append(overview)
+        for item in emails[:20]:
+            if not isinstance(item, dict):
+                continue
+            if meaningful_only and not item.get("meaningful", False):
+                continue
+            sender = str(item.get("sender", "Không rõ người gửi")).strip()
+            subject = str(item.get("subject", "Không có tiêu đề")).strip()
+            summary = str(item.get("summary", "")).strip()
+            action = str(item.get("action", "")).strip()
+            icon = "🔴" if item.get("urgent") else "•"
+            block = f"{icon} **{sender}** — {subject}"
+            if summary:
+                block += f"\n  {summary}"
+            if action:
+                block += f"\n  Việc cần làm: {action}"
+            lines.append(block)
+        tasks = data.get("tasks", [])
+        valid_tasks = []
+        if isinstance(tasks, list):
+            for item in tasks[:8]:
+                if not isinstance(item, dict):
+                    continue
+                task = str(item.get("task", "")).strip()
+                source_name = str(item.get("source", "")).strip()
+                deadline = str(item.get("deadline", "")).strip()
+                if not task:
+                    continue
+                detail = task
+                if source_name:
+                    detail += f" — Nguồn: {source_name}"
+                if deadline:
+                    detail += f" — Hạn: {deadline}"
+                valid_tasks.append(detail)
+        lines.append(
+            "✅ **VIỆC CẦN LÀM**\n"
+            + ("\n".join(f"• {task}" for task in valid_tasks)
+               if valid_tasks else "• Chưa thấy yêu cầu hành động rõ ràng.")
+        )
+        if not lines:
+            raise RuntimeError("Ollama không tìm thấy email hợp lệ để tóm tắt.")
+        return "\n\n".join(lines)[:5500]
+
     def decide(self, message):
         """Return a validated safe action decision, or a conversational reply."""
         payload = json.dumps(

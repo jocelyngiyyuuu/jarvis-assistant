@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -5,6 +6,13 @@ import jarvis
 
 
 class ChromeShortcutTests(unittest.TestCase):
+    def test_vscode_open_aborts_when_window_snapshot_is_unverifiable(self):
+        with patch.object(
+            jarvis.FILE_WINDOWS, "snapshot_ids", return_value=None
+        ), patch("jarvis.subprocess.Popen") as popen:
+            self.assertFalse(jarvis.open_vscode())
+        popen.assert_not_called()
+
     def test_bare_github_defaults_to_profile_1_without_prompt(self):
         with patch("jarvis.open_chrome", return_value=True) as opened:
             self.assertTrue(jarvis.handle_chrome_shortcut("mở github"))
@@ -12,13 +20,25 @@ class ChromeShortcutTests(unittest.TestCase):
         self.assertNotIn("Hãy nói rõ profile", jarvis.last_command_response)
         self.assertEqual(
             jarvis.last_command_response,
-            "✅ Đã mở GitHub bằng Chrome Học / ChatGPT.",
+            "✅ Đã mở GitHub.",
         )
 
     def test_explicit_personal_github_still_overrides_default(self):
         with patch("jarvis.open_chrome", return_value=True) as opened:
             self.assertTrue(jarvis.handle_chrome_shortcut("mở github cá nhân"))
         opened.assert_called_once_with(jarvis.PERSONAL_PROFILE, "https://github.com/")
+        self.assertEqual(jarvis.last_command_response, "✅ Đã mở GitHub.")
+
+    def test_chatgpt_open_response_does_not_expose_chrome_profile(self):
+        with patch("jarvis.open_chrome", return_value=True) as opened:
+            self.assertTrue(jarvis.handle_chrome_shortcut("mở chatgpt học"))
+        opened.assert_called_once_with(jarvis.STUDY_PROFILE, "https://chatgpt.com/")
+        self.assertEqual(jarvis.last_command_response, "✅ Đã mở ChatGPT.")
+
+    def test_direct_github_command_uses_short_success_response(self):
+        with patch("jarvis.open_chrome", return_value=True):
+            self.assertTrue(jarvis.open_github("github"))
+        self.assertEqual(jarvis.last_command_response, "✅ Đã mở GitHub.")
 
     def test_open_folder_tracks_window_for_paired_close(self):
         with patch.object(jarvis.Path, "exists", return_value=True), patch.object(
@@ -55,6 +75,84 @@ class ChromeShortcutTests(unittest.TestCase):
 
 
 class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chrome_close_failure_retains_exact_ownership_for_retry(self):
+        jarvis.youtube_page_id = 17
+        jarvis.youtube_videos = [{"id": "owned"}]
+        with patch.object(
+            jarvis.CHROME_WINDOWS, "close_all_tracked",
+            return_value=(False, "Không đóng được Chrome"),
+        ), patch.object(jarvis.CHROME_WINDOWS, "clear") as clear, patch(
+            "jarvis._terminate_jarvis_chrome", return_value=False
+        ), patch("jarvis.close_mcp_session", new=AsyncMock()):
+            self.assertTrue(await jarvis.close_chrome())
+        clear.assert_not_called()
+        self.assertEqual(jarvis.youtube_page_id, 17)
+        self.assertEqual(jarvis.youtube_videos, [{"id": "owned"}])
+
+    async def test_youtube_close_tool_error_retains_state_and_reports_failure(self):
+        pages = Mock(isError=False)
+        pages.content = [Mock(text=(
+            "17: https://www.youtube.com/watch?v=owned\n"
+            "18: https://example.com/"
+        ))]
+        failed_close = Mock(isError=True)
+        session = AsyncMock()
+        session.call_tool.side_effect = [pages, failed_close]
+        jarvis.youtube_page_id = 17
+        jarvis.youtube_videos = [{"id": "owned"}]
+        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)), patch(
+            "jarvis.find_youtube_page", new=AsyncMock(return_value=17)
+        ):
+            self.assertFalse(await jarvis.close_youtube())
+        self.assertEqual(jarvis.youtube_page_id, 17)
+        self.assertEqual(jarvis.youtube_videos, [{"id": "owned"}])
+
+    async def test_individual_chrome_close_never_uses_process_wide_terminate(self):
+        with patch.object(
+            jarvis.CHROME_WINDOWS, "close_all_tracked",
+            return_value=(True, "Đã đóng Chrome Jarvis"),
+        ) as close, patch(
+            "jarvis._terminate_jarvis_chrome", return_value=True
+        ) as exact_automation, patch(
+            "jarvis.close_mcp_session", new=AsyncMock()
+        ):
+            self.assertTrue(await jarvis.close_chrome())
+        close.assert_called_once()
+        exact_automation.assert_called_once()
+        self.assertNotIn("pkill", inspect.getsource(jarvis.close_chrome))
+
+    async def test_close_all_closes_all_gui_windows_but_preserves_jarvis_and_discord(self):
+        with patch.object(
+            jarvis.FILE_WINDOWS, "window_ids_for_pid_ancestry",
+            return_value={"0xhost"},
+        ), patch.object(
+            jarvis.FILE_WINDOWS, "close_all_gui_windows",
+            return_value=(True, 7, []),
+        ) as close, patch(
+            "jarvis.close_mcp_session", new=AsyncMock()
+        ):
+            self.assertTrue(await jarvis.close_all_managed_apps())
+        close.assert_called_once_with(
+            preserved_class_components={"discord", "jarvis"},
+            preserved_window_ids={"0xhost"},
+        )
+        self.assertIn("7 cửa sổ", jarvis.last_command_response)
+
+    async def test_close_all_partial_failure_keeps_ownership_for_retry(self):
+        before = dict(jarvis.FILE_WINDOWS.last_windows)
+        with patch.object(
+            jarvis.FILE_WINDOWS, "window_ids_for_pid_ancestry", return_value=set()
+        ), patch.object(
+            jarvis.FILE_WINDOWS, "close_all_gui_windows",
+            return_value=(False, 2, ["0xleft"]),
+        ), patch.object(jarvis.CHROME_WINDOWS, "clear") as clear, patch(
+            "jarvis.close_mcp_session", new=AsyncMock()
+        ):
+            self.assertTrue(await jarvis.close_all_managed_apps())
+        clear.assert_not_called()
+        self.assertEqual(jarvis.FILE_WINDOWS.last_windows, before)
+        self.assertIn("còn 1 cửa sổ", jarvis.last_command_response)
+
     def test_terminal_rolls_back_untracked_new_window(self):
         process = Mock()
         process.poll.return_value = None
@@ -70,6 +168,25 @@ class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(jarvis.open_terminal())
         rollback.assert_called_once_with({"0x1"})
         self.assertIn("đã hoàn tác", jarvis.last_command_response)
+
+    def test_system_monitor_open_and_close_use_exact_window_identity(self):
+        with patch.object(
+            jarvis.FILE_WINDOWS, "snapshot_ids", return_value={"0x1"}
+        ), patch("jarvis.shutil.which", return_value="/usr/bin/gnome-system-monitor"), patch(
+            "jarvis.subprocess.Popen"
+        ), patch.object(
+            jarvis.FILE_WINDOWS, "track_opened_window", return_value=True
+        ) as track:
+            self.assertTrue(jarvis.open_system_monitor())
+        track.assert_called_once_with(
+            "system-monitor", {"0x1"}, allowed_classes={"gnome-system-monitor"}
+        )
+        with patch.object(
+            jarvis.FILE_WINDOWS, "close_last",
+            return_value=(True, "Đã đóng System Monitor"),
+        ) as close:
+            self.assertTrue(jarvis.close_system_monitor())
+        close.assert_called_once_with("system-monitor")
 
     def test_open_folder_handles_missing_launcher_and_rolls_back_untracked_window(self):
         path = jarvis.Path("/tmp/example")
@@ -111,10 +228,10 @@ class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             jarvis.FILE_WINDOWS, "close_last",
             return_value=(True, "Đã đóng VS Code"),
-        ) as close, patch("jarvis._terminate_processes") as terminate:
+        ) as close:
             self.assertTrue(jarvis.close_vscode())
         close.assert_called_once_with("vscode")
-        terminate.assert_not_called()
+        self.assertNotIn("pkill", inspect.getsource(jarvis.close_vscode))
 
     def test_individual_file_manager_close_never_quits_or_pkills_process(self):
         with patch.object(
@@ -218,25 +335,42 @@ class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await jarvis.route_command("thoát chrome học", allow_local_ai=False))
             close_chrome.assert_awaited_once_with(jarvis.STUDY_PROFILE, "Học / ChatGPT")
 
-    async def test_close_gmail_study_closes_only_tracked_gmail_window(self):
-        with patch.object(
-            jarvis.CHROME_WINDOWS,
-            "close_site_window",
-            return_value=(True, "Đã đóng Gmail."),
+    async def test_close_gmail_study_closes_only_managed_gmail_tab(self):
+        with patch(
+            "jarvis.close_managed_web_tab", new=AsyncMock(return_value=True)
         ) as close:
             self.assertTrue(await jarvis.route_command(
                 "tắt gmail học", allow_local_ai=False
             ))
-        close.assert_called_once_with(jarvis.STUDY_PROFILE, "gmail", "Gmail")
-        self.assertEqual(jarvis.last_command_response, "✅ Đã đóng Gmail.")
+        close.assert_awaited_once_with(
+            "gmail", "Gmail",
+            ("https://mail.google.com/", "https://accounts.google.com/"),
+        )
 
-    async def test_close_site_without_profile_fails_instead_of_guessing(self):
-        with patch.object(jarvis.CHROME_WINDOWS, "close_site_window") as close:
+    async def test_close_gmail_without_profile_defaults_to_managed_tab(self):
+        with patch(
+            "jarvis.close_managed_web_tab", new=AsyncMock(return_value=True)
+        ) as close:
             self.assertTrue(await jarvis.route_command(
                 "đóng gmail", allow_local_ai=False
             ))
-        close.assert_not_called()
-        self.assertIn("nói rõ profile", jarvis.last_command_response)
+        close.assert_awaited_once()
+
+    def test_bare_gmail_defaults_to_jarvis_automation_profile(self):
+        with patch("jarvis.open_chrome", return_value=True) as opened:
+            self.assertTrue(jarvis.handle_chrome_shortcut("mở gmail"))
+        opened.assert_called_once_with(
+            jarvis.STUDY_PROFILE, jarvis.configured_gmail_url()
+        )
+        self.assertEqual(jarvis.last_command_response, "✅ Đã mở Gmail.")
+
+    def test_gmail_study_url_uses_automation_chrome(self):
+        self.assertTrue(jarvis._is_automation_url(
+            "https://mail.google.com/", jarvis.STUDY_PROFILE
+        ))
+        self.assertFalse(jarvis._is_automation_url(
+            "https://mail.google.com/", jarvis.PERSONAL_PROFILE
+        ))
 
     async def test_close_site_aliases_are_paired_with_open_shortcuts(self):
         commands = {

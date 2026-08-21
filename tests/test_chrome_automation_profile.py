@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -6,6 +7,25 @@ import jarvis
 
 
 class ChromeAutomationProfileTests(unittest.TestCase):
+    def test_existing_automation_chrome_opens_requested_url_via_loopback(self):
+        pages = MagicMock()
+        pages.__enter__ = MagicMock(return_value=pages)
+        pages.__exit__ = MagicMock(return_value=False)
+        pages.read.return_value = b"[]"
+        created = MagicMock()
+        created.__enter__ = MagicMock(return_value=created)
+        created.__exit__ = MagicMock(return_value=False)
+        created.read.return_value = b'{"type":"page"}'
+        with patch.object(Path, "mkdir"), patch.object(Path, "chmod"), patch(
+            "jarvis._jarvis_chrome_ready", return_value=True
+        ), patch(
+            "jarvis.urlopen", side_effect=[pages, created]
+        ) as opened, patch("jarvis.subprocess.Popen") as popen:
+            self.assertTrue(jarvis.ensure_jarvis_chrome("https://mail.google.com/"))
+        popen.assert_not_called()
+        self.assertEqual(opened.call_args_list[1].args[0].get_method(), "PUT")
+        self.assertIn("mail.google.com", opened.call_args_list[1].args[0].full_url)
+
     def test_discord_bare_github_open_and_close_do_not_require_profile(self):
         for command in (
             "github", "mở github", "mo github",
@@ -102,6 +122,7 @@ class ChromeAutomationProfileTests(unittest.TestCase):
     def test_youtube_uses_dedicated_automation_chrome(self):
         with patch("jarvis.ensure_jarvis_chrome", return_value=True) as ensure, \
              patch("jarvis._jarvis_debug_port_owner_pid", return_value=321), \
+             patch("jarvis._record_managed_cdp_target", return_value=True), \
              patch.object(jarvis.CHROME_WINDOWS, "snapshot_ids", return_value=set()), \
              patch.object(
                  jarvis.CHROME_WINDOWS, "activate_automation_window", return_value=True
@@ -116,6 +137,7 @@ class ChromeAutomationProfileTests(unittest.TestCase):
     def test_zalo_uses_dedicated_automation_chrome(self):
         with patch("jarvis.ensure_jarvis_chrome", return_value=True) as ensure, \
              patch("jarvis._jarvis_debug_port_owner_pid", return_value=321), \
+             patch("jarvis._record_managed_cdp_target", return_value=True), \
              patch.object(jarvis.CHROME_WINDOWS, "snapshot_ids", return_value=set()), \
              patch.object(
                  jarvis.CHROME_WINDOWS, "activate_automation_window", return_value=True
@@ -150,6 +172,7 @@ class ChromeAutomationProfileTests(unittest.TestCase):
     def test_opening_managed_site_activates_dedicated_window(self):
         with patch("jarvis.ensure_jarvis_chrome", return_value=True), \
              patch("jarvis._jarvis_debug_port_owner_pid", return_value=321), \
+             patch("jarvis._record_managed_cdp_target", return_value=True), \
              patch.object(jarvis.CHROME_WINDOWS, "snapshot_ids", return_value={"0x1"}), \
              patch.object(
                  jarvis.CHROME_WINDOWS,
@@ -166,6 +189,7 @@ class ChromeAutomationProfileTests(unittest.TestCase):
     def test_managed_site_fails_when_exact_window_cannot_be_activated(self):
         with patch("jarvis.ensure_jarvis_chrome", return_value=True), \
              patch("jarvis._jarvis_debug_port_owner_pid", return_value=321), \
+             patch("jarvis._record_managed_cdp_target", return_value=True), \
              patch.object(jarvis.CHROME_WINDOWS, "snapshot_ids", return_value=set()), \
              patch.object(
                  jarvis.CHROME_WINDOWS,
@@ -205,14 +229,17 @@ class ChromeAutomationProfileTests(unittest.TestCase):
         self.assertNotIn("https://github.com/", args)
 
     def test_dedicated_chrome_is_bound_to_loopback_with_separate_data_dir(self):
-        with patch("jarvis.subprocess.Popen") as popen, \
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            jarvis, "JARVIS_CHROME_DATA_DIR", Path(temp_dir) / "jarvis-chrome"
+        ), patch("jarvis.subprocess.Popen") as popen, \
              patch("jarvis._jarvis_chrome_ready", side_effect=[False, True]):
             self.assertTrue(jarvis.ensure_jarvis_chrome("https://www.youtube.com/"))
+            expected_data_dir = f"--user-data-dir={jarvis.JARVIS_CHROME_DATA_DIR}"
 
         args = popen.call_args.args[0]
         self.assertIn("--remote-debugging-address=127.0.0.1", args)
         self.assertIn("--remote-debugging-port=9223", args)
-        self.assertIn(f"--user-data-dir={jarvis.JARVIS_CHROME_DATA_DIR}", args)
+        self.assertIn(expected_data_dir, args)
         self.assertIn("--new-window", args)
 
 

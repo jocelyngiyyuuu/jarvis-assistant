@@ -1,5 +1,6 @@
 import unittest
 import ctypes
+import os
 import subprocess
 from unittest.mock import Mock, patch
 
@@ -7,6 +8,65 @@ from jarvis_core.window_manager import ChromeWindowManager, FileWindowManager
 
 
 class ManagedDesktopWindowTests(unittest.TestCase):
+    def test_snapshot_is_unverifiable_when_enumeration_fails(self):
+        manager = FileWindowManager()
+        with patch(
+            "jarvis_core.window_manager.subprocess.run", side_effect=FileNotFoundError
+        ):
+            self.assertIsNone(manager.snapshot_ids())
+
+    def test_rollback_without_exact_launched_pid_never_closes_new_window(self):
+        manager = FileWindowManager()
+        candidate = {"id": "0x2", "class": "org.gnome.Nautilus", "title": "Home"}
+        with patch.object(manager, "list_windows", return_value=[candidate]), patch(
+            "jarvis_core.window_manager.subprocess.run"
+        ) as run:
+            self.assertFalse(manager.close_new_window(set(), file_manager_only=True))
+        run.assert_not_called()
+
+    def test_individual_close_keeps_identity_when_enumeration_fails(self):
+        manager = FileWindowManager()
+        identity = {
+            "id": "0x2", "class": "code.Code", "title": "Jarvis VS Code",
+            "path": "VS Code", "pid": 222, "start_time": "100",
+        }
+        manager.last_windows["vscode"] = identity
+        with patch(
+            "jarvis_core.window_manager.subprocess.run", side_effect=FileNotFoundError
+        ):
+            success, _ = manager.close_last("vscode")
+        self.assertFalse(success)
+        self.assertIs(manager.last_windows["vscode"], identity)
+
+    def test_close_all_fails_when_window_enumeration_fails(self):
+        manager = FileWindowManager()
+        with patch(
+            "jarvis_core.window_manager.subprocess.run", side_effect=FileNotFoundError
+        ):
+            success, closed, _ = manager.close_all_gui_windows()
+        self.assertFalse(success)
+        self.assertEqual(closed, 0)
+
+    def test_hosting_window_lookup_is_unverifiable_when_enumeration_fails(self):
+        manager = FileWindowManager()
+        with patch(
+            "jarvis_core.window_manager.subprocess.run", side_effect=FileNotFoundError
+        ):
+            self.assertIsNone(manager.window_ids_for_pid_ancestry(os.getpid()))
+
+    def test_pid_ancestry_finds_exact_hosting_window(self):
+        manager = FileWindowManager()
+        windows = [
+            {"id": "0xhost", "class": "terminal.Terminal", "title": "Jarvis"},
+            {"id": "0xother", "class": "terminal.Terminal", "title": "User"},
+        ]
+        with patch.object(manager, "list_windows", return_value=windows), patch.object(
+            manager, "_window_pid", side_effect=[os.getpid(), 999999]
+        ):
+            self.assertEqual(
+                manager.window_ids_for_pid_ancestry(os.getpid()), {"0xhost"}
+            )
+
     def test_named_app_tracking_filters_exact_allowed_class_components(self):
         manager = FileWindowManager()
         windows = [
@@ -215,6 +275,43 @@ class ManagedDesktopWindowTests(unittest.TestCase):
 
 
 class ChromeAutomationWindowTests(unittest.TestCase):
+    def test_profile_close_retains_all_ownership_when_any_identity_is_unverifiable(self):
+        manager = ChromeWindowManager()
+        valid = {
+            "id": "0x2", "class": "google-chrome", "title": "Gmail",
+            "pid": 222, "start_time": "100",
+        }
+        missing = {
+            "id": "0x3", "class": "google-chrome", "title": "Drive",
+            "pid": 333, "start_time": "200",
+        }
+        manager.profile_windows["Default"] = [valid, missing]
+        with patch.object(manager, "list_windows", return_value=[valid]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_start_time", return_value="100"), patch.object(
+            manager, "_process_has_profile", return_value=True
+        ), patch("jarvis_core.window_manager.subprocess.run") as run:
+            success, _ = manager.close_profile("Default", "Cá nhân")
+        self.assertFalse(success)
+        run.assert_not_called()
+        self.assertEqual(manager.profile_windows["Default"], [valid, missing])
+
+    def test_site_close_rejects_process_start_time_change(self):
+        manager = ChromeWindowManager()
+        identity = {
+            "id": "0x2", "class": "google-chrome", "title": "Gmail",
+            "pid": 222, "start_time": "100",
+        }
+        manager.site_windows[("Default", "gmail")] = identity
+        with patch.object(manager, "list_windows", return_value=[identity]), patch.object(
+            manager, "_window_pid", return_value=222
+        ), patch.object(manager, "_process_start_time", return_value="200"), patch.object(
+            manager, "_process_has_profile", return_value=True
+        ), patch("jarvis_core.window_manager.subprocess.run") as run:
+            success, _ = manager.close_site_window("Default", "gmail", "Gmail")
+        self.assertFalse(success)
+        run.assert_not_called()
+
     def test_site_close_requires_exact_stored_class_and_title(self):
         manager = ChromeWindowManager()
         manager.site_windows[("Profile 1", "github")] = {
@@ -251,7 +348,8 @@ class ChromeAutomationWindowTests(unittest.TestCase):
             success, _ = manager.close_profile("Profile 1", "Học")
         self.assertFalse(success)
         run.assert_not_called()
-        self.assertEqual(manager.profile_windows["Profile 1"], [])
+        self.assertEqual(len(manager.profile_windows["Profile 1"]), 1)
+        self.assertEqual(manager.profile_windows["Profile 1"][0]["id"], "0x2")
 
     def test_github_tracking_ignores_unrelated_profile_window_until_app_marker(self):
         manager = ChromeWindowManager()
@@ -331,12 +429,16 @@ class ChromeAutomationWindowTests(unittest.TestCase):
         ]
         with patch.object(manager, "list_windows", return_value=windows), patch.object(
             manager, "_window_pid", return_value=111
+        ), patch.object(
+            manager, "_process_start_time", return_value="100"
         ), patch.object(manager, "_process_has_profile", return_value=True):
             self.assertTrue(manager.track_profile_window(
                 "Default", {"0x1"}, site_key="gmail"
             ))
         with patch.object(manager, "list_windows", side_effect=[windows, []]), patch.object(
             manager, "_window_pid", return_value=111
+        ), patch.object(
+            manager, "_process_start_time", return_value="100"
         ), patch.object(manager, "_process_has_profile", return_value=True), patch(
             "jarvis_core.window_manager.subprocess.run"
         ) as run:

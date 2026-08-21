@@ -3,7 +3,7 @@
 import json
 import sqlite3
 import threading
-from contextlib import closing
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,8 +26,18 @@ class MemoryStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def _transaction(self):
+        """Commit successful operations and always close the SQLite handle."""
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self):
-        with closing(self._connect()) as connection:
+        with self._transaction() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memories (
@@ -92,7 +102,7 @@ class MemoryStore:
             expires_at = (now_value + timedelta(seconds=max(1, int(expires_in)))).isoformat()
             category = "temporary"
         normalized = normalize_text(content)
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, self._transaction() as connection:
             self._purge_expired(connection)
             duplicate = connection.execute(
                 "SELECT id FROM memories WHERE normalized = ? AND category = ?",
@@ -140,7 +150,7 @@ class MemoryStore:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY id DESC LIMIT ?"
         parameters.append(max(1, min(int(limit), 50)))
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, self._transaction() as connection:
             self._purge_expired(connection)
             rows = connection.execute(sql, parameters).fetchall()
             if rows:
@@ -157,7 +167,7 @@ class MemoryStore:
         if not content:
             raise ValueError("Nội dung cập nhật không được để trống.")
         now = self._utc_now().isoformat()
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, self._transaction() as connection:
             self._purge_expired(connection)
             cursor = connection.execute(
                 "UPDATE memories SET content = ?, normalized = ?, updated_at = ? "
@@ -167,7 +177,7 @@ class MemoryStore:
             return cursor.rowcount > 0
 
     def forget_id(self, memory_id):
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, self._transaction() as connection:
             cursor = connection.execute(
                 "DELETE FROM memories WHERE id = ?", (int(memory_id),)
             )
@@ -177,7 +187,7 @@ class MemoryStore:
         query = normalize_text(query)
         if not query:
             return 0
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, self._transaction() as connection:
             self._purge_expired(connection)
             cursor = connection.execute(
                 "DELETE FROM memories WHERE normalized LIKE ?", (f"%{query}%",)
