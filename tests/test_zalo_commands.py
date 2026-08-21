@@ -39,6 +39,48 @@ class ZaloCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("user-zalo", close.call_args.args[0])
         self.assertEqual(jarvis.managed_cdp_targets["zalo"], set())
 
+    async def test_close_zalo_waits_for_target_to_disappear(self):
+        target = {
+            "id": "owned-zalo", "type": "page", "url": "https://chat.zalo.me/",
+        }
+        other = {"id": "other", "type": "page", "url": "https://www.youtube.com/"}
+        before = [target, other]
+        response = Mock(status=200)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch(
+            "jarvis._cdp_pages", side_effect=[before, before, [other]]
+        ), patch("jarvis.urlopen", return_value=response), patch(
+            "jarvis.asyncio.sleep", new=AsyncMock()
+        ) as sleep:
+            self.assertTrue(await jarvis.close_managed_web_tab(
+                "zalo", "Zalo", ("https://chat.zalo.me/",)
+            ))
+        sleep.assert_awaited_once_with(0.1)
+        self.assertEqual(jarvis.managed_cdp_targets["zalo"], set())
+
+    async def test_close_last_zalo_tab_creates_safe_blank_page_first(self):
+        target = {
+            "id": "owned-zalo", "type": "page", "url": "https://chat.zalo.me/",
+        }
+        blank = {"id": "blank", "type": "page", "url": "about:blank"}
+        blank_response = Mock(status=200)
+        blank_response.read.return_value = json.dumps(blank).encode()
+        blank_response.__enter__ = Mock(return_value=blank_response)
+        blank_response.__exit__ = Mock(return_value=False)
+        close_response = Mock(status=200)
+        close_response.__enter__ = Mock(return_value=close_response)
+        close_response.__exit__ = Mock(return_value=False)
+        with patch("jarvis._cdp_pages", side_effect=[[target], [blank]]), patch(
+            "jarvis.urlopen", side_effect=[blank_response, close_response]
+        ) as opened:
+            self.assertTrue(await jarvis.close_managed_web_tab(
+                "zalo", "Zalo", ("https://chat.zalo.me/",)
+            ))
+        self.assertEqual(opened.call_args_list[0].args[0].get_method(), "PUT")
+        self.assertIn("about%3Ablank", opened.call_args_list[0].args[0].full_url)
+        self.assertIn("/json/close/owned-zalo", opened.call_args_list[1].args[0])
+
     async def test_close_zalo_without_registry_fails_closed_without_url_scan(self):
         jarvis.managed_cdp_targets["zalo"].clear()
         with patch("jarvis._cdp_pages") as pages, patch("jarvis.urlopen") as close:

@@ -161,6 +161,10 @@ class YouTubeNowPlayingTests(unittest.IsolatedAsyncioTestCase):
             ))
         session.call_tool.assert_not_awaited()
         self.assertIsNone(jarvis.youtube_page_id)
+        self.assertEqual(
+            jarvis.last_command_response,
+            "❌ Không tìm thấy tab YouTube đang mở.",
+        )
 
     async def test_route_dispatches_now_playing_before_local_ai(self):
         with patch.object(

@@ -352,6 +352,7 @@ mcp_stdio_context = None
 mcp_session_context = None
 mcp_session = None
 mcp_errlog = None
+mcp_browser_pid = None
 
 
 # ==========================================================
@@ -551,8 +552,18 @@ def _ensure_jarvis_chrome_tab(url):
         with urlopen(f"{JARVIS_CHROME_DEBUG_URL}/json/list", timeout=2) as response:
             pages = json.loads(response.read().decode("utf-8"))
         site_key = _automation_site_key(url)
-        owned = managed_cdp_targets.get(site_key, set()) if site_key else set()
+        owned = managed_cdp_targets.setdefault(site_key, set()) if site_key else set()
         target_url = str(url).rstrip("/")
+        site_pages = [
+            page for page in pages if isinstance(page, dict)
+            and _automation_site_key(page.get("url", "")) == site_key
+            and page.get("id")
+        ]
+        # systemd có thể khởi động lại Jarvis trong khi Chrome automation riêng
+        # vẫn còn sống. Với đúng một tab của site trong browser đã xác minh,
+        # khôi phục ownership thay vì mở một tab trùng lặp.
+        if site_key and not owned and len(site_pages) == 1:
+            owned.add(site_pages[0]["id"])
         for page in pages if isinstance(pages, list) else []:
             if not isinstance(page, dict) or page.get("id") not in owned:
                 continue
@@ -887,6 +898,12 @@ def extract_page_id(line):
     return None
 
 
+def extract_page_url(line):
+    """Extract a URL from current and legacy chrome-devtools-mcp page lines."""
+    match = re.search(r"https?://[^\s)\]}]+", str(line), re.IGNORECASE)
+    return match.group(0).rstrip(".,;") if match else ""
+
+
 # ==========================================================
 # CLEAN TITLE
 # ==========================================================
@@ -1130,21 +1147,40 @@ def create_mcp_server():
     )
 
 
+def _mcp_browser_process_is_current(tracked_pid):
+    """Check that a persistent MCP session still targets the live browser."""
+    current_pid = _jarvis_debug_port_owner_pid()
+    return bool(
+        tracked_pid is not None
+        and current_pid == tracked_pid
+        and _process_has_jarvis_chrome_args(current_pid)
+    )
+
+
 async def get_mcp_session():
     """Tạo MCP một lần và giữ session cho tới khi Jarvis thoát."""
     global mcp_stdio_context
     global mcp_session_context
     global mcp_session
     global mcp_errlog
+    global mcp_browser_pid
 
     if mcp_session is not None:
-        return mcp_session
+        if _mcp_browser_process_is_current(mcp_browser_pid):
+            return mcp_session
+        # Chrome automation có thể đã bị người dùng đóng rồi mở lại. MCP cũ
+        # vẫn còn process nhưng không tự bám sang browser PID mới, khiến mọi
+        # lệnh YouTube/Gmail/Zalo trả về rỗng.
+        await close_mcp_session()
 
     print()
     print("Jarvis: Đang kết nối Chrome...")
 
     if not ensure_jarvis_chrome():
         raise RuntimeError("Không khởi động được Chrome riêng của Jarvis.")
+    browser_pid = _jarvis_debug_port_owner_pid()
+    if browser_pid is None or not _process_has_jarvis_chrome_args(browser_pid):
+        raise RuntimeError("Không xác minh được Chrome riêng của Jarvis.")
 
     server = create_mcp_server()
 
@@ -1165,6 +1201,7 @@ async def get_mcp_session():
         mcp_session_context = ClientSession(read, write)
         mcp_session = await mcp_session_context.__aenter__()
         await mcp_session.initialize()
+        mcp_browser_pid = browser_pid
 
         print("Jarvis: Đã kết nối Chrome.")
         print("Jarvis: Kết nối này sẽ được giữ cho tới khi Jarvis thoát.")
@@ -1181,6 +1218,7 @@ async def close_mcp_session():
     global mcp_session_context
     global mcp_session
     global mcp_errlog
+    global mcp_browser_pid
 
     session_context = mcp_session_context
     stdio_context = mcp_stdio_context
@@ -1190,6 +1228,7 @@ async def close_mcp_session():
     mcp_session_context = None
     mcp_stdio_context = None
     mcp_errlog = None
+    mcp_browser_pid = None
 
     if session_context is not None:
         try:
@@ -1232,8 +1271,7 @@ async def _find_owned_mcp_pages(session, site_key):
     matches = []
     for line in result_to_text(pages_result).splitlines():
         page_id = extract_page_id(line)
-        url_match = re.search(r"https?://[^\s]+", line, re.IGNORECASE)
-        page_url = url_match.group(0).rstrip("/") if url_match else ""
+        page_url = extract_page_url(line).rstrip("/")
         if page_id is not None and page_url in owned_urls:
             matches.append((page_id, line))
     return matches
@@ -1641,23 +1679,54 @@ async def close_managed_web_tab(site_key, site_name, url_needles):
         set_command_response(message)
         print(f"Jarvis: {message}")
         return False
-    failed = []
+
+    # Chrome thường tự thoát khi đóng page cuối cùng, làm mất luôn endpoint
+    # xác minh. Tạo một tab trống không được quản lý trước để chỉ đóng đúng
+    # Zalo/Gmail mục tiêu mà vẫn giữ browser automation sống.
+    if targets == current_ids:
+        try:
+            request = Request(
+                f"{JARVIS_CHROME_DEBUG_URL}/json/new?{quote_plus('about:blank')}",
+                method="PUT",
+            )
+            with urlopen(request, timeout=4) as response:
+                blank_page = json.loads(response.read().decode("utf-8"))
+            if not isinstance(blank_page, dict) or blank_page.get("type") != "page":
+                raise ValueError("CDP did not create a page")
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            message = (
+                f"❌ Không thể tạo tab an toàn trước khi đóng {site_name}; "
+                "Jarvis giữ nguyên tab hiện tại."
+            )
+            set_command_response(message)
+            print(f"Jarvis: {message}")
+            return False
+
     for target_id in targets:
         try:
             with urlopen(
                 f"{JARVIS_CHROME_DEBUG_URL}/json/close/{target_id}", timeout=4
-            ) as response:
-                if response.status >= 400:
-                    failed.append(target_id)
+            ):
+                pass
         except OSError:
-            failed.append(target_id)
-    pages_after = _cdp_pages()
-    if pages_after is None:
-        failed.extend(targets)
-        pages_after = []
-    remaining = {page.get("id") for page in pages_after if page.get("id")}
-    failed.extend(target_id for target_id in targets if target_id in remaining)
-    failed = sorted(set(failed))
+            pass
+
+    # /json/close trả về trước khi target biến mất hoàn toàn khỏi /json/list.
+    # Chờ tối đa 2 giây để tránh báo thất bại giả dù tab đã đóng thành công.
+    pages_after = None
+    remaining = set(targets)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        pages_after = _cdp_pages()
+        if pages_after is None:
+            break
+        current_after = {page.get("id") for page in pages_after if page.get("id")}
+        remaining = targets & current_after
+        if not remaining:
+            break
+        await asyncio.sleep(0.1)
+
+    failed = sorted(targets if pages_after is None else remaining)
     closed = targets - set(failed)
     managed_cdp_targets.setdefault(site_key, set()).difference_update(closed)
     if failed:
@@ -1890,6 +1959,7 @@ async def read_youtube_videos(
                     continue
 
                 print("Jarvis: Không tìm thấy tab YouTube.")
+                set_command_response("❌ Không tìm thấy tab YouTube đang mở.")
                 return False
 
             await session.call_tool(
@@ -1918,6 +1988,10 @@ async def read_youtube_videos(
         if not videos:
             print("Jarvis: Trang YouTube đã mở nhưng chưa có danh sách video.")
             print("Jarvis: Thử 'làm mới youtube' sau khi trang tải xong.")
+            set_command_response(
+                "⏳ YouTube đã mở nhưng chưa tải được danh sách video. "
+                "Hãy thử `làm mới youtube` sau ít phút."
+            )
             return False
 
         youtube_videos = videos
@@ -1949,6 +2023,7 @@ async def read_youtube_videos(
     except Exception as error:
         print("Jarvis: Không thể đọc YouTube qua Chrome DevTools.")
         print(f"Jarvis: Chi tiết: {error}")
+        set_command_response("❌ Không thể cập nhật danh sách YouTube lúc này.")
         return False
 
 
@@ -1975,16 +2050,21 @@ async def open_youtube(command):
         f"{profile_name}..."
     )
 
-    open_chrome(
+    opened = open_chrome(
         profile,
         "https://www.youtube.com/",
     )
+    if not opened:
+        message = "❌ Không thể mở cửa sổ YouTube lúc này."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
 
     # Cho tab mới xuất hiện; read_youtube_videos() sẽ tự retry
     # cho tới khi danh sách video render xong.
     await asyncio.sleep(0.8)
 
-    await read_youtube_videos(
+    return await read_youtube_videos(
         profile,
         profile_name,
     )
@@ -2044,10 +2124,16 @@ async def refresh_youtube_videos():
 
     try:
         session = await get_mcp_session()
-        _, videos = await get_current_youtube_videos(session, limit=10)
+        page_id, videos = await get_current_youtube_videos(session, limit=10)
 
         if not videos:
             print("Jarvis: Không tìm thấy video trên tab YouTube hiện tại.")
+            message = (
+                "❌ Không tìm thấy tab YouTube đang mở."
+                if page_id is None
+                else "⏳ YouTube chưa tải được danh sách video. Hãy thử lại sau ít phút."
+            )
+            set_command_response(message)
             return False
 
         youtube_videos = videos
@@ -2077,6 +2163,7 @@ async def refresh_youtube_videos():
     except Exception as error:
         print("Jarvis: Không thể làm mới danh sách YouTube.")
         print(f"Jarvis: Chi tiết: {error}")
+        set_command_response("❌ Không thể cập nhật danh sách YouTube lúc này.")
         return False
 
 

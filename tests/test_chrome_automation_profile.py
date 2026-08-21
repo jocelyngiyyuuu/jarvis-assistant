@@ -7,6 +7,11 @@ import jarvis
 
 
 class ChromeAutomationProfileTests(unittest.TestCase):
+    def tearDown(self):
+        jarvis.mcp_browser_pid = None
+        for targets in jarvis.managed_cdp_targets.values():
+            targets.clear()
+
     def test_existing_automation_chrome_opens_requested_url_via_loopback(self):
         pages = MagicMock()
         pages.__enter__ = MagicMock(return_value=pages)
@@ -25,6 +30,25 @@ class ChromeAutomationProfileTests(unittest.TestCase):
         popen.assert_not_called()
         self.assertEqual(opened.call_args_list[1].args[0].get_method(), "PUT")
         self.assertIn("mail.google.com", opened.call_args_list[1].args[0].full_url)
+
+    def test_mcp_page_url_parser_ignores_current_selected_suffix(self):
+        self.assertEqual(
+            jarvis.extract_page_url(
+                "1: YouTube (https://www.youtube.com/) [selected]"
+            ),
+            "https://www.youtube.com/",
+        )
+
+    def test_existing_unique_automation_tab_restores_ownership(self):
+        page = {"id": "target-1", "type": "page", "url": "https://www.youtube.com/"}
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = __import__("json").dumps([page]).encode()
+        jarvis.managed_cdp_targets["youtube"].clear()
+        with patch("jarvis.urlopen", return_value=response):
+            self.assertTrue(jarvis._ensure_jarvis_chrome_tab("https://www.youtube.com/"))
+        self.assertEqual(jarvis.managed_cdp_targets["youtube"], {"target-1"})
 
     def test_discord_bare_github_open_and_close_do_not_require_profile(self):
         for command in (
@@ -118,6 +142,13 @@ class ChromeAutomationProfileTests(unittest.TestCase):
             server.args[browser_url_index + 1], jarvis.JARVIS_CHROME_DEBUG_URL
         )
         self.assertNotIn("--autoConnect", server.args)
+
+    def test_persistent_mcp_tracks_exact_browser_process(self):
+        with patch("jarvis._jarvis_debug_port_owner_pid", return_value=456), patch(
+            "jarvis._process_has_jarvis_chrome_args", return_value=True
+        ):
+            self.assertFalse(jarvis._mcp_browser_process_is_current(123))
+            self.assertTrue(jarvis._mcp_browser_process_is_current(456))
 
     def test_youtube_uses_dedicated_automation_chrome(self):
         with patch("jarvis.ensure_jarvis_chrome", return_value=True) as ensure, \
