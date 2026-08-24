@@ -36,7 +36,8 @@ def classify_remote_command(command):
         return "forbidden"
     dangerous = (
         "sleep sau", "ngu sau", "suspend", "huy sleep sau", "shutdown",
-        "tat may", "khoi dong lai", "reboot", "xoa file", "dua vao thung rac",
+        "tat may", "tat pc", "khoi dong lai", "reboot", "xoa file",
+        "dua vao thung rac",
     )
     if re.search(
         r"(?:gui|nhan)\s+(?:tin nhan\s+)?(?:zalo\s+)?cho\s+.+\s+(?:voi\s+)?noi dung\s+.+",

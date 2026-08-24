@@ -8,7 +8,9 @@ import jarvis
 
 class ChromeAutomationProfileTests(unittest.TestCase):
     def tearDown(self):
+        jarvis.mcp_session = None
         jarvis.mcp_browser_pid = None
+        jarvis.mcp_page_topology_changed = False
         for targets in jarvis.managed_cdp_targets.values():
             targets.clear()
 
@@ -49,6 +51,39 @@ class ChromeAutomationProfileTests(unittest.TestCase):
         with patch("jarvis.urlopen", return_value=response):
             self.assertTrue(jarvis._ensure_jarvis_chrome_tab("https://www.youtube.com/"))
         self.assertEqual(jarvis.managed_cdp_targets["youtube"], {"target-1"})
+
+    def test_new_cdp_tab_records_ownership_before_url_finishes_loading(self):
+        pages = MagicMock()
+        pages.__enter__.return_value = pages
+        pages.__exit__.return_value = False
+        pages.read.return_value = b"[]"
+        created = MagicMock()
+        created.__enter__.return_value = created
+        created.__exit__.return_value = False
+        created.read.return_value = b'{"id":"youtube-new","type":"page"}'
+        with patch("jarvis.urlopen", side_effect=[pages, created]):
+            self.assertTrue(
+                jarvis._ensure_jarvis_chrome_tab("https://www.youtube.com/")
+            )
+        self.assertEqual(
+            jarvis.managed_cdp_targets["youtube"], {"youtube-new"}
+        )
+        self.assertTrue(jarvis.mcp_page_topology_changed)
+        with patch.object(jarvis, "_cdp_pages", return_value=[{
+            "id": "youtube-new", "type": "page", "url": "about:blank",
+        }]):
+            self.assertTrue(jarvis._record_managed_cdp_target("youtube", set()))
+
+    def test_changed_page_topology_forces_mcp_reconnect(self):
+        jarvis.mcp_session = object()
+        jarvis.mcp_browser_pid = 123
+        jarvis.mcp_page_topology_changed = True
+        reconnect = AsyncMock(side_effect=RuntimeError("reconnect reached"))
+        with patch.object(jarvis, "close_mcp_session", new=reconnect):
+            with self.assertRaisesRegex(RuntimeError, "reconnect reached"):
+                import asyncio
+                asyncio.run(jarvis.get_mcp_session())
+        reconnect.assert_awaited_once_with()
 
     def test_discord_bare_github_open_and_close_do_not_require_profile(self):
         for command in (

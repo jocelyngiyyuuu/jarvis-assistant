@@ -14,6 +14,7 @@ class SecurityPolicyTests(unittest.TestCase):
         self.assertEqual(classify_remote_command("tình trạng hệ thống"), "normal")
         self.assertEqual(classify_remote_command("sleep sâu lúc 23:30"), "confirm")
         self.assertEqual(classify_remote_command("hủy sleep sâu"), "confirm")
+        self.assertEqual(classify_remote_command("tắt PC"), "confirm")
         self.assertEqual(
             classify_remote_command("gửi tin nhắn cho Minh với nội dung test"),
             "confirm",

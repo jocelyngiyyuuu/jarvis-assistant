@@ -72,6 +72,8 @@ class JarvisWindow(Gtk.ApplicationWindow):
         self.set_size_request(900, 600)
         self.last_conversation_id = 0
         self.index_rebuild_running = False
+        self.voice_switch_updating = False
+        self.clap_wake_switch_updating = False
 
         header = Gtk.HeaderBar()
         header.set_title_widget(Gtk.Label(label="Jarvis"))
@@ -121,6 +123,51 @@ class JarvisWindow(Gtk.ApplicationWindow):
         spacer = Gtk.Box()
         spacer.set_vexpand(True)
         sidebar.append(spacer)
+
+        voice_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        voice_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        voice_text.set_hexpand(True)
+        voice_title = Gtk.Label(label="🎙 Giọng nói", xalign=0)
+        voice_title.set_tooltip_text(
+            "Bật hoặc tạm tắt cảm biến vỗ tay và nhận lệnh giọng nói"
+        )
+        voice_text.append(voice_title)
+        self.voice_status_label = Gtk.Label(label="Đang kiểm tra…", xalign=0)
+        self.voice_status_label.add_css_class("muted")
+        voice_text.append(self.voice_status_label)
+        voice_row.append(voice_text)
+        self.voice_enabled_switch = Gtk.Switch(active=False)
+        self.voice_enabled_switch.set_valign(Gtk.Align.CENTER)
+        self.voice_enabled_switch.set_sensitive(False)
+        self.voice_enabled_switch.connect(
+            "notify::active", self._toggle_voice_control
+        )
+        voice_row.append(self.voice_enabled_switch)
+        sidebar.append(voice_row)
+
+        clap_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        clap_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        clap_text.set_hexpand(True)
+        clap_title = Gtk.Label(label="👏 Vỗ tay bật màn hình", xalign=0)
+        clap_title.set_tooltip_text(
+            "Bật hoặc tắt microphone chờ tiếng vỗ khi màn hình sleep"
+        )
+        clap_text.append(clap_title)
+        self.clap_wake_status_label = Gtk.Label(
+            label="Đang kiểm tra…", xalign=0
+        )
+        self.clap_wake_status_label.add_css_class("muted")
+        clap_text.append(self.clap_wake_status_label)
+        clap_row.append(clap_text)
+        self.clap_wake_enabled_switch = Gtk.Switch(active=False)
+        self.clap_wake_enabled_switch.set_valign(Gtk.Align.CENTER)
+        self.clap_wake_enabled_switch.set_sensitive(False)
+        self.clap_wake_enabled_switch.connect(
+            "notify::active", self._toggle_clap_wake_control
+        )
+        clap_row.append(self.clap_wake_enabled_switch)
+        sidebar.append(clap_row)
+
         self.service_label = Gtk.Label(label="● JarvisCore sẵn sàng", xalign=0)
         self.service_label.add_css_class("status-good")
         sidebar.append(self.service_label)
@@ -133,6 +180,8 @@ class JarvisWindow(Gtk.ApplicationWindow):
         # SQLite của Jarvis nhưng không tự đổ lại lên màn hình.
         self.last_conversation_id = CORE.conversation.latest_id()
         GLib.timeout_add(700, self._sync_conversation)
+        GLib.idle_add(self._refresh_voice_control)
+        GLib.idle_add(self._refresh_clap_wake_control)
         GLib.idle_add(self._ensure_file_index_background)
         GLib.timeout_add_seconds(600, self._periodic_index_check)
 
@@ -185,9 +234,10 @@ class JarvisWindow(Gtk.ApplicationWindow):
 
         threading.Thread(target=runner, daemon=True).start()
 
-    def _run_legacy_command(self, command):
+    def _run_legacy_command(self, command, *, silent=False):
         request = json.dumps(
-            {"source": "gtk", "command": command}, ensure_ascii=False
+            {"source": "gtk", "command": command, "silent": silent},
+            ensure_ascii=False,
         ).encode("utf-8") + b"\n"
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(120)
@@ -203,6 +253,133 @@ class JarvisWindow(Gtk.ApplicationWindow):
         if not payload.get("ok"):
             raise RuntimeError(payload.get("response", "Lệnh thất bại."))
         return payload["response"]
+
+    def _set_voice_switch_state(self, enabled, status):
+        self.voice_switch_updating = True
+        self.voice_enabled_switch.set_active(bool(enabled))
+        self.voice_switch_updating = False
+        self.voice_enabled_switch.set_sensitive(True)
+        self.voice_status_label.set_text(status)
+        return False
+
+    def _refresh_voice_control(self):
+        self.voice_enabled_switch.set_sensitive(False)
+        self.voice_status_label.set_text("Đang kiểm tra…")
+
+        def done(response):
+            if response.startswith("Không thể hoàn thành:"):
+                self.voice_enabled_switch.set_sensitive(True)
+                self.voice_status_label.set_text("Không kết nối được")
+                return False
+            paused = "tạm tắt" in response.casefold()
+            enabled = "đang bật" in response.casefold() and not paused
+            if enabled:
+                status = "Đang bật"
+            elif paused:
+                status = "Đã tạm tắt"
+            else:
+                status = "Chưa sẵn sàng"
+            return self._set_voice_switch_state(enabled, status)
+
+        self._run_background(
+            lambda: self._run_legacy_command(
+                "trạng thái giọng nói", silent=True
+            ),
+            done,
+        )
+        return False
+
+    def _toggle_voice_control(self, switch, _parameter):
+        if self.voice_switch_updating:
+            return
+        requested_enabled = switch.get_active()
+        previous_enabled = not requested_enabled
+        switch.set_sensitive(False)
+        self.voice_status_label.set_text(
+            "Đang bật…" if requested_enabled else "Đang tạm tắt…"
+        )
+        command = "bật giọng nói" if requested_enabled else "tắt giọng nói tạm thời"
+
+        def done(response):
+            expected = "đã bật lại" if requested_enabled else "đã tạm tắt"
+            succeeded = (
+                not response.startswith("Không thể hoàn thành:")
+                and expected in response.casefold()
+            )
+            if succeeded:
+                status = "Đang bật" if requested_enabled else "Đã tạm tắt"
+                if hasattr(self, "system_status"):
+                    self.system_status.set_text(response)
+                return self._set_voice_switch_state(requested_enabled, status)
+            self._set_voice_switch_state(previous_enabled, "Không thể thay đổi")
+            if hasattr(self, "system_status"):
+                self.system_status.set_text(response)
+            return False
+
+        self._run_background(lambda: self._run_legacy_command(command), done)
+
+    def _set_clap_wake_switch_state(self, enabled, status):
+        self.clap_wake_switch_updating = True
+        self.clap_wake_enabled_switch.set_active(bool(enabled))
+        self.clap_wake_switch_updating = False
+        self.clap_wake_enabled_switch.set_sensitive(True)
+        self.clap_wake_status_label.set_text(status)
+        return False
+
+    def _refresh_clap_wake_control(self):
+        self.clap_wake_enabled_switch.set_sensitive(False)
+        self.clap_wake_status_label.set_text("Đang kiểm tra…")
+
+        def done(response):
+            if response.startswith("Không thể hoàn thành:"):
+                self.clap_wake_enabled_switch.set_sensitive(True)
+                self.clap_wake_status_label.set_text("Không kết nối được")
+                return False
+            enabled = "đang bật" in response.casefold()
+            return self._set_clap_wake_switch_state(
+                enabled, "Đang bật" if enabled else "Đang tắt"
+            )
+
+        self._run_background(
+            lambda: self._run_legacy_command(
+                "trạng thái vỗ tay bật màn hình", silent=True
+            ),
+            done,
+        )
+        return False
+
+    def _toggle_clap_wake_control(self, switch, _parameter):
+        if self.clap_wake_switch_updating:
+            return
+        requested_enabled = switch.get_active()
+        previous_enabled = not requested_enabled
+        switch.set_sensitive(False)
+        self.clap_wake_status_label.set_text(
+            "Đang bật…" if requested_enabled else "Đang tắt…"
+        )
+        command = "bật vỗ tay" if requested_enabled else "tắt vỗ tay"
+
+        def done(response):
+            expected = "đã bật" if requested_enabled else "đã tắt"
+            succeeded = (
+                not response.startswith("Không thể hoàn thành:")
+                and expected in response.casefold()
+            )
+            if succeeded:
+                if hasattr(self, "system_status"):
+                    self.system_status.set_text(response)
+                return self._set_clap_wake_switch_state(
+                    requested_enabled,
+                    "Đang bật" if requested_enabled else "Đang tắt",
+                )
+            self._set_clap_wake_switch_state(
+                previous_enabled, "Không thể thay đổi"
+            )
+            if hasattr(self, "system_status"):
+                self.system_status.set_text(response)
+            return False
+
+        self._run_background(lambda: self._run_legacy_command(command), done)
 
     def _sync_conversation(self):
         rows = CORE.conversation.since(self.last_conversation_id, limit=100)

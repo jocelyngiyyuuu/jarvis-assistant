@@ -10,6 +10,7 @@ import os
 import signal
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -34,6 +35,7 @@ from jarvis_core.help_catalog import (
 )
 from jarvis_core.security import classify_remote_command, redact_sensitive
 from jarvis_core.text import normalize_text as normalize_core_text
+from jarvis_core.voice_trigger import VoiceTriggerEngine, run_voice_trigger_loop
 from jarvis_core.window_manager import (
     ChromeWindowManager,
     FileWindowManager,
@@ -100,6 +102,54 @@ TTS_PYTHON = TTS_DIR / "VieNeu-TTS" / ".venv" / "bin" / "python"
 TTS_ENGINE = TTS_DIR / "tts_engine.py"
 TTS_ENABLED = True
 tts_process = None
+voice_trigger_engine = None
+voice_trigger_suppressed_until = 0.0
+VOICE_TRIGGER_ENABLED = os.getenv("VOICE_TRIGGER_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+VOICE_TRIGGER_MODEL_PATH = Path(os.getenv(
+    "VOICE_TRIGGER_MODEL_PATH",
+    str(BASE_DIR / ".jarvis_data" / "models" / "vosk-model-small-vn-0.4"),
+)).expanduser()
+VOICE_TRIGGER_SOURCE = os.getenv("VOICE_TRIGGER_SOURCE", "").strip()
+VOICE_TRIGGER_READY_SOUND = os.getenv(
+    "VOICE_TRIGGER_READY_SOUND",
+    "/usr/share/sounds/freedesktop/stereo/message.oga",
+).strip()
+CLAP_SCREEN_WAKE_STATE_PATH = BASE_DIR / ".jarvis_data" / "clap_screen_wake.json"
+
+
+def load_clap_screen_wake_enabled():
+    """Keep the user's clap-to-wake preference across Jarvis restarts."""
+    try:
+        payload = json.loads(
+            CLAP_SCREEN_WAKE_STATE_PATH.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return True
+    return bool(payload.get("enabled", True)) if isinstance(payload, dict) else True
+
+
+def save_clap_screen_wake_enabled(enabled):
+    CLAP_SCREEN_WAKE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CLAP_SCREEN_WAKE_STATE_PATH.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"enabled": bool(enabled)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    temporary.replace(CLAP_SCREEN_WAKE_STATE_PATH)
+
+
+CLAP_SCREEN_WAKE_ENABLED = load_clap_screen_wake_enabled()
+WOL_PC_MAC = os.getenv("WOL_PC_MAC", "").strip()
+WOL_BROADCAST = os.getenv("WOL_BROADCAST", "255.255.255.255").strip()
+try:
+    WOL_PORT = int(os.getenv("WOL_PORT", "9"))
+except ValueError:
+    WOL_PORT = 9
+PC_SSH_USER = os.getenv("PC_SSH_USER", "").strip()
+PC_SSH_HOST = os.getenv("PC_SSH_HOST", "").strip()
 DISCORD_RECONNECT_DELAY_SECONDS = 15
 GMAIL_STATE_PATH = BASE_DIR / ".jarvis_data" / "gmail_state.json"
 GMAIL_ACCOUNT_PATH = BASE_DIR / ".jarvis_data" / "gmail_account.json"
@@ -118,9 +168,11 @@ def _clean_tts_text(text):
     if not value:
         return ""
 
-    # Danh sách YouTube có thể rất dài; chỉ đọc một câu xác nhận ngắn.
+    # Danh sách media có thể rất dài; chỉ đọc một câu xác nhận ngắn.
     if "YOUTUBE -" in value.upper() or "KẾT QUẢ YOUTUBE" in value.upper():
         return "Đã cập nhật danh sách YouTube."
+    if "SOUNDCLOUD -" in value.upper() or "KẾT QUẢ SOUNDCLOUD" in value.upper():
+        return "Đã cập nhật danh sách SoundCloud."
 
     if "KẾT QUẢ FILE" in value.upper() or "KẾT QUẢ THƯ MỤC" in value.upper():
         return "Đã cập nhật danh sách file."
@@ -222,6 +274,7 @@ def speak(text):
     Model VieNeu chỉ load một lần khi worker khởi động.
     """
     global tts_process
+    global voice_trigger_suppressed_until
 
     if not TTS_ENABLED:
         return False
@@ -239,6 +292,13 @@ def speak(text):
 
         # Worker dùng từng dòng stdin làm một câu nói.
         text = text.replace("\n", " ").strip()
+        # Tránh cảm biến nghe lại chính giọng TTS. Thời gian này chỉ là cửa sổ
+        # bảo vệ; detector sẽ tự hoạt động lại sau khi câu nói kết thúc.
+        estimated_seconds = min(18.0, max(2.5, len(text) / 11.0 + 1.5))
+        voice_trigger_suppressed_until = max(
+            voice_trigger_suppressed_until,
+            time.monotonic() + estimated_seconds,
+        )
         tts_process.stdin.write(text + "\n")
         tts_process.stdin.flush()
         return True
@@ -262,8 +322,94 @@ def jarvis_say(text, *, show=True):
 
 def speak_last_response():
     """Đọc phản hồi cuối mà route_command đã lưu cho Terminal/Discord."""
+    if last_spoken_response is False:
+        return
     if last_command_response:
         speak(last_spoken_response or last_command_response)
+
+
+def voice_trigger_is_suppressed():
+    return time.monotonic() < voice_trigger_suppressed_until
+
+
+def normalize_voice_command(command):
+    """Repair common Vietnamese STT spellings for app names."""
+    original = str(command).strip()
+    plain = normalize_core_text(original)
+    youtube_aliases = (
+        "youtube", "you tube", "du tup", "diu tup", "iu tup", "u tup",
+        "du tuyp", "diu tuyp", "iu tuyp",
+    )
+    for verb, canonical in (("mo", "mở"), ("tat", "tắt"), ("dong", "tắt")):
+        if any(plain == f"{verb} {alias}" for alias in youtube_aliases):
+            return f"{canonical} youtube"
+    return original
+
+
+async def announce_voice_ready(_trigger):
+    """Use Jarvis' own TTS voice instead of an ambiguous notification sound."""
+    speak("Jarvis đang nghe.")
+    # Start capture immediately so a second double clap can cancel even while
+    # this acknowledgement is playing. capture_command() ignores TTS for STT.
+    await asyncio.sleep(0.1)
+
+
+async def announce_voice_cancelled():
+    speak("Jarvis đã tắt chế độ nghe.")
+
+
+async def announce_voice_unrecognized():
+    speak("Jarvis chưa nghe rõ, vui lòng thử lại.")
+
+
+async def handle_screen_wake_trigger(_trigger):
+    """Consume a clap/snap as display wake when screen-wake mode is armed."""
+    engine = voice_trigger_engine
+    if (
+        not CLAP_SCREEN_WAKE_ENABLED
+        or engine is None
+        or not engine.screen_wake_armed()
+    ):
+        return False
+    success = wake_screen()
+    engine.disarm_screen_wake()
+    if success:
+        print("Jarvis: Đã bật màn hình bằng cử chỉ âm thanh.", flush=True)
+        speak("Jarvis đã bật màn hình.")
+    else:
+        print("Jarvis: Không thể bật màn hình bằng cử chỉ âm thanh.", flush=True)
+        speak("Jarvis không thể bật màn hình.")
+    return True
+
+
+async def handle_voice_command(command, trigger):
+    """Route a local STT result while blocking risky false recognitions."""
+    global last_command_response
+    command = normalize_voice_command(command)
+    if not command:
+        return False
+    print(
+        f"Bạn (giọng nói/{trigger}): {redact_sensitive(command)}",
+        flush=True,
+    )
+    risk = classify_remote_command(command)
+    if risk != "normal":
+        message = (
+            "⚠️ Lệnh giọng nói này cần xác nhận. "
+            "Hãy thực hiện bằng ứng dụng Jarvis hoặc Discord."
+        )
+        set_command_response(message)
+        speak(message)
+        CORE.security.audit("voice", command, risk, "blocked_voice_confirmation")
+        return False
+    CORE.conversation.add("voice", "user", command)
+    async with discord_command_lock:
+        last_command_response = None
+        await route_command(command, source="voice")
+        response = last_command_response or "✅ Jarvis đã xử lý lệnh giọng nói."
+    CORE.conversation.add("voice", "assistant", response)
+    speak_last_response()
+    return True
 
 
 # ==========================================================
@@ -280,9 +426,11 @@ async def _handle_ipc_client(reader, writer):
                 command = str(request.get("command", "")).strip()
                 original_command = command
                 source = str(request.get("source", "gtk")).strip() or "gtk"
+                silent = bool(request.get("silent", False))
                 if not command:
                     raise ValueError("Lệnh không được để trống.")
-                CORE.conversation.add(source, "user", command)
+                if not silent:
+                    CORE.conversation.add(source, "user", command)
                 command, confirmation_note = resolve_command_confirmation(command, source)
                 async with discord_command_lock:
                     last_command_response = None
@@ -291,9 +439,10 @@ async def _handle_ipc_client(reader, writer):
                     else:
                         await route_command(command, source=source)
                     response = last_command_response or "✅ Jarvis đã xử lý lệnh."
-                if classify_remote_command(command) != "sensitive":
+                if not silent and classify_remote_command(command) != "sensitive":
                     CORE.conversation.add(source, "assistant", response)
-                speak_last_response()
+                if not silent:
+                    speak_last_response()
                 payload = {"ok": True, "response": response}
             except Exception as error:
                 payload = {"ok": False, "response": f"Không thể xử lý lệnh: {error}"}
@@ -341,7 +490,11 @@ youtube_videos = []
 youtube_profile = None
 youtube_profile_name = None
 youtube_page_id = None
-managed_cdp_targets = {"youtube": set(), "zalo": set(), "gmail": set()}
+soundcloud_tracks = []
+soundcloud_page_id = None
+managed_cdp_targets = {
+    "youtube": set(), "soundcloud": set(), "zalo": set(), "gmail": set(),
+}
 
 
 # ==========================================================
@@ -353,6 +506,7 @@ mcp_session_context = None
 mcp_session = None
 mcp_errlog = None
 mcp_browser_pid = None
+mcp_page_topology_changed = False
 
 
 # ==========================================================
@@ -511,6 +665,8 @@ def _automation_site_key(url):
         return "gmail"
     if host == "youtube.com" or host.endswith(".youtube.com"):
         return "youtube"
+    if host == "soundcloud.com" or host.endswith(".soundcloud.com"):
+        return "soundcloud"
     return None
 
 
@@ -526,10 +682,19 @@ def _cdp_pages():
 
 
 def _record_managed_cdp_target(site_key, before_ids):
-    matching = []
     pages = _cdp_pages()
     if pages is None:
         return False
+    owned = managed_cdp_targets.setdefault(site_key, set())
+    current_ids = {page.get("id") for page in pages if page.get("id")}
+    # _ensure_jarvis_chrome_tab đã ghi ownership từ chính response /json/new.
+    # Chấp nhận target mới đó ngay cả khi Chrome chưa cập nhật URL khỏi
+    # about:blank; URL sẽ được kiểm tra lại trước mọi thao tác MCP sau đó.
+    newly_created_owned = owned & (current_ids - set(before_ids))
+    if len(newly_created_owned) == 1:
+        return True
+
+    matching = []
     for page in pages:
         target_id = page.get("id")
         if not target_id or _automation_site_key(page.get("url", "")) != site_key:
@@ -539,12 +704,12 @@ def _record_managed_cdp_target(site_key, before_ids):
     if len(new_ids) == 1:
         managed_cdp_targets.setdefault(site_key, set()).add(new_ids[0])
         return True
-    owned = managed_cdp_targets.setdefault(site_key, set())
     return bool(owned.intersection(matching))
 
 
 def _ensure_jarvis_chrome_tab(url):
     """Open an automation URL through the verified loopback CDP browser."""
+    global mcp_page_topology_changed
     try:
         target = urlparse(url)
         if target.scheme not in {"http", "https"}:
@@ -575,13 +740,27 @@ def _ensure_jarvis_chrome_tab(url):
                 "mail.google.com", "accounts.google.com",
             }:
                 return True
+            if site_key == "soundcloud" and (
+                page_host == "soundcloud.com"
+                or page_host.endswith(".soundcloud.com")
+            ):
+                return True
         encoded_url = quote_plus(str(url))
         request = Request(
             f"{JARVIS_CHROME_DEBUG_URL}/json/new?{encoded_url}", method="PUT"
         )
         with urlopen(request, timeout=4) as response:
             created = json.loads(response.read().decode("utf-8"))
-        return isinstance(created, dict) and created.get("type") == "page"
+        created_page = isinstance(created, dict) and created.get("type") == "page"
+        if created_page:
+            created_id = created.get("id")
+            if site_key and created_id:
+                owned.add(created_id)
+            # chrome-devtools-mcp giữ snapshot page targets của session hiện
+            # tại và có thể chưa thấy tab được tạo trực tiếp qua /json/new.
+            # Đánh dấu để get_mcp_session kết nối lại trước lần đọc kế tiếp.
+            mcp_page_topology_changed = True
+        return created_page
     except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         return False
 
@@ -594,6 +773,8 @@ def _is_automation_url(url, profile=None):
     return (
         host == "youtube.com"
         or host.endswith(".youtube.com")
+        or host == "soundcloud.com"
+        or host.endswith(".soundcloud.com")
         or (host == "chat.zalo.me" and profile == STUDY_PROFILE)
         or (host == "mail.google.com" and profile == STUDY_PROFILE)
     )
@@ -608,6 +789,8 @@ def open_chrome(profile, url):
         target_hint = {
             "chat.zalo.me": "zalo",
             "mail.google.com": "gmail",
+            "soundcloud.com": "soundcloud",
+            "www.soundcloud.com": "soundcloud",
         }.get(automation_host, "youtube")
         before_pages = _cdp_pages() if _jarvis_chrome_ready() else []
         if before_pages is None:
@@ -1055,6 +1238,72 @@ async def extract_videos_from_page(session, limit=10):
     return videos
 
 
+async def extract_soundcloud_tracks_from_page(session, limit=10):
+    """Read playable SoundCloud track links from the currently selected page."""
+    script = r'''() => {
+        const tracks = new Map();
+        const blocked = new Set([
+            'discover', 'search', 'you', 'stream', 'upload', 'settings',
+            'stations', 'charts', 'likes', 'history', 'terms', 'pages',
+            'mobile', 'creators', 'jobs'
+        ]);
+        const selectors = [
+            '.soundList__item a.soundTitle__title[href]',
+            '.searchList__item a.soundTitle__title[href]',
+            '.systemPlaylistTrackList__item a.trackItem__trackTitle[href]',
+            '.playbackSoundBadge__titleLink[href]',
+            'a[itemprop="url"][href]'
+        ];
+        for (const a of document.querySelectorAll(selectors.join(','))) {
+            try {
+                const u = new URL(a.href, location.href);
+                const host = u.hostname.toLowerCase();
+                if (host !== 'soundcloud.com' && !host.endsWith('.soundcloud.com')) continue;
+                const parts = u.pathname.split('/').filter(Boolean);
+                if (parts.length < 2 || blocked.has(parts[0].toLowerCase())) continue;
+                const title = (
+                    a.getAttribute('title') || a.textContent ||
+                    a.getAttribute('aria-label') || ''
+                ).replace(/\s+/g, ' ').trim();
+                if (!title || title.length < 2) continue;
+                u.search = '';
+                u.hash = '';
+                const url = u.href;
+                const current = tracks.get(url);
+                if (!current || title.length > current.title.length) {
+                    tracks.set(url, {title, url});
+                }
+            } catch (_) {
+            }
+        }
+        return Array.from(tracks.values());
+    }'''
+    result = await session.call_tool(
+        "evaluate_script", arguments={"function": script}
+    )
+    raw_tracks = _json_from_mcp_result(result, default=[])
+    if not isinstance(raw_tracks, list):
+        return []
+
+    tracks = []
+    seen = set()
+    for item in raw_tracks:
+        if not isinstance(item, dict):
+            continue
+        title = clean_title(str(item.get("title", "")))
+        url = str(item.get("url", "")).strip()
+        if not title or not _is_soundcloud_track_url(url):
+            continue
+        key = url.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        tracks.append({"title": title, "url": url})
+        if len(tracks) >= limit:
+            break
+    return tracks
+
+
 # ==========================================================
 # TẠO MCP SERVER
 # ==========================================================
@@ -1164,9 +1413,13 @@ async def get_mcp_session():
     global mcp_session
     global mcp_errlog
     global mcp_browser_pid
+    global mcp_page_topology_changed
 
     if mcp_session is not None:
-        if _mcp_browser_process_is_current(mcp_browser_pid):
+        if (
+            not mcp_page_topology_changed
+            and _mcp_browser_process_is_current(mcp_browser_pid)
+        ):
             return mcp_session
         # Chrome automation có thể đã bị người dùng đóng rồi mở lại. MCP cũ
         # vẫn còn process nhưng không tự bám sang browser PID mới, khiến mọi
@@ -1202,6 +1455,7 @@ async def get_mcp_session():
         mcp_session = await mcp_session_context.__aenter__()
         await mcp_session.initialize()
         mcp_browser_pid = browser_pid
+        mcp_page_topology_changed = False
 
         print("Jarvis: Đã kết nối Chrome.")
         print("Jarvis: Kết nối này sẽ được giữ cho tới khi Jarvis thoát.")
@@ -1263,7 +1517,11 @@ async def _find_owned_mcp_pages(session, site_key):
     owned_urls = {
         str(page.get("url", "")).rstrip("/")
         for page in pages
-        if page.get("id") in owned_ids and page.get("url")
+        if (
+            page.get("id") in owned_ids
+            and page.get("url")
+            and _automation_site_key(page.get("url", "")) == site_key
+        )
     }
     if not owned_urls:
         return []
@@ -1279,6 +1537,11 @@ async def _find_owned_mcp_pages(session, site_key):
 
 async def find_youtube_page(session):
     matches = await _find_owned_mcp_pages(session, "youtube")
+    return matches[0][0] if len(matches) == 1 else None
+
+
+async def find_soundcloud_page(session):
+    matches = await _find_owned_mcp_pages(session, "soundcloud")
     return matches[0][0] if len(matches) == 1 else None
 
 
@@ -2176,14 +2439,16 @@ async def open_video(number):
     global youtube_page_id
 
     if not youtube_videos:
-        print()
-        print("Jarvis: Chưa có danh sách video.")
-        print('Jarvis: Hãy dùng "mở youtube" trước.')
-        return
+        message = "ℹ️ Chưa có danh sách video. Hãy dùng `mở YouTube` trước."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
 
     if number < 1 or number > len(youtube_videos):
-        print("Jarvis: Số video không hợp lệ.")
-        return
+        message = "ℹ️ Số video không hợp lệ."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
 
     selected_video = youtube_videos[number - 1]
     selected_title = selected_video["title"]
@@ -2197,16 +2462,17 @@ async def open_video(number):
         selected_url = selected_video.get("url")
 
         if not selected_url:
-            print("Jarvis: Video này chưa có URL hợp lệ.")
-            print('Jarvis: Dùng "làm mới youtube" để cập nhật danh sách.')
-            return
+            message = "❌ Video chưa có URL hợp lệ. Hãy dùng `làm mới YouTube`."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return False
 
         youtube_page_id = await find_youtube_page(session)
         if youtube_page_id is None:
             message = "❌ Không tìm thấy tab YouTube để mở video."
             print(f"Jarvis: {message}")
             set_command_response(message)
-            return
+            return False
 
         await session.call_tool(
             "select_page",
@@ -2223,18 +2489,23 @@ async def open_video(number):
         message = f"▶️ Đã mở video: {selected_title}"
         print(f"Jarvis: {message}")
         set_command_response(message)
+        return True
 
-    except Exception as error:
-        print("Jarvis: Không thể nhấn vào video.")
-        print(f"Jarvis: Chi tiết: {error}")
+    except Exception:
+        message = "❌ Không thể mở video YouTube lúc này."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
 
 
 async def open_video_by_name(query):
     query = clean_title(query)
 
     if not query:
-        print("Jarvis: Bạn chưa nhập tên video.")
-        return
+        message = "ℹ️ Bạn chưa nhập tên video."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
 
     print()
     print(f"Jarvis: Đang tìm video: {query}")
@@ -2244,23 +2515,28 @@ async def open_video_by_name(query):
         _, current_videos = await get_current_youtube_videos(session, limit=40)
 
         if not current_videos:
-            print("Jarvis: Không đọc được video trên tab YouTube hiện tại.")
-            return
+            message = "❌ Không đọc được video trên tab YouTube hiện tại."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return False
 
         selected_video = find_video_by_title(current_videos, query)
 
         if selected_video is None:
-            print("Jarvis: Không tìm thấy video có tên phù hợp trên trang hiện tại.")
-            print('Jarvis: Bạn có thể dùng "làm mới youtube" để xem danh sách.')
-            return
+            message = "ℹ️ Không tìm thấy video phù hợp trên trang YouTube hiện tại."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return False
 
         print("Jarvis: Đã tìm thấy:")
         print(selected_video["title"])
 
         selected_url = selected_video.get("url")
         if not selected_url:
-            print("Jarvis: Video này chưa có URL hợp lệ.")
-            return
+            message = "❌ Video chưa có URL hợp lệ."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return False
 
         await session.call_tool(
             "navigate_page",
@@ -2272,10 +2548,13 @@ async def open_video_by_name(query):
         message = f"▶️ Đã mở video: {selected_video['title']}"
         print(f"Jarvis: {message}")
         set_command_response(message)
+        return True
 
-    except Exception as error:
-        print("Jarvis: Không thể nhấn vào video.")
-        print(f"Jarvis: Chi tiết: {error}")
+    except Exception:
+        message = "❌ Không thể mở video YouTube lúc này."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
 
 
 async def control_youtube_playback(should_play):
@@ -2553,7 +2832,9 @@ async def search_youtube(command):
     query = extract_youtube_search_query(command)
 
     if not query:
-        print("Jarvis: Bạn chưa nhập nội dung cần tìm trên YouTube.")
+        message = "ℹ️ Bạn chưa nhập nội dung cần tìm trên YouTube."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
         return False
 
     print()
@@ -2630,6 +2911,9 @@ async def search_youtube(command):
         if not videos:
             print("Jarvis: Chưa đọc được kết quả tìm kiếm YouTube.")
             print('Jarvis: Thử "làm mới youtube" sau khi trang tải xong.')
+            set_command_response(
+                "⏳ Chưa đọc được kết quả YouTube. Hãy thử `làm mới YouTube`."
+            )
             return False
 
         youtube_videos = videos
@@ -2656,9 +2940,448 @@ async def search_youtube(command):
         )
         return True
 
-    except Exception as error:
-        print("Jarvis: Không thể tìm kiếm trên YouTube.")
-        print(f"Jarvis: Chi tiết: {error}")
+    except Exception:
+        message = "❌ Không thể tìm kiếm YouTube lúc này."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return False
+
+
+# ==========================================================
+# SOUNDCLOUD
+# ==========================================================
+
+def _is_soundcloud_url(value):
+    try:
+        parsed = urlparse(str(value).strip())
+    except (TypeError, ValueError):
+        return False
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme in {"http", "https"} and (
+        host == "soundcloud.com" or host.endswith(".soundcloud.com")
+    )
+
+
+def _is_soundcloud_track_url(value):
+    if not _is_soundcloud_url(value):
+        return False
+    parsed = urlparse(str(value).strip())
+    parts = [part for part in parsed.path.split("/") if part]
+    blocked = {
+        "discover", "search", "you", "stream", "upload", "settings",
+        "stations", "charts", "likes", "history", "terms", "pages",
+        "mobile", "creators", "jobs",
+    }
+    return len(parts) >= 2 and parts[0].casefold() not in blocked
+
+
+def format_soundcloud_list(title, tracks):
+    lines = [f"☁️ **{title}**", ""]
+    for index, track in enumerate(tracks, start=1):
+        lines.append(f"{index}. {track['title']}")
+    lines.extend(["", "Dùng `mở bài SoundCloud 3` hoặc `mở bài SoundCloud <tên>`. "])
+    return "\n".join(lines).rstrip()
+
+
+async def get_current_soundcloud_tracks(session, limit=20, *, bring_to_front=True):
+    global soundcloud_page_id
+    soundcloud_page_id = await find_soundcloud_page(session)
+    if soundcloud_page_id is None:
+        return None, []
+    try:
+        selected = await session.call_tool(
+            "select_page",
+            arguments={
+                "pageId": soundcloud_page_id,
+                "bringToFront": bring_to_front,
+            },
+        )
+        if _is_mcp_tool_error(selected):
+            raise RuntimeError("MCP select_page failed")
+    except Exception:
+        soundcloud_page_id = await find_soundcloud_page(session)
+        if soundcloud_page_id is None:
+            return None, []
+        selected = await session.call_tool(
+            "select_page",
+            arguments={
+                "pageId": soundcloud_page_id,
+                "bringToFront": bring_to_front,
+            },
+        )
+        if _is_mcp_tool_error(selected):
+            return None, []
+    tracks = await extract_soundcloud_tracks_from_page(session, limit=limit)
+    return soundcloud_page_id, tracks
+
+
+async def refresh_soundcloud_tracks(*, attempts=6):
+    global soundcloud_tracks
+    try:
+        session = await get_mcp_session()
+        page_id, tracks = None, []
+        for attempt in range(attempts):
+            page_id, tracks = await get_current_soundcloud_tracks(session, limit=10)
+            if tracks:
+                break
+            if attempt + 1 < attempts:
+                await asyncio.sleep(1.0)
+        if not tracks:
+            message = (
+                "❌ Không tìm thấy tab SoundCloud đang mở."
+                if page_id is None else
+                "⏳ Đã mở SoundCloud nhưng chưa đọc được danh sách bài hát. "
+                "Hãy thử `làm mới SoundCloud`."
+            )
+            set_command_response(message)
+            print(f"Jarvis: {message}")
+            return False
+        soundcloud_tracks = tracks
+        set_command_response(format_soundcloud_list("SOUNDCLOUD - DANH SÁCH MỚI", tracks))
+        print(f"Jarvis: Đã cập nhật {len(tracks)} bài hát SoundCloud.")
+        return True
+    except Exception:
+        message = "❌ Không thể cập nhật danh sách SoundCloud lúc này."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
+
+
+async def open_soundcloud():
+    global soundcloud_tracks, soundcloud_page_id
+    soundcloud_tracks = []
+    try:
+        session = await get_mcp_session()
+        soundcloud_page_id = await find_soundcloud_page(session)
+        if soundcloud_page_id is None:
+            opened = open_chrome(
+                JARVIS_CHROME_PROFILE, "https://soundcloud.com/discover"
+            )
+            if not opened:
+                raise RuntimeError("open failed")
+            await asyncio.sleep(0.8)
+        else:
+            await session.call_tool(
+                "select_page",
+                arguments={"pageId": soundcloud_page_id, "bringToFront": True},
+            )
+    except Exception:
+        message = "❌ Không thể mở SoundCloud lúc này."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
+    return await refresh_soundcloud_tracks()
+
+
+def extract_soundcloud_search_query(command):
+    for pattern in (
+        r"^(?:tìm|tim)\s+soundcloud\s+(.+)$",
+        r"^soundcloud\s+(?:tìm|tim)\s+(.+)$",
+        r"^(?:tìm|tim)\s+(?:bài|bai|nhạc|nhac)\s+soundcloud\s+(.+)$",
+    ):
+        match = re.match(pattern, command.strip(), re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+async def search_soundcloud(command):
+    global soundcloud_tracks, soundcloud_page_id
+    query = extract_soundcloud_search_query(command)
+    if not query:
+        message = "ℹ️ Hãy nói nội dung cần tìm, ví dụ: `tìm SoundCloud nhạc thư giãn`."
+        set_command_response(message)
+        return False
+    search_url = "https://soundcloud.com/search/sounds?q=" + quote_plus(query)
+    try:
+        session = await get_mcp_session()
+        soundcloud_page_id = await find_soundcloud_page(session)
+        if soundcloud_page_id is None:
+            if not open_chrome(JARVIS_CHROME_PROFILE, search_url):
+                raise RuntimeError("open failed")
+            await asyncio.sleep(0.8)
+        else:
+            selected = await session.call_tool(
+                "select_page",
+                arguments={"pageId": soundcloud_page_id, "bringToFront": True},
+            )
+            if _is_mcp_tool_error(selected):
+                raise RuntimeError("select failed")
+            navigated = await session.call_tool(
+                "navigate_page", arguments={"type": "url", "url": search_url}
+            )
+            if _is_mcp_tool_error(navigated):
+                raise RuntimeError("navigate failed")
+        soundcloud_tracks = []
+        for attempt in range(6):
+            _, tracks = await get_current_soundcloud_tracks(session, limit=10)
+            if tracks:
+                soundcloud_tracks = tracks
+                set_command_response(
+                    format_soundcloud_list(f"KẾT QUẢ SOUNDCLOUD: {query}", tracks)
+                )
+                print(f"Jarvis: Đã tìm thấy {len(tracks)} bài trên SoundCloud.")
+                return True
+            if attempt < 5:
+                await asyncio.sleep(1.0)
+        message = "⏳ Chưa đọc được kết quả SoundCloud. Hãy thử `làm mới SoundCloud`."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
+    except Exception:
+        message = "❌ Không thể tìm kiếm SoundCloud lúc này."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
+
+
+async def open_soundcloud_track(number=None, query=""):
+    global soundcloud_tracks, soundcloud_page_id
+    try:
+        session = await get_mcp_session()
+        soundcloud_page_id, current = await get_current_soundcloud_tracks(
+            session, limit=40
+        )
+        candidates = current or soundcloud_tracks
+        if soundcloud_page_id is None:
+            message = "❌ Không tìm thấy tab SoundCloud đang mở."
+            set_command_response(message)
+            return False
+        if number is not None:
+            if number < 1 or number > len(candidates):
+                message = "ℹ️ Số bài SoundCloud không hợp lệ."
+                set_command_response(message)
+                return False
+            selected_track = candidates[number - 1]
+        else:
+            selected_track = find_video_by_title(candidates, clean_title(query))
+            if selected_track is None:
+                message = "ℹ️ Không tìm thấy bài phù hợp trên trang SoundCloud hiện tại."
+                set_command_response(message)
+                return False
+        url = selected_track.get("url", "")
+        if not _is_soundcloud_track_url(url):
+            message = "❌ Link bài SoundCloud không hợp lệ."
+            set_command_response(message)
+            return False
+        navigated = await session.call_tool(
+            "navigate_page", arguments={"type": "url", "url": url}
+        )
+        if _is_mcp_tool_error(navigated):
+            raise RuntimeError("navigate failed")
+        # SoundCloud không tự phát khi chỉ điều hướng tới URL bài hát. Lệnh
+        # "mở bài" có cùng ý nghĩa với YouTube nên chủ động bắt đầu phát.
+        await asyncio.sleep(0.6)
+        started = await control_soundcloud_playback(True)
+        title = clean_title(selected_track.get("title", ""))
+        prefix = "▶️ Đã mở và phát bài SoundCloud" if started else "✅ Đã mở bài SoundCloud"
+        message = f"{prefix}{f': {title}' if title else '.'}"
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+    except Exception:
+        message = "❌ Không thể mở bài SoundCloud lúc này."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
+
+
+async def control_soundcloud_playback(should_play):
+    global soundcloud_page_id
+    try:
+        session = await get_mcp_session()
+        soundcloud_page_id = await find_soundcloud_page(session)
+        if soundcloud_page_id is None:
+            message = "❌ Không tìm thấy tab SoundCloud đang mở."
+            set_command_response(message)
+            return False
+        await session.call_tool(
+            "select_page",
+            arguments={"pageId": soundcloud_page_id, "bringToFront": True},
+        )
+        action = "play" if should_play else "pause"
+        script = f'''async () => {{
+            const audio = document.querySelector('audio');
+            const button = document.querySelector('.playControl');
+            try {{
+                if (audio && '{action}' === 'pause') {{
+                    audio.pause();
+                }} else if (audio && '{action}' === 'play') {{
+                    try {{
+                        await audio.play();
+                    }} catch (_) {{
+                        if (button) button.click();
+                        else return {{ok: false}};
+                    }}
+                }} else if (button) {{
+                    const isPlaying = button.classList.contains('playing') ||
+                        button.getAttribute('aria-label')?.toLowerCase().includes('pause');
+                    if (('{action}' === 'play') !== isPlaying) button.click();
+                }} else {{
+                    return {{ok: false}};
+                }}
+                return {{ok: true}};
+            }} catch (_) {{ return {{ok: false}}; }}
+        }}'''
+        result = await session.call_tool(
+            "evaluate_script", arguments={"function": script}
+        )
+        state = _json_from_mcp_result(result, default={})
+        if _is_mcp_tool_error(result) or not isinstance(state, dict) or not state.get("ok"):
+            raise RuntimeError("playback failed")
+        message = "▶️ Đã phát tiếp SoundCloud." if should_play else "⏸️ Đã tạm dừng SoundCloud."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+    except Exception:
+        message = "❌ Không thể điều khiển SoundCloud lúc này."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return False
+
+
+def is_soundcloud_now_playing_command(command):
+    plain = re.sub(r"[?!.,;:]+$", "", normalize_core_text(command)).strip()
+    return plain in {
+        "soundcloud dang phat gi", "soundcloud dang mo bai gi",
+        "bai soundcloud dang phat", "bai soundcloud dang phat gi",
+    }
+
+
+async def report_soundcloud_now_playing():
+    global soundcloud_page_id
+    try:
+        session = await get_mcp_session()
+        soundcloud_page_id = await find_soundcloud_page(session)
+        if soundcloud_page_id is None:
+            message = "❌ Không tìm thấy tab SoundCloud đang mở."
+            set_command_response(message)
+            return True
+        selected = await session.call_tool(
+            "select_page",
+            arguments={"pageId": soundcloud_page_id, "bringToFront": False},
+        )
+        if _is_mcp_tool_error(selected):
+            raise RuntimeError("select failed")
+        script = r'''() => {
+            const text = selector => (document.querySelector(selector)?.textContent || '')
+                .replace(/\s+/g, ' ').trim();
+            const link = document.querySelector('.playbackSoundBadge__titleLink');
+            const artistLink = document.querySelector('.playbackSoundBadge__lightLink');
+            const audio = document.querySelector('audio');
+            return {
+                ok: Boolean(link || audio),
+                title: (link?.getAttribute('title') ||
+                    link?.querySelector('[aria-hidden="true"]')?.textContent ||
+                    text('.playbackSoundBadge__titleLink')).replace(/\s+/g, ' ').trim(),
+                artist: (artistLink?.getAttribute('title') ||
+                    artistLink?.querySelector('[aria-hidden="true"]')?.textContent ||
+                    text('.playbackSoundBadge__lightLink')).replace(/\s+/g, ' ').trim(),
+                paused: audio ? Boolean(audio.paused) :
+                    !document.querySelector('.playControl.playing'),
+                ended: audio ? Boolean(audio.ended) : false,
+                currentTime: audio && Number.isFinite(audio.currentTime) ? audio.currentTime : 0,
+                duration: audio && Number.isFinite(audio.duration) ? audio.duration : 0,
+                trackUrl: link?.href || '',
+                pageUrl: location.href
+            };
+        }'''
+        result = await session.call_tool("evaluate_script", arguments={"function": script})
+        state = _json_from_mcp_result(result, default={})
+        if _is_mcp_tool_error(result) or not isinstance(state, dict) or not _is_soundcloud_url(
+            state.get("pageUrl", "")
+        ):
+            raise RuntimeError("invalid state")
+        if not state.get("ok"):
+            message = "ℹ️ SoundCloud chưa phát bài nào."
+        else:
+            title = _escape_discord_text(state.get("title", "")) or "Không rõ tiêu đề"
+            artist = _escape_discord_text(state.get("artist", ""))
+            playback = "Đã kết thúc" if state.get("ended") else (
+                "Tạm dừng" if state.get("paused") else "Đang phát"
+            )
+            lines = [f"☁️ **{title}**"]
+            if artist:
+                lines.append(f"Nghệ sĩ: {artist}")
+            lines.append(f"Trạng thái: {playback}")
+            current_seconds = float(state.get("currentTime") or 0)
+            duration_seconds = float(state.get("duration") or 0)
+            current = _format_media_time(current_seconds)
+            duration = _format_media_time(duration_seconds)
+            if current_seconds > 0 or duration_seconds > 0:
+                lines.append(f"Thời gian: {current}{f' / {duration}' if duration else ''}")
+            track_url = str(state.get("trackUrl", "")).strip()
+            if _is_soundcloud_track_url(track_url):
+                lines.append(f"Link: {track_url}")
+            message = "\n".join(lines)
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+    except Exception:
+        soundcloud_page_id = None
+        message = "❌ Không thể đọc trạng thái SoundCloud lúc này."
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+
+
+async def close_soundcloud():
+    global soundcloud_tracks, soundcloud_page_id
+    closed = await close_managed_web_tab(
+        "soundcloud", "SoundCloud", ("https://soundcloud.com/",)
+    )
+    if closed:
+        soundcloud_tracks = []
+        soundcloud_page_id = None
+    return closed
+
+
+async def show_soundcloud():
+    global soundcloud_page_id
+    try:
+        session = await get_mcp_session()
+        soundcloud_page_id = await find_soundcloud_page(session)
+        if soundcloud_page_id is None:
+            message = "❌ Không tìm thấy tab SoundCloud đang mở."
+            set_command_response(message)
+            return False
+        selected = await session.call_tool(
+            "select_page",
+            arguments={"pageId": soundcloud_page_id, "bringToFront": True},
+        )
+        if _is_mcp_tool_error(selected):
+            raise RuntimeError("select failed")
+        message = "✅ Đã hiện SoundCloud."
+        set_command_response(message)
+        return True
+    except Exception:
+        message = "❌ Không thể hiện SoundCloud lúc này."
+        set_command_response(message)
+        return False
+
+
+async def go_soundcloud_home():
+    global soundcloud_tracks, soundcloud_page_id
+    try:
+        session = await get_mcp_session()
+        soundcloud_page_id = await find_soundcloud_page(session)
+        if soundcloud_page_id is None:
+            return await open_soundcloud()
+        await session.call_tool(
+            "select_page",
+            arguments={"pageId": soundcloud_page_id, "bringToFront": True},
+        )
+        navigated = await session.call_tool(
+            "navigate_page",
+            arguments={"type": "url", "url": "https://soundcloud.com/discover"},
+        )
+        if _is_mcp_tool_error(navigated):
+            raise RuntimeError("navigate failed")
+        soundcloud_tracks = []
+        return await refresh_soundcloud_tracks()
+    except Exception:
+        message = "❌ Không thể về trang chủ SoundCloud lúc này."
+        set_command_response(message)
         return False
 
 
@@ -2703,8 +3426,9 @@ async def show_youtube():
         youtube_page_id = await find_youtube_page(session)
 
         if youtube_page_id is None:
-            print("Jarvis: Không tìm thấy tab YouTube đang mở.")
-            print('Jarvis: Hãy dùng "mở youtube cá nhân" hoặc "mở youtube học" trước.')
+            message = "❌ Không tìm thấy tab YouTube đang mở."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
             return False
 
         try:
@@ -2721,7 +3445,9 @@ async def show_youtube():
             youtube_page_id = await find_youtube_page(session)
 
             if youtube_page_id is None:
-                print("Jarvis: Không tìm thấy tab YouTube đang mở.")
+                message = "❌ Không tìm thấy tab YouTube đang mở."
+                print(f"Jarvis: {message}")
+                set_command_response(message)
                 return False
 
             await session.call_tool(
@@ -2732,12 +3458,15 @@ async def show_youtube():
                 },
             )
 
-        print("Jarvis: Đã quay lại YouTube.")
+        message = "✅ Đã hiện YouTube."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
         return True
 
-    except Exception as error:
-        print("Jarvis: Không thể quay lại YouTube.")
-        print(f"Jarvis: Chi tiết: {error}")
+    except Exception:
+        message = "❌ Không thể hiện YouTube lúc này."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
         return False
 
 
@@ -2746,104 +3475,22 @@ async def show_youtube():
 # ==========================================================
 
 async def close_youtube():
-    """
-    Đóng đúng tab YouTube mà Jarvis đang điều khiển.
-
-    - Nếu Chrome còn tab khác: chọn tab khác trước rồi đóng YouTube.
-    - Nếu YouTube là tab cuối cùng: đổi tab đó thành New Tab để giữ Chrome mở.
-    """
+    """Đóng đúng tab YouTube thuộc lifecycle của Jarvis."""
     global youtube_videos
-    global youtube_profile
-    global youtube_profile_name
     global youtube_page_id
 
     print()
     print("Jarvis: Đang tắt YouTube...")
-
-    try:
-        session = await get_mcp_session()
-
-        # Ownership is lifecycle-local. Never adopt a URL-matching tab after restart.
-        youtube_page_id = await find_youtube_page(session)
-        if youtube_page_id is None:
-            print("Jarvis: Không còn xác minh được tab YouTube nào do Jarvis mở.")
-            return False
-
-        # Lấy danh sách toàn bộ tab để biết YouTube có phải tab cuối hay không.
-        pages_result = await session.call_tool(
-            "list_pages",
-            arguments={},
-        )
-        if _is_mcp_tool_error(pages_result):
-            raise RuntimeError("MCP list_pages failed")
-
-        pages_text = result_to_text(pages_result)
-        all_page_ids = []
-
-        for line in pages_text.splitlines():
-            page_id = extract_page_id(line)
-
-            if page_id is not None and page_id not in all_page_ids:
-                all_page_ids.append(page_id)
-
-        other_page_ids = [
-            page_id
-            for page_id in all_page_ids
-            if page_id != youtube_page_id
-        ]
-
-        if other_page_ids:
-            closed_result = await session.call_tool(
-                "close_page",
-                arguments={
-                    "pageId": youtube_page_id,
-                },
-            )
-            if _is_mcp_tool_error(closed_result):
-                raise RuntimeError("MCP close_page failed")
-
-            print("Jarvis: Đã tắt tab YouTube. Chrome vẫn đang chạy.")
-
-        else:
-            # Chrome DevTools MCP không cho close_page() đóng tab cuối cùng.
-            # Vì vậy đổi tab YouTube cuối cùng thành New Tab,
-            # đạt mục tiêu rời YouTube nhưng vẫn giữ Chrome mở.
-            selected_result = await session.call_tool(
-                "select_page",
-                arguments={
-                    "pageId": youtube_page_id,
-                    "bringToFront": True,
-                },
-            )
-            if _is_mcp_tool_error(selected_result):
-                raise RuntimeError("MCP select_page failed")
-
-            navigated_result = await session.call_tool(
-                "navigate_page",
-                arguments={
-                    "type": "url",
-                    "url": "chrome://newtab/",
-                },
-            )
-            if _is_mcp_tool_error(navigated_result):
-                raise RuntimeError("MCP navigate_page failed")
-
-            print(
-                "Jarvis: YouTube là tab Chrome cuối cùng, "
-                "nên đã chuyển nó về New Tab."
-            )
-            print("Jarvis: Chrome vẫn đang chạy.")
-
-        # Xóa state cũ vì UID/video/page ID của YouTube không còn hợp lệ.
+    closed = await close_managed_web_tab(
+        "youtube", "YouTube", ("https://www.youtube.com/",)
+    )
+    if closed:
         youtube_videos = []
         youtube_page_id = None
-
-        return True
-
-    except Exception as error:
-        print("Jarvis: Không thể tắt YouTube.")
-        print(f"Jarvis: Chi tiết: {error}")
-        return False
+        set_command_response("✅ Đã đóng YouTube.", spoken_message="Đã đóng YouTube.")
+    elif last_command_response is None:
+        set_command_response("❌ Không thể đóng YouTube lúc này.")
+    return closed
 
 
 # ==========================================================
@@ -2896,6 +3543,7 @@ async def go_youtube_home():
                 profile, profile_name = choose_chrome_profile("")
 
             if profile is None:
+                set_command_response("❌ Chưa chọn được Chrome để mở YouTube.")
                 return False
 
             youtube_profile = profile
@@ -2933,6 +3581,9 @@ async def go_youtube_home():
         if not videos:
             print("Jarvis: Đã về trang chủ nhưng chưa đọc được danh sách video.")
             print('Jarvis: Thử "làm mới youtube" sau khi trang tải xong.')
+            set_command_response(
+                "✅ Đã về trang chủ YouTube nhưng danh sách video chưa tải xong."
+            )
             return True
 
         youtube_videos = videos
@@ -2959,9 +3610,10 @@ async def go_youtube_home():
         )
         return True
 
-    except Exception as error:
-        print("Jarvis: Không thể về trang chủ YouTube.")
-        print(f"Jarvis: Chi tiết: {error}")
+    except Exception:
+        message = "❌ Không thể về trang chủ YouTube lúc này."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
         return False
 
 
@@ -3079,10 +3731,18 @@ def search_google(command, *, allow_prompt=True):
         f"bằng {profile_name}..."
     )
 
-    return open_chrome(
+    opened = open_chrome(
         profile,
         url,
     )
+    message = (
+        f"✅ Đã mở kết quả Google cho: {query}"
+        if opened is not False else
+        "❌ Không thể mở kết quả Google lúc này."
+    )
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return opened is not False
 
 
 # ==========================================================
@@ -3823,10 +4483,10 @@ def show_desktop():
         )
 
         if result.returncode == 0:
-            print(
-                "Jarvis: Đã về Desktop. Chrome vẫn đang chạy."
-            )
-            return
+            message = "✅ Đã về Desktop. Các ứng dụng vẫn đang chạy."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return True
 
     except FileNotFoundError:
         pass
@@ -3841,21 +4501,18 @@ def show_desktop():
         )
 
         if result.returncode == 0:
-            print(
-                "Jarvis: Đã về Desktop. Chrome vẫn đang chạy."
-            )
-            return
+            message = "✅ Đã về Desktop. Các ứng dụng vẫn đang chạy."
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return True
 
     except FileNotFoundError:
         pass
 
-    print()
-    print(
-        "Jarvis: Chưa thể điều khiển Desktop trên phiên làm việc hiện tại."
-    )
-    print(
-        "Jarvis: Cài wmctrl bằng: sudo apt install wmctrl"
-    )
+    message = "❌ Chưa thể điều khiển Desktop trên phiên làm việc hiện tại."
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return False
 
 
 
@@ -3864,10 +4521,12 @@ def show_desktop():
 # ==========================================================
 
 def set_command_response(message, *, spoken_message=None):
-    """Lưu phản hồi cuối để Discord có thể gửi lại cho người dùng."""
+    """Lưu phản hồi; ``spoken_message=False`` tắt TTS cho phản hồi đó."""
     global last_command_response, last_spoken_response
     last_command_response = message
-    last_spoken_response = spoken_message or message
+    last_spoken_response = (
+        False if spoken_message is False else (spoken_message or message)
+    )
 
 
 def format_youtube_list(title, videos):
@@ -4934,6 +5593,98 @@ SCREEN_WAKE_COMMANDS = {
     "screen on",
 }
 
+WOL_PC_COMMANDS = {
+    "bật pc",
+    "bat pc",
+    "bật máy tính",
+    "bat may tinh",
+    "bật máy tính pc",
+    "bat may tinh pc",
+    "bật máy tính của tôi",
+    "bat may tinh cua toi",
+    "đánh thức pc",
+    "danh thuc pc",
+    "wake pc",
+    "wake on lan pc",
+}
+
+REMOTE_PC_SHUTDOWN_COMMANDS = {
+    "tắt pc",
+    "tat pc",
+    "tắt máy tính",
+    "tat may tinh",
+    "tắt máy tính pc",
+    "tat may tinh pc",
+    "shutdown pc",
+}
+
+
+def build_wol_magic_packet(mac_address):
+    """Create a standard Wake-on-LAN packet from a configured MAC address."""
+    compact = re.sub(r"[^0-9A-Fa-f]", "", str(mac_address))
+    if len(compact) != 12:
+        raise ValueError("địa chỉ MAC phải gồm 12 ký tự hexadecimal")
+    try:
+        mac_bytes = bytes.fromhex(compact)
+    except ValueError as error:
+        raise ValueError("địa chỉ MAC không hợp lệ") from error
+    return b"\xff" * 6 + mac_bytes * 16
+
+
+def send_wake_on_lan(
+    mac_address=None, *, broadcast=None, port=None, repeat=3
+):
+    """Broadcast magic packets from the always-on Jarvis device."""
+    target_mac = str(mac_address or WOL_PC_MAC).strip()
+    if not target_mac:
+        raise ValueError("chưa cấu hình WOL_PC_MAC")
+    target_broadcast = str(broadcast or WOL_BROADCAST).strip()
+    target_port = WOL_PORT if port is None else int(port)
+    if not 1 <= target_port <= 65535:
+        raise ValueError("WOL_PORT phải nằm trong khoảng 1-65535")
+    packet = build_wol_magic_packet(target_mac)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for _ in range(max(1, int(repeat))):
+            client.sendto(packet, (target_broadcast, target_port))
+    return max(1, int(repeat))
+
+
+def shutdown_remote_pc(user=None, host=None):
+    """Shut down the configured Windows PC over non-interactive SSH."""
+    target_user = str(user or PC_SSH_USER).strip()
+    target_host = str(host or PC_SSH_HOST).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", target_user):
+        raise ValueError("PC_SSH_USER chưa được cấu hình hợp lệ")
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", target_host):
+        raise ValueError("PC_SSH_HOST chưa được cấu hình hợp lệ")
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-o", "ConnectionAttempts=1",
+                f"{target_user}@{target_host}",
+                "shutdown /s /t 0",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise OSError("không tìm thấy chương trình ssh") from error
+    except subprocess.TimeoutExpired as error:
+        raise OSError("kết nối SSH quá thời gian") from error
+    if result.returncode != 0:
+        raise OSError(
+            "SSH thất bại; hãy kiểm tra PC đang bật, OpenSSH Server, "
+            "SSH key và known_hosts"
+        )
+    return True
+
 
 def is_deep_sleep_command(command):
     return command.strip().lower() in DEEP_SLEEP_COMMANDS
@@ -4945,6 +5696,14 @@ def is_screen_sleep_command(command):
 
 def is_screen_wake_command(command):
     return command.strip().lower() in SCREEN_WAKE_COMMANDS
+
+
+def is_wol_pc_command(command):
+    return command.strip().lower() in WOL_PC_COMMANDS
+
+
+def is_remote_pc_shutdown_command(command):
+    return command.strip().lower() in REMOTE_PC_SHUTDOWN_COMMANDS
 
 
 def wake_screen():
@@ -4960,6 +5719,8 @@ def wake_screen():
                 check=False,
             )
             if result.returncode == 0:
+                if voice_trigger_engine is not None:
+                    voice_trigger_engine.disarm_screen_wake()
                 return True
         except FileNotFoundError:
             pass
@@ -4979,9 +5740,31 @@ def wake_screen():
             stderr=subprocess.DEVNULL,
             check=False,
         )
-        return result.returncode == 0
+        success = result.returncode == 0
+        if success and voice_trigger_engine is not None:
+            voice_trigger_engine.disarm_screen_wake()
+        return success
     except FileNotFoundError:
         return False
+
+
+def configure_clap_screen_wake_after_sleep():
+    """Arm temporary microphone capture only when the user allows it."""
+    if voice_trigger_engine is None:
+        return
+    if CLAP_SCREEN_WAKE_ENABLED:
+        voice_trigger_engine.arm_screen_wake()
+    else:
+        voice_trigger_engine.disarm_screen_wake()
+
+
+def set_clap_screen_wake_enabled(enabled):
+    """Change clap/snap screen wake independently of voice recognition."""
+    global CLAP_SCREEN_WAKE_ENABLED
+    CLAP_SCREEN_WAKE_ENABLED = bool(enabled)
+    if voice_trigger_engine is not None and not CLAP_SCREEN_WAKE_ENABLED:
+        voice_trigger_engine.disarm_screen_wake()
+    save_clap_screen_wake_enabled(CLAP_SCREEN_WAKE_ENABLED)
 
 
 def deep_sleep_machine(*, source="command"):
@@ -5069,6 +5852,7 @@ def sleep_screen_only():
             )
             if result.returncode == 0:
                 print("Jarvis: Đã tắt màn hình bằng X11 DPMS. Nhạc vẫn tiếp tục chạy.")
+                configure_clap_screen_wake_after_sleep()
                 return True
             print(f"Jarvis: xset thất bại (code {result.returncode}).")
         except FileNotFoundError:
@@ -5092,6 +5876,7 @@ def sleep_screen_only():
 
         if result.returncode == 0:
             print("Jarvis: Đã sleep màn hình bằng GNOME D-Bus. Nhạc/Jarvis/Discord vẫn chạy.")
+            configure_clap_screen_wake_after_sleep()
             return True
 
         detail = (result.stderr or result.stdout or "").strip()
@@ -5553,8 +6338,10 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         print(f"Jarvis: {last_command_response}")
         return True
 
-    # Truy vấn chỉ đọc phải được nhận diện trước local AI. Hàm này không
-    # phát/dừng video, reload trang hoặc đưa Chrome ra trước màn hình.
+    # Truy vấn chỉ đọc phải được nhận diện trước local AI. Các hàm này không
+    # phát/dừng media, reload trang hoặc đưa Chrome ra trước màn hình.
+    if is_soundcloud_now_playing_command(command):
+        return await report_soundcloud_now_playing()
     if is_youtube_now_playing_command(command):
         return await report_youtube_now_playing()
 
@@ -5645,6 +6432,28 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         )
 
     # ------------------------------------------------------
+    # WAKE-ON-LAN CHO PC KHÁC TRONG CÙNG MẠNG
+    # ------------------------------------------------------
+
+    if is_wol_pc_command(command):
+        try:
+            send_wake_on_lan()
+            set_command_response("🖥️ Đã bật PC.")
+        except (OSError, ValueError) as error:
+            set_command_response(f"❌ Không thể gửi Wake-on-LAN: {error}.")
+        print(f"Jarvis: {last_command_response}")
+        return True
+
+    if is_remote_pc_shutdown_command(command):
+        try:
+            shutdown_remote_pc()
+            set_command_response("🖥️ Đã tắt PC.")
+        except (OSError, ValueError) as error:
+            set_command_response(f"❌ Không thể tắt PC qua SSH: {error}.")
+        print(f"Jarvis: {last_command_response}")
+        return True
+
+    # ------------------------------------------------------
     # BẬT LẠI MÀN HÌNH - KHÔNG BỎ QUA KHÓA/MẬT KHẨU
     # ------------------------------------------------------
 
@@ -5670,7 +6479,10 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
     if is_screen_sleep_command(command):
         if sleep_screen_only():
             set_command_response(
-                "🌙 Đã sleep màn hình. Nhạc, Jarvis và Discord vẫn tiếp tục chạy."
+                "🌙 Đã sleep màn hình. Nhạc, Jarvis và Discord vẫn tiếp tục chạy.",
+                # Speaking after the display is blanked is picked up by the
+                # deliberately sensitive screen-wake impulse detector.
+                spoken_message=False,
             )
         else:
             set_command_response("❌ Jarvis không thể sleep màn hình.")
@@ -5692,6 +6504,184 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
     # ------------------------------------------------------
 
     if handle_volume_command(command):
+        return True
+
+    voice_control = normalize_core_text(command)
+    if voice_control in {
+        "tat vo tay", "tat vo tay bat man hinh", "tat vo tay de bat man hinh",
+        "tat tinh nang vo tay", "tat cam bien vo tay",
+    }:
+        try:
+            set_clap_screen_wake_enabled(False)
+            set_command_response(
+                "👏 Đã tắt vỗ tay để bật màn hình. Jarvis sẽ không mở "
+                "microphone chờ tiếng vỗ khi màn hình sleep."
+            )
+        except OSError as error:
+            set_command_response(f"❌ Không thể lưu cài đặt vỗ tay: {error}")
+        print(f"Jarvis: {last_command_response}")
+        return True
+
+    if voice_control in {
+        "bat vo tay", "bat vo tay bat man hinh", "bat vo tay de bat man hinh",
+        "bat tinh nang vo tay", "bat cam bien vo tay",
+    }:
+        try:
+            set_clap_screen_wake_enabled(True)
+            set_command_response(
+                "👏 Đã bật vỗ tay để bật màn hình. Tính năng sẽ sẵn sàng "
+                "mỗi khi Jarvis tắt màn hình."
+            )
+        except OSError as error:
+            set_command_response(f"❌ Không thể lưu cài đặt vỗ tay: {error}")
+        print(f"Jarvis: {last_command_response}")
+        return True
+
+    if voice_control in {
+        "trang thai vo tay", "vo tay bat man hinh",
+        "trang thai vo tay bat man hinh",
+    }:
+        message = (
+            "👏 Vỗ tay để bật màn hình đang bật."
+            if CLAP_SCREEN_WAKE_ENABLED else
+            "🔇 Vỗ tay để bật màn hình đang tắt."
+        )
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+
+    if voice_control in {
+        "tat giong noi", "tat giong noi tam thoi", "tat cam bien giong noi",
+        "tat cam bien am thanh", "tam dung giong noi", "tam dung cam bien",
+    }:
+        if voice_trigger_engine is None:
+            set_command_response("ℹ️ Cảm biến giọng nói chưa hoạt động.")
+        else:
+            voice_trigger_engine.pause()
+            set_command_response(
+                "🔇 Đã tạm tắt cảm biến vỗ tay và giọng nói. "
+                "Dùng `bật giọng nói` để khôi phục."
+            )
+        print(f"Jarvis: {last_command_response}")
+        return True
+
+    if voice_control in {
+        "bat giong noi", "bat lai giong noi", "bat cam bien giong noi",
+        "bat cam bien am thanh", "tiep tuc giong noi", "tiep tuc cam bien",
+    }:
+        if voice_trigger_engine is None:
+            set_command_response("ℹ️ Cảm biến giọng nói chưa hoạt động.")
+        else:
+            voice_trigger_engine.resume()
+            set_command_response("🎙️ Đã bật lại cảm biến vỗ tay và giọng nói.")
+        print(f"Jarvis: {last_command_response}")
+        return True
+
+    if voice_control in {
+        "trang thai cam bien am thanh", "cam bien am thanh",
+        "trang thai giong noi", "microphone jarvis",
+    }:
+        paused = bool(
+            voice_trigger_engine is not None
+            and voice_trigger_engine.is_paused()
+        )
+        ready = bool(
+            VOICE_TRIGGER_ENABLED
+            and voice_trigger_engine is not None
+            and voice_trigger_engine.available()
+            and not voice_trigger_engine.stop_event.is_set()
+            and not paused
+        )
+        message = (
+            "🔇 Cảm biến vỗ tay và giọng nói đang tạm tắt. "
+            "Dùng `bật giọng nói` để khôi phục."
+            if paused else
+            "🎙️ Cảm biến âm thanh đang bật. Vỗ tay 2 lần hoặc búng tay "
+            "1 lần, chờ Jarvis nói 'Jarvis đang nghe' xong rồi nói lệnh."
+            if ready else
+            "ℹ️ Cảm biến âm thanh chưa hoạt động. Hãy kiểm tra model, microphone "
+            "và cấu hình VOICE_TRIGGER_ENABLED."
+        )
+        set_command_response(message)
+        print(f"Jarvis: {message}")
+        return True
+
+    # ------------------------------------------------------
+    # SOUNDCLOUD
+    # ------------------------------------------------------
+
+    if extract_soundcloud_search_query(command):
+        await search_soundcloud(command)
+        return True
+
+    soundcloud_number = re.fullmatch(
+        r"(?:mở|mo)\s+(?:bài|bai|nhạc|nhac)?\s*soundcloud\s+(\d+)",
+        command,
+        re.IGNORECASE,
+    )
+    if soundcloud_number:
+        await open_soundcloud_track(number=int(soundcloud_number.group(1)))
+        return True
+
+    soundcloud_name = re.fullmatch(
+        r"(?:mở|mo)\s+(?:bài|bai|nhạc|nhac)\s+soundcloud\s+(.+)",
+        command,
+        re.IGNORECASE,
+    )
+    if soundcloud_name:
+        await open_soundcloud_track(query=soundcloud_name.group(1).strip())
+        return True
+
+    if command_lower in {
+        "dừng soundcloud", "dung soundcloud", "tạm dừng soundcloud",
+        "tam dung soundcloud", "pause soundcloud",
+    }:
+        await control_soundcloud_playback(False)
+        return True
+
+    if command_lower in {
+        "phát soundcloud", "phat soundcloud", "phát tiếp soundcloud",
+        "phat tiep soundcloud", "tiếp tục soundcloud", "tiep tuc soundcloud",
+        "play soundcloud", "resume soundcloud",
+    }:
+        await control_soundcloud_playback(True)
+        return True
+
+    if command_lower in {
+        "làm mới soundcloud", "lam moi soundcloud", "refresh soundcloud",
+        "cập nhật soundcloud", "cap nhat soundcloud",
+    }:
+        await refresh_soundcloud_tracks()
+        return True
+
+    if command_lower in {
+        "hiện soundcloud", "hien soundcloud", "mở lại soundcloud",
+        "mo lai soundcloud", "quay lại soundcloud", "quay lai soundcloud",
+        "show soundcloud",
+    }:
+        await show_soundcloud()
+        return True
+
+    if command_lower in {
+        "trang chủ soundcloud", "trang chu soundcloud", "soundcloud home",
+        "home soundcloud", "về soundcloud", "ve soundcloud",
+    }:
+        await go_soundcloud_home()
+        return True
+
+    if command_lower in {
+        "tắt soundcloud", "tat soundcloud", "đóng soundcloud",
+        "dong soundcloud", "đóng tab soundcloud", "dong tab soundcloud",
+        "thoát soundcloud", "thoat soundcloud", "close soundcloud",
+    }:
+        await close_soundcloud()
+        return True
+
+    if command_lower in {
+        "soundcloud", "mở soundcloud", "mo soundcloud",
+        "vào soundcloud", "vao soundcloud",
+    }:
+        await open_soundcloud()
         return True
 
     # ------------------------------------------------------
@@ -6834,7 +7824,6 @@ async def start_discord_bot():
                 screen_sleep_message,
                 mention_author=False,
             )
-            speak(screen_sleep_message)
             await asyncio.sleep(0.4)
             sleep_screen_only()
             return
@@ -6990,6 +7979,7 @@ def acquire_instance_lock():
     return False
 
 async def main():
+    global voice_trigger_engine
     if not acquire_instance_lock():
         return
 
@@ -7016,6 +8006,32 @@ async def main():
     discord_task = asyncio.create_task(supervise_discord_bot())
     reminder_task = asyncio.create_task(reminder_dispatch_loop())
     gmail_task = asyncio.create_task(gmail_monitor_loop())
+    voice_task = None
+    if VOICE_TRIGGER_ENABLED:
+        voice_trigger_engine = VoiceTriggerEngine(
+            VOICE_TRIGGER_MODEL_PATH,
+            source=VOICE_TRIGGER_SOURCE,
+            suppression_callback=voice_trigger_is_suppressed,
+        )
+        if voice_trigger_engine.available():
+            voice_task = asyncio.create_task(run_voice_trigger_loop(
+                voice_trigger_engine,
+                handle_voice_command,
+                ready_callback=announce_voice_ready,
+                cancelled_callback=announce_voice_cancelled,
+                unrecognized_callback=announce_voice_unrecognized,
+                trigger_callback=handle_screen_wake_trigger,
+                ready_sound=VOICE_TRIGGER_READY_SOUND,
+            ))
+            print(
+                "Jarvis: Cảm biến âm thanh đã bật "
+                "(vỗ tay 2 lần hoặc búng tay 1 lần)."
+            )
+        else:
+            print(
+                "Jarvis: Cảm biến âm thanh chưa sẵn sàng; "
+                f"thiếu model tại {VOICE_TRIGGER_MODEL_PATH} hoặc thiếu parec."
+            )
 
     try:
         if interactive_terminal:
@@ -7068,6 +8084,8 @@ async def main():
             await reminder_task
 
     finally:
+        if voice_trigger_engine is not None:
+            voice_trigger_engine.stop()
         await stop_ipc_server()
         await stop_discord_bot()
 
@@ -7077,6 +8095,8 @@ async def main():
             reminder_task.cancel()
         if not gmail_task.done():
             gmail_task.cancel()
+        if voice_task is not None and not voice_task.done():
+            voice_task.cancel()
 
         try:
             await discord_task

@@ -89,23 +89,34 @@ class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(jarvis.youtube_page_id, 17)
         self.assertEqual(jarvis.youtube_videos, [{"id": "owned"}])
 
-    async def test_youtube_close_tool_error_retains_state_and_reports_failure(self):
-        pages = Mock(isError=False)
-        pages.content = [Mock(text=(
-            "17: https://www.youtube.com/watch?v=owned\n"
-            "18: https://example.com/"
-        ))]
-        failed_close = Mock(isError=True)
-        session = AsyncMock()
-        session.call_tool.side_effect = [pages, failed_close]
+    async def test_youtube_close_failure_retains_state_and_reports_failure(self):
         jarvis.youtube_page_id = 17
         jarvis.youtube_videos = [{"id": "owned"}]
-        with patch("jarvis.get_mcp_session", new=AsyncMock(return_value=session)), patch(
-            "jarvis.find_youtube_page", new=AsyncMock(return_value=17)
+        jarvis.last_command_response = None
+        with patch(
+            "jarvis.close_managed_web_tab", new=AsyncMock(return_value=False)
         ):
             self.assertFalse(await jarvis.close_youtube())
         self.assertEqual(jarvis.youtube_page_id, 17)
         self.assertEqual(jarvis.youtube_videos, [{"id": "owned"}])
+        self.assertEqual(
+            jarvis.last_command_response, "❌ Không thể đóng YouTube lúc này."
+        )
+
+    async def test_youtube_close_success_sets_specific_response_and_clears_state(self):
+        jarvis.youtube_page_id = 17
+        jarvis.youtube_videos = [{"id": "owned"}]
+        jarvis.last_command_response = None
+        with patch(
+            "jarvis.close_managed_web_tab", new=AsyncMock(return_value=True)
+        ) as close:
+            self.assertTrue(await jarvis.close_youtube())
+        close.assert_awaited_once_with(
+            "youtube", "YouTube", ("https://www.youtube.com/",)
+        )
+        self.assertIsNone(jarvis.youtube_page_id)
+        self.assertEqual(jarvis.youtube_videos, [])
+        self.assertEqual(jarvis.last_command_response, "✅ Đã đóng YouTube.")
 
     async def test_individual_chrome_close_never_uses_process_wide_terminate(self):
         with patch.object(

@@ -15,6 +15,12 @@ import tts_limits
 
 
 class JarvisTtsRoutingTests(unittest.TestCase):
+    def test_response_can_explicitly_disable_tts(self):
+        jarvis.set_command_response("Đã sleep màn hình.", spoken_message=False)
+        with patch.object(jarvis, "speak") as speak:
+            jarvis.speak_last_response()
+        speak.assert_not_called()
+
     def test_gtk_ipc_speaks_last_response(self):
         async def run():
             reader = AsyncMock()
@@ -53,6 +59,45 @@ class JarvisTtsRoutingTests(unittest.TestCase):
             payload = json.loads(writer.write.call_args.args[0].decode("utf-8"))
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["response"], "Sẵn sàng.")
+
+        asyncio.run(run())
+
+    def test_silent_gtk_status_request_does_not_speak_or_fill_chat(self):
+        async def run():
+            reader = AsyncMock()
+            reader.readline = AsyncMock(
+                side_effect=[
+                    json.dumps({
+                        "command": "trạng thái giọng nói",
+                        "source": "gtk",
+                        "silent": True,
+                    }, ensure_ascii=False).encode("utf-8") + b"\n",
+                    b"",
+                ]
+            )
+            writer = Mock()
+            writer.drain = AsyncMock()
+            writer.wait_closed = AsyncMock()
+
+            async def fake_route(command, source="terminal"):
+                jarvis.set_command_response("🔇 Cảm biến đang tạm tắt.")
+                return True
+
+            with patch.object(jarvis.CORE.conversation, "add") as add, \
+                 patch.object(
+                     jarvis, "resolve_command_confirmation",
+                     return_value=("trạng thái giọng nói", None),
+                 ), \
+                 patch.object(
+                     jarvis, "route_command", AsyncMock(side_effect=fake_route)
+                 ), \
+                 patch.object(jarvis, "speak_last_response") as spoken:
+                await jarvis._handle_ipc_client(reader, writer)
+
+            add.assert_not_called()
+            spoken.assert_not_called()
+            payload = json.loads(writer.write.call_args.args[0].decode("utf-8"))
+            self.assertTrue(payload["ok"])
 
         asyncio.run(run())
 

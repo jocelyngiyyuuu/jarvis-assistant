@@ -65,6 +65,7 @@ lsof -v
   ```
 
 - VieNeu-TTS cho giọng nói tiếng Việt. Đây là submodule có dependency và môi trường riêng; xem tài liệu trong `tts/VieNeu-TTS` trước khi cài vì yêu cầu CPU/GPU phụ thuộc máy.
+- Vosk và model tiếng Việt cho cảm biến vỗ/búng tay rồi nhận lệnh giọng nói.
 
 ## 3. Tải và cài nhánh YouTube/Zalo
 
@@ -207,6 +208,10 @@ DISCORD_CHANNEL_ID=thay_bang_channel_id
 # Tùy chọn: AI cục bộ
 OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3:4b
+
+# Tùy chọn: cảm biến âm thanh (mặc định bật khi đã có model)
+VOICE_TRIGGER_ENABLED=1
+# VOICE_TRIGGER_SOURCE=alsa_input.pci-0000_06_00.6.analog-stereo
 ```
 
 Siết quyền file:
@@ -237,6 +242,63 @@ cd ~/Projects/jarvis
 Gõ `help` để xem lệnh. Nhấn `Ctrl+C` để dừng.
 
 Nếu TTS chưa được cài, Jarvis có thể báo không tìm thấy Python TTS nhưng các tính năng không phụ thuộc giọng nói vẫn có thể chạy.
+
+### Cài cảm biến vỗ/búng tay và nhận lệnh giọng nói
+
+Chạy một lần:
+
+```bash
+cd ~/Projects/jarvis
+bash scripts/install-voice-trigger.sh
+systemctl --user restart jarvis.service
+```
+
+Khi log báo `Cảm biến âm thanh đã bật`, hãy:
+
+1. Vỗ tay hai lần, cách nhau khoảng 0,12–0,85 giây; hoặc búng tay một lần.
+2. Chờ Jarvis nói `Jarvis đang nghe` xong.
+3. Nói một lệnh tiếng Việt trong tối đa 9 giây, ví dụ `mở YouTube`.
+
+Nếu đổi ý trong lúc Jarvis đang chờ lệnh, vỗ tay hai lần nữa. Jarvis sẽ nói
+`Jarvis đã tắt chế độ nghe` và không thực hiện nội dung vừa thu.
+
+Trong ứng dụng Jarvis, công tắc `🎙 Giọng nói` ở cuối thanh bên cho phép tạm
+tắt hoặc bật lại cảm biến. Cũng có thể dùng lệnh `tắt giọng nói tạm thời` và
+`bật giọng nói`; việc tạm tắt không làm gián đoạn Discord, Gmail hoặc TTS.
+
+Khi Jarvis thực hiện lệnh `tắt màn hình`, cảm biến được mở tạm thời dù giọng
+nói đang tạm tắt. Vỗ tay hai lần hoặc búng tay một lần sẽ bật màn hình; Jarvis
+không chuyển cử chỉ đó thành phiên nhận lệnh. Nếu giọng nói vẫn tạm tắt, luồng
+microphone được đóng lại ngay sau khi màn hình sáng.
+
+Công tắc `👏 Vỗ tay bật màn hình` trong ứng dụng điều khiển riêng hành vi này.
+Cũng có thể dùng `tắt vỗ tay`, `bật vỗ tay` và `trạng thái vỗ tay bật màn hình`.
+Lựa chọn được lưu qua lần khởi động lại. Khi tắt, lệnh `tắt màn hình` không mở
+microphone để chờ cử chỉ âm thanh; công tắc giọng nói vẫn hoạt động độc lập.
+
+### Bật một PC khác bằng Wake-on-LAN
+
+Đặt PC đích nối dây Ethernet cùng mạng với thiết bị chạy Jarvis, bật Wake-on-LAN
+trong BIOS/hệ điều hành, rồi thêm cấu hình cục bộ vào `.env`:
+
+```dotenv
+WOL_PC_MAC=00:11:22:33:44:55
+WOL_BROADCAST=192.168.1.255
+WOL_PORT=9
+PC_SSH_USER=WindowsUser
+PC_SSH_HOST=192.168.1.100
+```
+
+Sau khi khởi động lại dịch vụ, dùng `bật PC`, `đánh thức PC` hoặc `wake PC`.
+Jarvis gửi ba magic packet và phản hồi `Đã bật PC`; PC đích vẫn cần cắm điện,
+nối LAN và giữ nguồn chờ cho card mạng. Dùng `tắt PC` để chạy lệnh Windows
+`shutdown /s /t 0` qua SSH. PC phải bật OpenSSH Server, SSH key phải hoạt động
+không cần mật khẩu và host key phải có sẵn trong `known_hosts`. Lệnh tắt từ
+Discord luôn yêu cầu xác nhận trước khi thực hiện.
+
+Toàn bộ âm thanh được nhận dạng cục bộ bằng Vosk. Jarvis không lưu file thu âm.
+Để chọn microphone khác, đặt `VOICE_TRIGGER_SOURCE` trong `.env` bằng tên lấy từ
+`pactl list short sources`. Đặt `VOICE_TRIGGER_ENABLED=0` để tắt cảm biến.
 
 ## 7. Cài dịch vụ `systemd --user`
 
