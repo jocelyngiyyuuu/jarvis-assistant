@@ -1,0 +1,5 @@
+discord.py==2.7.1
+discord-ext-voice-recv @ git+https://github.com/imayhaveborkedit/discord-ext-voice-recv.git@ddd28601fe556f585b869e215f29c8236b95f88f
+mcp==2.0.0
+python-dotenv==1.2.2
+vosk==0.3.45
