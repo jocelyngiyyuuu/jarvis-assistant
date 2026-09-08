@@ -1,15 +1,19 @@
 """Small Ollama client used as Jarvis' local conversational fallback."""
 
+import base64
 import json
 import os
 import re
+import subprocess
 from collections import deque
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
 SYSTEM_PROMPT = """Bạn là Jarvis, trợ lý AI local trên Ubuntu.
 Hãy trả lời bằng tiếng Việt, rõ ràng và ngắn gọn.
+Chỉ dùng tiếng Việt và thuật ngữ tiếng Anh khi cần; không chèn chữ Trung Quốc.
 Không tuyên bố đã mở, đóng hoặc thay đổi máy tính: các thao tác đó do bộ lệnh
 riêng của Jarvis xử lý. Nếu người dùng yêu cầu một thao tác mà bạn không thể
 thực hiện, hãy nói rõ và gợi ý họ dùng lệnh Jarvis phù hợp.
@@ -84,10 +88,45 @@ class LocalAI:
     """Talk to Ollama without adding a third-party HTTP dependency."""
 
     def __init__(self, model=None, base_url=None, timeout=90, history_size=8):
-        self.model = model or os.getenv("OLLAMA_MODEL", "qwen3:4b")
+        default_model = os.getenv("OLLAMA_MODEL", "qwen3-vl:4b")
+        if model is not None:
+            # Preserve the existing explicit-constructor behavior used by
+            # tests and callers that intentionally select one model.
+            self.model = model
+            self.vision_model = model
+        else:
+            self.model = os.getenv("OLLAMA_TEXT_MODEL", default_model)
+            self.vision_model = os.getenv("OLLAMA_VISION_MODEL", default_model)
         self.base_url = (base_url or os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
+        keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip() or "30m"
+        self.keep_alive = int(keep_alive) if re.fullmatch(r"-?\d+", keep_alive) else keep_alive
+        self.vision_keep_alive = (
+            os.getenv("OLLAMA_VISION_KEEP_ALIVE", "10m").strip() or "10m"
+        )
         self.timeout = timeout
         self.history = deque(maxlen=history_size)
+
+    def warmup(self):
+        """Load the text model into Ollama without generating a response."""
+        payload = json.dumps({
+            "model": self.model,
+            "prompt": "",
+            "stream": False,
+            "keep_alive": self.keep_alive,
+        }).encode("utf-8")
+        request = Request(
+            f"{self.base_url}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=min(self.timeout, 60)) as response:
+                json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, OSError,
+                json.JSONDecodeError) as error:
+            raise RuntimeError(f"Không thể nạp trước Ollama: {error}") from error
+        return True
 
     @staticmethod
     def _strip_thinking(content):
@@ -97,6 +136,17 @@ class LocalAI:
         content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL | re.IGNORECASE)
         return content.strip()
 
+    @classmethod
+    def _structured_content(cls, result):
+        """Read schema JSON from either Ollama message field used by Qwen3-VL."""
+        message = result.get("message", {}) if isinstance(result, dict) else {}
+        content = cls._strip_thinking(message.get("content", ""))
+        if not content:
+            # Ollama/Qwen3-VL can place schema-constrained JSON in `thinking`
+            # while leaving `content` empty even when think=false.
+            content = str(message.get("thinking", "")).strip()
+        return content
+
     def chat(self, message):
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self.history)
@@ -104,9 +154,14 @@ class LocalAI:
         payload = json.dumps(
             {
                 "model": self.model,
+                "keep_alive": self.keep_alive,
                 "messages": messages,
                 "think": False,
-                "options": {"num_ctx": 4096},
+                "options": {
+                    "num_ctx": 4096,
+                    "num_predict": 320,
+                    "temperature": 0.2,
+                },
                 "stream": False,
             },
             ensure_ascii=False,
@@ -131,6 +186,34 @@ class LocalAI:
         self.history.append({"role": "user", "content": str(message).strip()})
         self.history.append({"role": "assistant", "content": answer})
         return answer
+
+    @staticmethod
+    def _is_direct_conversation(message):
+        """Identify clear conversation so it needs only one Ollama call."""
+        normalized = " ".join(re.sub(
+            r"[^0-9a-zà-ỹđ?]+", " ", str(message).casefold()
+        ).split())
+        status_subject = any(term in normalized for term in (
+            "hệ thống", "he thong", "cpu", "ram", "ổ đĩa", "o dia",
+            "uptime", "máy tính", "may tinh",
+        ))
+        status_intent = any(term in normalized for term in (
+            "tình trạng", "tinh trang", "trạng thái", "trang thai",
+            "kiểm tra", "kiem tra", "đang dùng", "dang dung",
+            "còn bao nhiêu", "con bao nhieu",
+        ))
+        if status_subject and status_intent:
+            return False
+        conversational_markers = (
+            "là gì", "la gi", "tại sao", "tai sao", "vì sao", "vi sao",
+            "như thế nào", "nhu the nao", "giải thích", "giai thich",
+            "cho tôi biết", "cho toi biet", "nghĩa là gì", "nghia la gi",
+            "xin chào", "xin chao", "chào jarvis", "chao jarvis",
+            "kể cho tôi", "ke cho toi",
+        )
+        return normalized.endswith("?") or any(
+            marker in normalized for marker in conversational_markers
+        )
 
     def summarize_zalo_work(self, conversations):
         """Summarize locally extracted Zalo work chats without adding to chat history."""
@@ -177,6 +260,7 @@ Dữ liệu:
         payload = json.dumps(
             {
                 "model": self.model,
+                "keep_alive": self.keep_alive,
                 "messages": [
                     {"role": "system", "content": "Bạn là trợ lý tổng hợp công việc. Chỉ điền dữ liệu vào JSON schema, không chép lại chỉ dẫn."},
                     {"role": "user", "content": prompt},
@@ -199,7 +283,7 @@ Dữ liệu:
                 result = json.loads(response.read().decode("utf-8"))
         except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"Không thể tóm tắt Zalo bằng Ollama: {error}") from error
-        raw_answer = self._strip_thinking(result.get("message", {}).get("content", ""))
+        raw_answer = self._structured_content(result)
         try:
             data = json.loads(raw_answer)
             groups = data.get("groups", [])
@@ -254,6 +338,7 @@ Dữ liệu: {source[:30000]}
 """
         payload = json.dumps({
             "model": self.model,
+            "keep_alive": self.keep_alive,
             "messages": [
                 {"role": "system", "content": "Bạn trả lời có căn cứ từ tin nhắn Zalo. Chỉ xuất JSON schema."},
                 {"role": "user", "content": prompt},
@@ -270,7 +355,7 @@ Dữ liệu: {source[:30000]}
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 result = json.loads(response.read().decode("utf-8"))
-            data = json.loads(self._strip_thinking(result.get("message", {}).get("content", "")))
+            data = json.loads(self._structured_content(result))
         except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"Không thể hỏi dữ liệu Zalo: {error}") from error
         answer = str(data.get("answer", "")).strip()
@@ -335,6 +420,7 @@ Dữ liệu: {source[:30000]}
 """
         payload = json.dumps({
             "model": self.model,
+            "keep_alive": self.keep_alive,
             "messages": [
                 {"role": "system", "content": "Bạn là trợ lý tóm tắt email riêng tư chạy local. Chỉ xuất JSON schema."},
                 {"role": "user", "content": prompt},
@@ -351,7 +437,7 @@ Dữ liệu: {source[:30000]}
         try:
             with urlopen(request, timeout=min(self.timeout, 45)) as response:
                 result = json.loads(response.read().decode("utf-8"))
-            data = json.loads(self._strip_thinking(result.get("message", {}).get("content", "")))
+            data = json.loads(self._structured_content(result))
         except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"Không thể tóm tắt Gmail bằng Ollama: {error}") from error
         emails = data.get("emails", [])
@@ -405,9 +491,16 @@ Dữ liệu: {source[:30000]}
 
     def decide(self, message):
         """Return a validated safe action decision, or a conversational reply."""
+        if self._is_direct_conversation(message):
+            return {
+                "action": "chat",
+                "args": {"site": "", "profile": ""},
+                "reply": self.chat(message),
+            }
         payload = json.dumps(
             {
                 "model": self.model,
+                "keep_alive": self.keep_alive,
                 "messages": [
                     {"role": "system", "content": TOOL_ROUTER_PROMPT},
                     {"role": "user", "content": str(message).strip()},
@@ -428,8 +521,7 @@ Dữ liệu: {source[:30000]}
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 result = json.loads(response.read().decode("utf-8"))
-            content = result.get("message", {}).get("content", "")
-            decision = json.loads(content)
+            decision = json.loads(self._structured_content(result))
         except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"Không thể định tuyến bằng Ollama: {error}") from error
 
@@ -440,6 +532,25 @@ Dữ liệu: {source[:30000]}
         if not isinstance(args, dict):
             args = {}
         reply = str(decision.get("reply", "")).strip()
+        normalized_message = " ".join(re.sub(
+            r"[^0-9a-zà-ỹđ]+", " ", str(message).casefold()
+        ).split())
+        status_subject = any(term in normalized_message for term in (
+            "hệ thống", "he thong", "cpu", "ram", "ổ đĩa", "o dia",
+            "uptime", "máy tính", "may tinh",
+        ))
+        status_intent = any(term in normalized_message for term in (
+            "tình trạng", "tinh trang", "trạng thái", "trang thai",
+            "kiểm tra", "kiem tra", "đang dùng", "dang dung",
+            "bao nhiêu", "bao nhieu", "còn bao nhiêu", "con bao nhieu",
+        ))
+        if action == "system_status" and not (status_subject and status_intent):
+            action = "chat"
+            reply = ""
+        if action == "open_site" and args.get("site") in {
+            "zalo", "gmail", "github",
+        } and args.get("profile") not in {"study", "personal"}:
+            args["profile"] = "study"
         if action == "open_site" and (
             args.get("site") not in {"chatgpt", "gmail", "drive", "calendar", "github", "google", "chrome", "zalo"}
             or args.get("profile") not in {"study", "personal"}
@@ -447,4 +558,252 @@ Dữ liệu: {source[:30000]}
             action = "chat"
         if action == "close_chrome" and args.get("profile") not in {"study", "personal"}:
             action = "chat"
+        if action == "chat" and not reply:
+            # Never make a hidden second model request. Clear questions are
+            # routed directly to chat above; ambiguous inputs get a concise
+            # deterministic request for clarification.
+            reply = "Tôi chưa hiểu rõ yêu cầu. Bạn hãy nói cụ thể hơn."
         return {"action": action, "args": args, "reply": reply}
+
+    def choose_accessible_target(self, instruction, controls):
+        """Choose one visible AT-SPI control without receiving screenshot pixels."""
+        candidates = []
+        for index, control in enumerate(controls[:120]):
+            candidates.append({
+                "index": index,
+                "name": str(control.get("name", ""))[:160],
+                "role": str(control.get("role", ""))[:60],
+                "app": str(control.get("app", ""))[:80],
+                "window": str(control.get("window", ""))[:120],
+            })
+        schema = {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "minimum": -1},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+            "required": ["index", "confidence"],
+        }
+        prompt = f"""/no_think
+Bạn chọn phần tử giao diện phù hợp với yêu cầu tiếng Việt.
+Chỉ chọn dựa trên tên, vai trò, ứng dụng và cửa sổ trong danh sách; không suy đoán
+phần tử không có trong dữ liệu. Nếu không có đúng mục hoặc có nhiều mục tương đương,
+trả index=-1 và confidence=0. Chỉ dùng confidence >= 0.8 khi kết quả rõ ràng.
+Yêu cầu: {str(instruction)[:300]}
+Danh sách: {json.dumps(candidates, ensure_ascii=False)}
+"""
+        payload = json.dumps({
+            "model": self.model,
+            "keep_alive": self.vision_keep_alive,
+            "messages": [
+                {"role": "system", "content": "Bạn là bộ chọn phần tử UI an toàn. Chỉ xuất JSON schema."},
+                {"role": "user", "content": prompt},
+            ],
+            "format": schema,
+            "think": False,
+            "options": {"temperature": 0, "num_predict": 180, "num_ctx": 8192},
+            "stream": False,
+        }, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            f"{self.base_url}/api/chat", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urlopen(request, timeout=min(self.timeout, 45)) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            decision = json.loads(self._structured_content(result))
+            index = int(decision.get("index", -1))
+            confidence = float(decision.get("confidence", 0))
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError,
+                TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"Không thể chọn nút bằng Qwen: {error}") from error
+        if index < 0 or index >= len(controls) or confidence < 0.8:
+            return None
+        return controls[index]
+
+    def _choose_visual_bbox(self, instruction, image, image_width, image_height,
+                            *, refinement=False):
+        """Ask Qwen VL for one normalized bounding box."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "found": {"type": "boolean"},
+                "x1": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "y1": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "x2": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "y2": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "ambiguous": {"type": "boolean"},
+            },
+            "required": [
+                "found", "x1", "y1", "x2", "y2", "confidence",
+                "ambiguous",
+            ],
+        }
+        stage = (
+            "Đây là ảnh phóng to quanh một ứng viên đã tìm thấy. Hãy định vị lại "
+            "thật sát vùng có thể bấm; không giữ tọa độ cũ nếu nó lệch."
+            if refinement else
+            "Đây là ảnh toàn màn hình. Hãy định vị ứng viên duy nhất trước."
+        )
+        prompt = f"""/no_think
+{stage}
+Kích thước ảnh hiện tại là {image_width}x{image_height} pixel.
+Hãy tìm đúng một điều khiển giao diện phù hợp với yêu cầu tiếng Việt bên dưới.
+Trả hộp bao CHẶT quanh toàn bộ vùng có thể bấm bằng (x1,y1,x2,y2) trong hệ
+chuẩn hóa 0..1000 của Qwen3-VL: (0,0) là góc trên-trái và (1000,1000) là
+góc dưới-phải. Không chỉ khoanh riêng một chữ nếu nút có nền lớn hơn.
+Đọc kỹ nhãn, biểu tượng, vị trí tương đối và cửa sổ đang hoạt động. Phân biệt
+các mục gần nhau hoặc có từ giống nhau. Nếu mục bị che, không hiện rõ, có nhiều
+mục tương đương hoặc bạn không chắc chắn, trả found=false, ambiguous=true và
+confidence=0; tuyệt đối không đoán.
+Chỉ dùng confidence >= 0.9 khi mục tiêu nhìn thấy rõ và khớp chính xác.
+Yêu cầu: {str(instruction)[:300]}
+"""
+        payload = json.dumps({
+            "model": self.vision_model,
+            "keep_alive": self.keep_alive,
+            "messages": [{
+                "role": "user",
+                "content": prompt,
+                "images": [base64.b64encode(image).decode("ascii")],
+            }],
+            "format": schema,
+            "think": False,
+            "options": {"temperature": 0, "num_predict": 256, "num_ctx": 2048},
+            "stream": False,
+        }, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            f"{self.base_url}/api/chat", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            decision = None
+            for attempt in range(2):
+                with urlopen(request, timeout=min(self.timeout, 90)) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                try:
+                    decision = json.loads(self._structured_content(result))
+                    break
+                except json.JSONDecodeError:
+                    if attempt:
+                        raise
+            if decision is None:
+                raise json.JSONDecodeError("empty structured response", "", 0)
+            found = bool(decision.get("found", False))
+            x1 = int(decision.get("x1", -1))
+            y1 = int(decision.get("y1", -1))
+            x2 = int(decision.get("x2", -1))
+            y2 = int(decision.get("y2", -1))
+            confidence = float(decision.get("confidence", 0))
+            ambiguous = bool(decision.get("ambiguous", True))
+        except RuntimeError:
+            raise
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError,
+                TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"Không thể nhìn màn hình bằng Qwen VL: {error}") from error
+        box_area = max(0, x2 - x1) * max(0, y2 - y1)
+        if (not found or ambiguous or confidence < 0.9
+                or not 0 <= x1 < x2 <= 1000
+                or not 0 <= y1 < y2 <= 1000
+                or box_area < 4 or box_area > 300000):
+            return None
+        return {
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "confidence": confidence,
+        }
+
+    @staticmethod
+    def _map_visual_bbox(box, left, top, width, height):
+        return [
+            left + round(box["x1"] * width / 1000),
+            top + round(box["y1"] * height / 1000),
+            max(2, round((box["x2"] - box["x1"]) * width / 1000)),
+            max(2, round((box["y2"] - box["y1"]) * height / 1000)),
+        ]
+
+    def choose_visual_target(self, instruction, image_path):
+        """Locate one UI target, then refine it inside a magnified crop."""
+        try:
+            image = Path(image_path).read_bytes()
+        except OSError as error:
+            raise RuntimeError(f"Không đọc được ảnh màn hình: {error}") from error
+        if len(image) < 24 or image[:8] != b"\x89PNG\r\n\x1a\n":
+            raise RuntimeError("Ảnh màn hình không phải PNG hợp lệ.")
+        width = int.from_bytes(image[16:20], "big")
+        height = int.from_bytes(image[20:24], "big")
+        if width < 1 or height < 1 or len(image) > 20 * 1024 * 1024:
+            raise RuntimeError("Kích thước ảnh màn hình không hợp lệ.")
+
+        # First pass: retain enough detail for small toolbar icons while still
+        # fitting Qwen3-VL alongside a 4 GB GPU.
+        vision_image = image
+        vision_width, vision_height = width, height
+        if width > 1280 or height > 720:
+            try:
+                resized = subprocess.run(
+                    ["convert", str(image_path), "-resize", "1280x720>", "png:-"],
+                    capture_output=True, check=False, timeout=15,
+                )
+            except (FileNotFoundError, subprocess.SubprocessError):
+                resized = None
+            if (resized is not None and resized.returncode == 0
+                    and len(resized.stdout) >= 24
+                    and resized.stdout[:8] == b"\x89PNG\r\n\x1a\n"):
+                vision_image = resized.stdout
+                vision_width = int.from_bytes(vision_image[16:20], "big")
+                vision_height = int.from_bytes(vision_image[20:24], "big")
+
+        selected = self._choose_visual_bbox(
+            instruction, vision_image, vision_width, vision_height
+        )
+        if selected is None:
+            return None
+        screen_bounds = self._map_visual_bbox(selected, 0, 0, width, height)
+
+        # Second pass: enlarge only the nearby region. This corrects the
+        # 10-30 px drift common when a 4B model grounds tiny full-screen UI.
+        box_left, box_top, box_width, box_height = screen_bounds
+        pad_x = max(80, min(180, box_width))
+        pad_y = max(60, min(140, box_height * 2))
+        crop_left = max(0, box_left - pad_x)
+        crop_top = max(0, box_top - pad_y)
+        crop_right = min(width, box_left + box_width + pad_x)
+        crop_bottom = min(height, box_top + box_height + pad_y)
+        crop_width = crop_right - crop_left
+        crop_height = crop_bottom - crop_top
+        if width >= 1000 and crop_width >= 40 and crop_height >= 40:
+            try:
+                cropped = subprocess.run(
+                    [
+                        "convert", str(image_path), "-crop",
+                        f"{crop_width}x{crop_height}+{crop_left}+{crop_top}",
+                        "+repage", "-resize", "960x720>", "png:-",
+                    ],
+                    capture_output=True, check=False, timeout=15,
+                )
+            except (FileNotFoundError, subprocess.SubprocessError):
+                cropped = None
+            if (cropped is not None and cropped.returncode == 0
+                    and len(cropped.stdout) >= 24
+                    and cropped.stdout[:8] == b"\x89PNG\r\n\x1a\n"):
+                crop_image_width = int.from_bytes(cropped.stdout[16:20], "big")
+                crop_image_height = int.from_bytes(cropped.stdout[20:24], "big")
+                refined = self._choose_visual_bbox(
+                    instruction, cropped.stdout, crop_image_width,
+                    crop_image_height, refinement=True,
+                )
+                if refined is not None:
+                    screen_bounds = self._map_visual_bbox(
+                        refined, crop_left, crop_top, crop_width, crop_height
+                    )
+                    selected = refined
+
+        screen_x = min(width - 1, screen_bounds[0] + screen_bounds[2] // 2)
+        screen_y = min(height - 1, screen_bounds[1] + screen_bounds[3] // 2)
+        return {
+            "x": screen_x, "y": screen_y,
+            "confidence": selected["confidence"],
+            "bounds": screen_bounds,
+            "width": width, "height": height,
+        }

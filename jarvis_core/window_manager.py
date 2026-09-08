@@ -605,6 +605,14 @@ class ChromeWindowManager(FileWindowManager):
                 window for window in windows
                 if self._normalize_window_id(window["id"]) not in previous_normalized
             ]
+            # A freshly created automation browser can still be titled
+            # ``New Tab`` while Zalo/Gmail is loading.  One window owned by
+            # the already verified Jarvis Chrome PID is unambiguous; waiting
+            # for the title here caused a false failure even though the CDP
+            # tab had opened successfully.
+            if len(windows) == 1 and len(new_windows) == 1:
+                selected_id = windows[0]["id"]
+                break
             if len(new_windows) == 1 and target_hint in new_windows[0].get(
                 "title", ""
             ).casefold():

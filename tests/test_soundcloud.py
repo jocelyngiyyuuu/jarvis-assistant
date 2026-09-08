@@ -50,12 +50,16 @@ class SoundCloudTests(unittest.IsolatedAsyncioTestCase):
         response.__enter__.return_value = response
         response.__exit__.return_value = False
         response.read.return_value = json.dumps([page]).encode()
-        with patch("jarvis.urlopen", return_value=response) as opened:
+        activated = MagicMock(status=200)
+        activated.__enter__.return_value = activated
+        activated.__exit__.return_value = False
+        with patch("jarvis.urlopen", side_effect=[response, activated]) as opened:
             self.assertTrue(
                 jarvis._ensure_jarvis_chrome_tab("https://soundcloud.com/discover")
             )
         self.assertEqual(jarvis.managed_cdp_targets["soundcloud"], {"soundcloud-1"})
-        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(opened.call_count, 2)
+        self.assertIn("/json/activate/soundcloud-1", opened.call_args_list[1].args[0])
 
     def test_track_url_validation_rejects_navigation_and_foreign_urls(self):
         self.assertTrue(
@@ -75,7 +79,8 @@ class SoundCloudTests(unittest.IsolatedAsyncioTestCase):
             {"title": "Điều hướng", "url": "https://soundcloud.com/discover/sets"},
             {"title": "Giả", "url": "https://evil.example/artist/song"},
         ]])
-        tracks = await jarvis.extract_soundcloud_tracks_from_page(session)
+        tracks = await jarvis.extract_soundcloud_tracks_from_page(session, 7)
+        self.assertEqual(session.calls[0][1]["pageId"], 7)
         self.assertEqual(tracks, [{
             "title": "Bài một",
             "url": "https://soundcloud.com/artist/song",

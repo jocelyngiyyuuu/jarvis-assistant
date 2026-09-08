@@ -13,13 +13,15 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 
 import discord
+from discord.ext import voice_recv
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -33,9 +35,34 @@ from jarvis_core.help_catalog import (
     format_category_choices,
     resolve_help_category,
 )
+from jarvis_core.desktop_control import (
+    DesktopController,
+    parse_monitor_role,
+    strip_monitor_suffix,
+)
+from jarvis_core.discord_voice import (
+    decode_voice_message_audio,
+    match_whisper_chat_command,
+    recognize_whisper_pcm,
+    start_discord_voice_listening,
+)
+from jarvis_core.lunar_intent import answer_lunar_calendar
+from jarvis_core.marked_screenshot import (
+    MarkedScreenshotError,
+    detect_added_red_marker,
+)
 from jarvis_core.security import classify_remote_command, redact_sensitive
+from jarvis_core.semantic_desktop import SemanticDesktopController
 from jarvis_core.text import normalize_text as normalize_core_text
-from jarvis_core.voice_trigger import VoiceTriggerEngine, run_voice_trigger_loop
+from jarvis_core.voice_trigger import (
+    VoiceTriggerEngine,
+    run_exact_voice_command_loop,
+    run_voice_trigger_loop,
+)
+from jarvis_core.windows_audio import (
+    build_windows_audio_command,
+    parse_windows_audio_output,
+)
 from jarvis_core.window_manager import (
     ChromeWindowManager,
     FileWindowManager,
@@ -50,10 +77,17 @@ load_dotenv()
 discord_client = None
 discord_notification_channel_id = None
 discord_command_lock = asyncio.Lock()
+discord_tts_lock = asyncio.Lock()
 last_command_response = None
 last_spoken_response = None
+last_response_attachment = None
 pending_command_suggestions = {}
+pending_marked_screenshots = {}
 SUGGESTION_CONFIRM_TTL_SECONDS = 120
+MARKED_SCREENSHOT_TTL_SECONDS = 10 * 60
+MARKED_SCREENSHOT_MAX_BYTES = 15 * 1024 * 1024
+DISCORD_VOICE_MESSAGE_MAX_BYTES = 8 * 1024 * 1024
+DISCORD_VOICE_MESSAGE_MAX_SECONDS = 15
 
 SUGGESTION_AFFIRMATIONS = {
     "dung", "dung roi", "phai", "phai roi", "uh", "u", "ừ", "ok",
@@ -94,6 +128,8 @@ JARVIS_CHROME_DEBUG_URL = f"http://127.0.0.1:{JARVIS_CHROME_DEBUG_PORT}"
 
 BASE_DIR = Path(__file__).resolve().parent
 CORE = JarvisCore(BASE_DIR)
+DESKTOP = DesktopController(BASE_DIR / ".jarvis_data")
+SEMANTIC_DESKTOP = SemanticDesktopController()
 IPC_SOCKET_PATH = Path(os.getenv("XDG_RUNTIME_DIR", "/tmp")) / f"jarvis-{os.getuid()}.sock"
 FILE_WINDOWS = FileWindowManager()
 CHROME_WINDOWS = ChromeWindowManager()
@@ -111,7 +147,28 @@ VOICE_TRIGGER_MODEL_PATH = Path(os.getenv(
     "VOICE_TRIGGER_MODEL_PATH",
     str(BASE_DIR / ".jarvis_data" / "models" / "vosk-model-small-vn-0.4"),
 )).expanduser()
+DISCORD_VOICE_MODEL_PATH = Path(os.getenv(
+    "DISCORD_VOICE_MODEL_PATH",
+    str(BASE_DIR / ".jarvis_data" / "models" / "vosk-model-vn-0.4"),
+)).expanduser()
 VOICE_TRIGGER_SOURCE = os.getenv("VOICE_TRIGGER_SOURCE", "").strip()
+VOICE_TRIGGER_SERIAL_PORT = os.getenv(
+    "VOICE_TRIGGER_SERIAL_PORT", "/dev/ttyACM0"
+).strip()
+VOICE_COMMAND_CAPTURE_ENABLED = os.getenv(
+    "VOICE_COMMAND_CAPTURE_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+VOICE_DEVICE_COMMANDS_ENABLED = os.getenv(
+    "VOICE_DEVICE_COMMANDS_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+ESP32_AC_ON_COMMAND = os.getenv("ESP32_AC_ON_COMMAND", "CMD AC_B").strip()
+ESP32_AC_OFF_COMMAND = os.getenv("ESP32_AC_OFF_COMMAND", "CMD AC_A").strip()
+VOICE_AUDIO_FROM_ESP32 = os.getenv(
+    "VOICE_AUDIO_FROM_ESP32", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+CLAP_PC_CONTROL_ENABLED = os.getenv(
+    "CLAP_PC_CONTROL_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 VOICE_TRIGGER_READY_SOUND = os.getenv(
     "VOICE_TRIGGER_READY_SOUND",
     "/usr/share/sounds/freedesktop/stereo/message.oga",
@@ -188,10 +245,8 @@ def _clean_tts_text(text):
     value = re.sub(r"^[✅❌🔊🔇🌙😴📺]+\s*", "", value)
     value = re.sub(r"\s+", " ", value).strip()
 
-    # Tránh đưa câu quá dài vào TTS.
-    if len(value) > 220:
-        value = value[:217].rstrip() + "..."
-
+    # Văn bản dài được worker chia nhỏ để sinh rồi ghép thành một tệp WAV.
+    # Không cắt ở đây vì sẽ làm mất các ngày cuối của bản tin thời tiết.
     return value
 
 
@@ -205,6 +260,12 @@ def start_tts_worker():
     if tts_process is not None and tts_process.poll() is None:
         return True
 
+    if tts_process is not None:
+        print(
+            f"[TTS ERROR] Worker trước đã thoát với mã {tts_process.poll()}.",
+            flush=True,
+        )
+
     if not TTS_PYTHON.exists():
         print(f"[TTS ERROR] Không tìm thấy Python TTS: {TTS_PYTHON}")
         return False
@@ -216,17 +277,22 @@ def start_tts_worker():
     try:
         print("Jarvis: Đang khởi động TTS worker...")
 
+        worker_environment = os.environ.copy()
+        worker_environment["HF_HUB_OFFLINE"] = "1"
+        worker_environment["TRANSFORMERS_OFFLINE"] = "1"
         tts_process = subprocess.Popen(
             [
                 str(TTS_PYTHON),
                 str(TTS_ENGINE),
             ],
             cwd=str(TTS_DIR),
+            env=worker_environment,
             stdin=subprocess.PIPE,
             text=True,
             bufsize=1,
-            # Giữ stdout để thấy trạng thái READY, ẩn warning dài của torch.
-            stderr=subprocess.DEVNULL,
+            # Errors are needed in the service log; the worker is offline so
+            # Hugging Face retry noise cannot flood the journal.
+            stderr=subprocess.STDOUT,
         )
 
         return True
@@ -268,7 +334,7 @@ def stop_tts_worker():
                 pass
 
 
-def speak(text):
+def speak(text, *, play_local=True):
     """
     Gửi text cho TTS worker qua stdin.
     Model VieNeu chỉ load một lần khi worker khởi động.
@@ -299,7 +365,14 @@ def speak(text):
             voice_trigger_suppressed_until,
             time.monotonic() + estimated_seconds,
         )
-        tts_process.stdin.write(text + "\n")
+        worker_input = (
+            text
+            if play_local
+            else json.dumps(
+                {"text": text, "play_local": False}, ensure_ascii=False
+            )
+        )
+        tts_process.stdin.write(worker_input + "\n")
         tts_process.stdin.flush()
         return True
 
@@ -382,6 +455,540 @@ async def handle_screen_wake_trigger(_trigger):
     return True
 
 
+async def handle_device_clap_trigger(trigger):
+    """Control the configured PC while ESP32 handles the fan locally."""
+    if not CLAP_PC_CONTROL_ENABLED:
+        return False
+    if trigger == "double_clap":
+        try:
+            packet_count = await asyncio.to_thread(send_reliable_wake_on_lan)
+            print(
+                "Jarvis: Hai tiếng vỗ đã gửi "
+                f"{packet_count} gói Wake-on-LAN cho PC.",
+                flush=True,
+            )
+        except (OSError, ValueError) as error:
+            print(f"Jarvis: Không thể bật PC bằng tiếng vỗ: {error}", flush=True)
+        return True
+    if trigger == "single_clap":
+        try:
+            await asyncio.to_thread(shutdown_remote_pc)
+            print("Jarvis: Một tiếng vỗ đã gửi lệnh tắt PC.", flush=True)
+        except (OSError, ValueError) as error:
+            print(f"Jarvis: Không thể tắt PC bằng tiếng vỗ: {error}", flush=True)
+        return True
+    return False
+
+
+VOICE_DEVICE_COMMANDS = {"bật thiết bị", "tắt thiết bị"}
+
+
+async def handle_exact_voice_device_command(command):
+    """Control the fan and PC only for one of two exact spoken phrases."""
+    normalized = str(command).strip().casefold()
+    if normalized not in VOICE_DEVICE_COMMANDS or voice_trigger_engine is None:
+        print("Jarvis: Đã bỏ qua câu nói không nằm trong danh sách cho phép.", flush=True)
+        return False
+
+    errors = []
+    if normalized == "bật thiết bị":
+        try:
+            await asyncio.to_thread(
+                voice_trigger_engine.send_serial_commands,
+                ["CMD DEVICE_ON"],
+            )
+        except (OSError, ValueError) as error:
+            errors.append(f"quạt: {error}")
+        try:
+            packets = await asyncio.to_thread(send_reliable_wake_on_lan)
+            print(f"Jarvis: Đã gửi {packets} gói Wake-on-LAN.", flush=True)
+        except (OSError, ValueError) as error:
+            errors.append(f"PC: {error}")
+    else:
+        try:
+            await asyncio.to_thread(
+                voice_trigger_engine.send_serial_commands,
+                ["CMD DEVICE_OFF"],
+            )
+        except (OSError, ValueError) as error:
+            errors.append(f"quạt: {error}")
+        try:
+            await asyncio.to_thread(shutdown_remote_pc)
+        except (OSError, ValueError) as error:
+            errors.append(f"PC: {error}")
+
+    if errors:
+        print("Jarvis: Lệnh thiết bị chưa hoàn tất: " + "; ".join(errors), flush=True)
+        return False
+    print(f"Jarvis: Đã thực hiện chính xác lệnh '{normalized}'.", flush=True)
+
+
+def send_esp32_device_commands(commands):
+    """Send commands without leaving USB audio streaming into an unread port."""
+    engine = VoiceTriggerEngine(
+        VOICE_TRIGGER_MODEL_PATH,
+        serial_port=VOICE_TRIGGER_SERIAL_PORT,
+    )
+    try:
+        # Native USB may briefly re-enumerate even with modem lines disabled.
+        # Open first, then wait through firmware's 1.5-second setup delay so a
+        # command can never land in the bootloader/startup window.
+        engine._start_serial()
+        time.sleep(2.0)
+        engine.send_serial_commands(commands)
+        connection = engine.serial_connection
+        if connection is not None:
+            connection.flush()
+        # Fan speed 3 + swing takes about 1.8 seconds in firmware.  Keep the
+        # CDC session alive until every queued IR frame has been emitted.
+        time.sleep(2.5)
+    finally:
+        engine._stop_serial()
+
+
+async def handle_esp32_device_command(command):
+    """Handle exact fan/air-conditioner commands before the AI fallback."""
+    normalized = normalize_core_text(command)
+    actions = {
+        "bat quat": (
+            ["CMD DEVICE_ON"],
+            "Jarvis đã bật quạt ở mức ba và bật lắc.",
+        ),
+        "mo quat": (
+            ["CMD DEVICE_ON"],
+            "Jarvis đã bật quạt ở mức ba và bật lắc.",
+        ),
+        "tat quat": (["CMD DEVICE_OFF"], "Jarvis đã tắt quạt."),
+        "bat may lanh": ([ESP32_AC_ON_COMMAND], "Jarvis đã bật máy lạnh."),
+        "tat may lanh": ([ESP32_AC_OFF_COMMAND], "Jarvis đã tắt máy lạnh."),
+    }
+    action = actions.get(normalized)
+    if action is None:
+        return False
+
+    serial_commands, success_message = action
+    try:
+        await asyncio.to_thread(send_esp32_device_commands, serial_commands)
+    except (OSError, ValueError) as error:
+        message = f"❌ Jarvis chưa thể điều khiển ESP32: {error}"
+        print(f"Jarvis: {message}", flush=True)
+        set_command_response(
+            message,
+            spoken_message="Jarvis chưa thể điều khiển thiết bị.",
+        )
+        return True
+
+    print(f"Jarvis: {success_message}", flush=True)
+    set_command_response(f"✅ {success_message}", spoken_message=success_message)
+    return True
+
+
+async def handle_discord_spoken_device_command(command, response_channel):
+    """Execute one exact owner voice command received from Discord."""
+    normalized = str(command).strip().casefold()
+    allowed = {
+        "bật thiết bị", "tắt thiết bị",
+        "bật máy lạnh", "tắt máy lạnh",
+        "bật quạt", "tắt quạt",
+        "bật pc", "tắt pc",
+    }
+    if normalized not in allowed:
+        return False
+
+    await response_channel.send(f"🎙️ Đã nhận: **{normalized}**")
+    serial_commands = []
+    pc_action = None
+    if normalized == "bật thiết bị":
+        serial_commands = [ESP32_AC_ON_COMMAND, "CMD DEVICE_ON"]
+        pc_action = "on"
+    elif normalized == "tắt thiết bị":
+        serial_commands = [ESP32_AC_OFF_COMMAND, "CMD DEVICE_OFF"]
+        pc_action = "off"
+    elif normalized == "bật máy lạnh":
+        serial_commands = [ESP32_AC_ON_COMMAND]
+    elif normalized == "tắt máy lạnh":
+        serial_commands = [ESP32_AC_OFF_COMMAND]
+    elif normalized == "bật quạt":
+        # Firmware makes this deterministic: speed 3, then swing on.
+        serial_commands = ["CMD DEVICE_ON"]
+    elif normalized == "tắt quạt":
+        serial_commands = ["CMD DEVICE_OFF"]
+    elif normalized == "bật pc":
+        pc_action = "on"
+    elif normalized == "tắt pc":
+        pc_action = "off"
+
+    errors = []
+    async with discord_command_lock:
+        if serial_commands:
+            try:
+                await asyncio.to_thread(
+                    send_esp32_device_commands, serial_commands
+                )
+            except (OSError, ValueError) as error:
+                errors.append(f"ESP32: {error}")
+        if pc_action == "on":
+            try:
+                packets = await asyncio.to_thread(send_reliable_wake_on_lan)
+                print(
+                    f"Jarvis: Discord voice đã gửi {packets} gói WOL.",
+                    flush=True,
+                )
+            except (OSError, ValueError) as error:
+                errors.append(f"PC: {error}")
+        elif pc_action == "off":
+            try:
+                await asyncio.to_thread(shutdown_remote_pc)
+            except (OSError, ValueError) as error:
+                errors.append(f"PC: {error}")
+
+    if errors:
+        failure_response = "⚠️ Lệnh chưa hoàn tất: " + "; ".join(errors)
+        await response_channel.send(failure_response)
+        await speak_on_ubuntu_and_discord(
+            "Jarvis chưa thể thực hiện xong lệnh.", response_channel
+        )
+        return False
+    completion_messages = {
+        "bật thiết bị": "Jarvis đã bật tất cả thiết bị.",
+        "tắt thiết bị": "Jarvis đã tắt tất cả thiết bị.",
+        "bật máy lạnh": "Jarvis đã bật máy lạnh.",
+        "tắt máy lạnh": "Jarvis đã tắt máy lạnh.",
+        "bật quạt": "Jarvis đã bật quạt ở mức ba và bật lắc.",
+        "tắt quạt": "Jarvis đã tắt quạt.",
+        "bật pc": "Jarvis đã gửi lệnh bật PC.",
+        "tắt pc": "Jarvis đã gửi lệnh tắt PC an toàn.",
+    }
+    completion_response = completion_messages[normalized]
+    await response_channel.send(
+        f"✅ Đã thực hiện: **{normalized}**\n{completion_response}"
+    )
+    await speak_on_ubuntu_and_discord(completion_response, response_channel)
+    return True
+
+
+async def handle_discord_spoken_command(command, response_channel, owner_id=None):
+    """Route an authorized wake-prefixed voice phrase like Discord chat."""
+    global last_command_response, last_spoken_response, last_response_attachment
+
+    command = normalize_voice_command(command)
+    normalized = str(command).strip().casefold()
+    device_commands = {
+        "bật thiết bị", "tắt thiết bị",
+        "bật máy lạnh", "tắt máy lạnh",
+        "bật quạt", "tắt quạt", "bật pc", "tắt pc",
+    }
+    if not command:
+        return False
+    owner_id = owner_id or _env_int("DISCORD_USER_ID")
+    channel_id = getattr(response_channel, "id", None)
+    risk = classify_remote_command(command)
+    settings = CORE.security.settings()
+    if (
+        not settings["discord_enabled"]
+        and not CORE.security.is_allowed_when_locked(command)
+    ):
+        response = "🔒 Điều khiển Discord đang bị khóa trên Ubuntu."
+        await response_channel.send(response)
+        await speak_on_ubuntu_and_discord(response, response_channel)
+        return False
+    if risk == "forbidden":
+        CORE.security.audit(
+            "discord_voice", command, risk, "forbidden", owner_id, channel_id
+        )
+        response = "⛔ Jarvis từ chối đọc bí mật hoặc xóa vĩnh viễn qua Discord."
+        await response_channel.send(response)
+        await speak_on_ubuntu_and_discord(response, response_channel)
+        return False
+    if risk == "confirm":
+        if not settings["dangerous_enabled"]:
+            CORE.security.audit(
+                "discord_voice", command, risk, "dangerous_locked",
+                owner_id, channel_id,
+            )
+            response = "🔒 Lệnh nguy hiểm từ xa đang bị tắt trong ứng dụng Ubuntu."
+            await response_channel.send(response)
+            await speak_on_ubuntu_and_discord(response, response_channel)
+            return False
+        if owner_id is None or channel_id is None:
+            response = "⚠️ Không xác định được chủ tài khoản hoặc kênh để xác nhận an toàn."
+            await response_channel.send(response)
+            await speak_on_ubuntu_and_discord(response, response_channel)
+            return False
+        CORE.security.audit(
+            "discord_voice", command, risk, "pending_confirmation",
+            owner_id, channel_id,
+        )
+        warning = (
+            f"⚠️ **Lệnh giọng nói cần xác nhận**\n`{command}`\n\n"
+            "Chỉ tài khoản của bạn có thể xác nhận. Yêu cầu hết hạn sau 60 giây."
+        )
+        await response_channel.send(
+            warning,
+            view=DiscordDangerConfirmationView(command, owner_id, channel_id),
+        )
+        await speak_on_ubuntu_and_discord(
+            "Lệnh này cần bạn bấm xác nhận trong kênh Discord.",
+            response_channel,
+        )
+        return True
+    if normalized in {
+        "thoát", "thoat", "exit", "quit", "bye", "tạm biệt", "tam biet",
+    }:
+        response = "🔒 Không thể thoát Jarvis bằng giọng nói từ Discord."
+        await response_channel.send(response)
+        await speak_on_ubuntu_and_discord(response, response_channel)
+        return False
+    if _discord_command_needs_profile(command):
+        response = (
+            "Lệnh này cần nói rõ Chrome profile, ví dụ: "
+            "Jarvis mở YouTube cá nhân."
+        )
+        await response_channel.send(response)
+        await speak_on_ubuntu_and_discord(response, response_channel)
+        return False
+
+    CORE.security.audit(
+        "discord_voice", command, risk, "accepted", owner_id, channel_id
+    )
+    if normalized in device_commands:
+        return await handle_discord_spoken_device_command(
+            normalized, response_channel
+        )
+    CORE.conversation.add("discord_voice", "user", command)
+    try:
+        async with discord_command_lock:
+            last_command_response = None
+            last_spoken_response = None
+            last_response_attachment = None
+            await route_command(command, source="discord")
+            response = last_command_response or "✅ Jarvis đã xử lý lệnh."
+        response = redact_sensitive(response)
+        if risk != "sensitive":
+            CORE.conversation.add("discord_voice", "assistant", response)
+        remaining = response
+        first_chunk = True
+        while remaining:
+            if len(remaining) <= 1900:
+                chunk, remaining = remaining, ""
+            else:
+                split_at = remaining.rfind("\n", 0, 1900)
+                if split_at < 500:
+                    split_at = 1900
+                chunk = remaining[:split_at].rstrip()
+                remaining = remaining[split_at:].lstrip()
+            attachment = safe_response_attachment() if first_chunk else None
+            send_options = {}
+            if attachment:
+                send_options["file"] = discord.File(str(attachment))
+            await response_channel.send(chunk, **send_options)
+            if (
+                attachment and owner_id is not None and channel_id is not None
+                and _is_marked_screenshot_request(command)
+            ):
+                _remember_marked_screenshot(owner_id, channel_id, attachment)
+            first_chunk = False
+        spoken_response = last_spoken_response or response
+        if spoken_response is not False:
+            # Keep voice replies useful without making Jarvis read a long
+            # report or help catalogue aloud in the channel.
+            await speak_on_ubuntu_and_discord(
+                str(spoken_response)[:600], response_channel
+            )
+        return True
+    except Exception as error:
+        print(
+            "Jarvis: Lỗi Discord voice command: "
+            f"{type(error).__name__}: {error}",
+            flush=True,
+        )
+        response = "❌ Jarvis gặp lỗi khi xử lý lệnh giọng nói."
+        await response_channel.send(response)
+        await speak_on_ubuntu_and_discord(response, response_channel)
+        return False
+
+
+async def handle_discord_chat_voice_message(message):
+    """Transcribe and route one owner's Discord Voice Message attachment."""
+    attachment = next((
+        item for item in getattr(message, "attachments", [])
+        if callable(getattr(item, "is_voice_message", None))
+        and item.is_voice_message()
+    ), None)
+    if attachment is None:
+        return False
+    duration = float(getattr(attachment, "duration", 0) or 0)
+    size = int(getattr(attachment, "size", 0) or 0)
+    if duration <= 0 or duration > DISCORD_VOICE_MESSAGE_MAX_SECONDS:
+        await message.reply(
+            "❌ Tin nhắn thoại dùng làm lệnh phải dài tối đa 15 giây.",
+            mention_author=False,
+        )
+        return True
+    if size <= 0 or size > DISCORD_VOICE_MESSAGE_MAX_BYTES:
+        await message.reply(
+            "❌ Tin nhắn thoại trống hoặc lớn hơn 8 MB.",
+            mention_author=False,
+        )
+        return True
+    if not CORE.security.rate_limit(f"voice-message:{message.author.id}"):
+        await message.reply(
+            "⏳ Bạn gửi lệnh thoại quá nhanh. Hãy chờ khoảng 10 giây.",
+            mention_author=False,
+        )
+        return True
+    try:
+        encoded_audio = await attachment.read()
+        if not encoded_audio or len(encoded_audio) > DISCORD_VOICE_MESSAGE_MAX_BYTES:
+            raise ValueError("tin nhắn thoại trống hoặc quá lớn")
+        pcm = await asyncio.to_thread(
+            decode_voice_message_audio, encoded_audio
+        )
+        result = await asyncio.to_thread(recognize_whisper_pcm, pcm)
+        command = match_whisper_chat_command(result)
+    except (OSError, ValueError) as error:
+        print(
+            "Jarvis: Discord chat voice message lỗi: "
+            f"{type(error).__name__}: {error}",
+            flush=True,
+        )
+        await message.reply(
+            "❌ Jarvis không đọc được tin nhắn thoại này.",
+            mention_author=False,
+        )
+        return True
+    heard = str((result or {}).get("text", "")).strip()
+    if command is None:
+        detail = f" Jarvis nghe được: `{heard}`" if heard else ""
+        await message.reply(
+            "🤔 Jarvis chưa nhận ra lệnh rõ ràng." + detail,
+            mention_author=False,
+        )
+        return True
+    await message.reply(
+        f"🗣️ Jarvis nghe: **{command}**",
+        mention_author=False,
+    )
+    await handle_discord_spoken_command(
+        command, message.channel, owner_id=message.author.id
+    )
+    return True
+
+
+async def handle_discord_voice_heard(heard, accepted_command, response_channel):
+    """Echo the recognized phrase in General without local Ubuntu audio."""
+    cleaned = str(heard).strip()
+    if not cleaned:
+        return False
+    displayed = (
+        f"Jarvis {accepted_command}" if accepted_command else cleaned
+    )
+    suffix = "" if accepted_command else " — chưa thực hiện lệnh"
+    await response_channel.send(
+        f"🗣️ Jarvis nghe: **{displayed}**{suffix}"
+    )
+    await speak_on_ubuntu_and_discord(
+        f"Bạn vừa nói {displayed}.", response_channel
+    )
+    return True
+
+
+async def speak_on_ubuntu_and_discord(text, response_channel):
+    """Generate TTS without local playback, then play it only in Discord."""
+    async with discord_tts_lock:
+        # The TTS worker internally renders long text in safe-sized pieces
+        # and joins their audio before this single Discord playback.
+        return await _speak_on_discord_locked(text, response_channel)
+
+
+async def _speak_on_discord_locked(
+    text, response_channel, *, wait_for_playback=False
+):
+    output_path = TTS_DIR / "output.wav"
+    previous_mtime = (
+        output_path.stat().st_mtime_ns if output_path.is_file() else 0
+    )
+    if not speak(text, play_local=False):
+        return False
+
+    generated = False
+    for _attempt in range(300):
+        await asyncio.sleep(0.1)
+        try:
+            if (
+                output_path.is_file()
+                and output_path.stat().st_mtime_ns > previous_mtime
+                and output_path.stat().st_size > 44
+            ):
+                generated = True
+                break
+        except OSError:
+            pass
+    if not generated:
+        print("Jarvis: Discord TTS chờ file WAV quá thời gian.", flush=True)
+        return False
+
+    voice_client = getattr(
+        getattr(response_channel, "guild", None), "voice_client", None
+    )
+    if voice_client is None or not voice_client.is_connected():
+        return False
+    if voice_client.is_playing():
+        # VoiceRecvClient.stop() would also stop inbound recognition.  Stop
+        # only the stale outbound player so a missed FFmpeg after-callback can
+        # never block every later acknowledgement.
+        if hasattr(voice_client, "stop_playing"):
+            voice_client.stop_playing()
+        else:
+            voice_client.stop()
+        await asyncio.sleep(0.15)
+
+    handle = tempfile.NamedTemporaryFile(
+        prefix="jarvis-discord-", suffix=".wav", delete=False
+    )
+    discord_wav = Path(handle.name)
+    handle.close()
+    try:
+        shutil.copy2(output_path, discord_wav)
+        source = discord.FFmpegPCMAudio(str(discord_wav))
+
+        playback_done = asyncio.Event()
+        event_loop = asyncio.get_running_loop()
+
+        def playback_finished(error):
+            try:
+                discord_wav.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if error is not None:
+                print(
+                    "Jarvis: Discord TTS playback lỗi: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
+            event_loop.call_soon_threadsafe(playback_done.set)
+
+        voice_client.play(source, after=playback_finished)
+        print(
+            f"Jarvis: Discord TTS bắt đầu phát: {text}",
+            flush=True,
+        )
+        if wait_for_playback:
+            try:
+                await asyncio.wait_for(playback_done.wait(), timeout=35)
+            except asyncio.TimeoutError:
+                print(
+                    "Jarvis: Discord TTS phát quá thời gian chờ.",
+                    flush=True,
+                )
+                return False
+        return True
+    except Exception:
+        discord_wav.unlink(missing_ok=True)
+        raise
+    return True
+
+
 async def handle_voice_command(command, trigger):
     """Route a local STT result while blocking risky false recognitions."""
     global last_command_response
@@ -418,7 +1025,7 @@ async def handle_voice_command(command, trigger):
 
 async def _handle_ipc_client(reader, writer):
     """Nhận từng lệnh JSON qua Unix socket và xử lý trong process Jarvis chính."""
-    global last_command_response
+    global last_command_response, last_response_attachment
     try:
         while line := await reader.readline():
             try:
@@ -434,6 +1041,7 @@ async def _handle_ipc_client(reader, writer):
                 command, confirmation_note = resolve_command_confirmation(command, source)
                 async with discord_command_lock:
                     last_command_response = None
+                    last_response_attachment = None
                     if confirmation_note and command == original_command:
                         set_command_response(confirmation_note)
                     else:
@@ -443,7 +1051,11 @@ async def _handle_ipc_client(reader, writer):
                     CORE.conversation.add(source, "assistant", response)
                 if not silent:
                     speak_last_response()
-                payload = {"ok": True, "response": response}
+                payload = {
+                    "ok": True,
+                    "response": response,
+                    "attachment": last_response_attachment,
+                }
             except Exception as error:
                 payload = {"ok": False, "response": f"Không thể xử lý lệnh: {error}"}
             writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -494,6 +1106,7 @@ soundcloud_tracks = []
 soundcloud_page_id = None
 managed_cdp_targets = {
     "youtube": set(), "soundcloud": set(), "zalo": set(), "gmail": set(),
+    "weather": set(),
 }
 
 
@@ -561,6 +1174,30 @@ def choose_chrome_profile(command=""):
 # ==========================================================
 # MỞ CHROME
 # ==========================================================
+
+def _refresh_graphical_environment():
+    """Import the current desktop environment into an early-started service."""
+    if os.environ.get("DISPLAY"):
+        return True
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    allowed = {"DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"}
+    for line in result.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name in allowed and value:
+            os.environ[name] = value
+    return bool(os.environ.get("DISPLAY"))
+
 
 def _jarvis_debug_port_owner_pid():
     """Return the PID listening on Jarvis' loopback DevTools port."""
@@ -635,6 +1272,7 @@ def ensure_jarvis_chrome(url="chrome://newtab/"):
     args = [
         "google-chrome",
         "--ozone-platform=x11",
+        "--force-renderer-accessibility",
         "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={JARVIS_CHROME_DEBUG_PORT}",
         f"--user-data-dir={JARVIS_CHROME_DATA_DIR}",
@@ -658,7 +1296,8 @@ def ensure_jarvis_chrome(url="chrome://newtab/"):
 
 
 def _automation_site_key(url):
-    host = (urlparse(url).hostname or "").lower()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
     if host == "chat.zalo.me":
         return "zalo"
     if host in {"mail.google.com", "accounts.google.com"}:
@@ -667,6 +1306,10 @@ def _automation_site_key(url):
         return "youtube"
     if host == "soundcloud.com" or host.endswith(".soundcloud.com"):
         return "soundcloud"
+    if host in {"google.com", "www.google.com"} and parsed.path == "/search":
+        query = parse_qs(parsed.query).get("q", [""])[0]
+        if "thoi tiet" in normalize_core_text(query):
+            return "weather"
     return None
 
 
@@ -707,6 +1350,61 @@ def _record_managed_cdp_target(site_key, before_ids):
     return bool(owned.intersection(matching))
 
 
+def _managed_cdp_site_is_open(site_key):
+    """Confirm an exact owned page in Jarvis' isolated Chrome browser."""
+    if not _jarvis_chrome_ready():
+        return False
+    pages = _cdp_pages()
+    if pages is None:
+        return False
+    owned = set(managed_cdp_targets.get(site_key, set()))
+    matches = [
+        page for page in pages
+        if page.get("id") in owned
+        and _automation_site_key(page.get("url", "")) == site_key
+    ]
+    return len(matches) == 1
+
+
+def _activate_managed_cdp_target(target_id):
+    """Bring one already-owned Jarvis Chrome tab to the foreground."""
+    target_id = str(target_id or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", target_id):
+        return False
+    try:
+        with urlopen(
+            f"{JARVIS_CHROME_DEBUG_URL}/json/activate/{target_id}", timeout=3
+        ) as response:
+            return getattr(response, "status", 200) == 200
+    except OSError:
+        return False
+
+
+def _close_owned_cdp_targets(site_key, target_ids):
+    """Close exact lifecycle-owned targets without touching other profiles."""
+    global mcp_page_topology_changed
+    owned = managed_cdp_targets.setdefault(site_key, set())
+    targets = {
+        str(target_id) for target_id in target_ids
+        if str(target_id) in owned
+        and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(target_id))
+    }
+    closed = set()
+    for target_id in targets:
+        try:
+            with urlopen(
+                f"{JARVIS_CHROME_DEBUG_URL}/json/close/{target_id}", timeout=4
+            ):
+                pass
+            closed.add(target_id)
+        except OSError:
+            pass
+    if closed:
+        owned.difference_update(closed)
+        mcp_page_topology_changed = True
+    return closed == targets
+
+
 def _ensure_jarvis_chrome_tab(url):
     """Open an automation URL through the verified loopback CDP browser."""
     global mcp_page_topology_changed
@@ -729,22 +1427,39 @@ def _ensure_jarvis_chrome_tab(url):
         # khôi phục ownership thay vì mở một tab trùng lặp.
         if site_key and not owned and len(site_pages) == 1:
             owned.add(site_pages[0]["id"])
+        owned_site_pages = [
+            page for page in site_pages if page.get("id") in owned
+        ]
+        if site_key == "weather":
+            exact = [
+                page for page in owned_site_pages
+                if str(page.get("url", "")).rstrip("/") == target_url
+            ]
+            if exact:
+                keep_id = exact[0]["id"]
+                extras = {
+                    page["id"] for page in owned_site_pages
+                    if page["id"] != keep_id
+                }
+                if not _close_owned_cdp_targets(site_key, extras):
+                    return False
+                return _activate_managed_cdp_target(keep_id)
         for page in pages if isinstance(pages, list) else []:
             if not isinstance(page, dict) or page.get("id") not in owned:
                 continue
             page_url = str(page.get("url", "")).rstrip("/")
             if page_url == target_url:
-                return True
+                return _activate_managed_cdp_target(page.get("id"))
             page_host = (urlparse(page_url).hostname or "").lower()
             if site_key == "gmail" and page_host in {
                 "mail.google.com", "accounts.google.com",
             }:
-                return True
+                return _activate_managed_cdp_target(page.get("id"))
             if site_key == "soundcloud" and (
                 page_host == "soundcloud.com"
                 or page_host.endswith(".soundcloud.com")
             ):
-                return True
+                return _activate_managed_cdp_target(page.get("id"))
         encoded_url = quote_plus(str(url))
         request = Request(
             f"{JARVIS_CHROME_DEBUG_URL}/json/new?{encoded_url}", method="PUT"
@@ -756,6 +1471,16 @@ def _ensure_jarvis_chrome_tab(url):
             created_id = created.get("id")
             if site_key and created_id:
                 owned.add(created_id)
+            if site_key == "weather":
+                replaced = {
+                    page["id"] for page in owned_site_pages
+                    if page.get("id") != created_id
+                }
+                if not _close_owned_cdp_targets(site_key, replaced):
+                    # Roll back the newly-created tab when an old owned tab
+                    # could not be closed, preserving fail-closed uniqueness.
+                    _close_owned_cdp_targets(site_key, {created_id})
+                    return False
             # chrome-devtools-mcp giữ snapshot page targets của session hiện
             # tại và có thể chưa thấy tab được tạo trực tiếp qua /json/new.
             # Đánh dấu để get_mcp_session kết nối lại trước lần đọc kế tiếp.
@@ -771,6 +1496,8 @@ def _is_automation_url(url, profile=None):
     except (TypeError, ValueError):
         return False
     return (
+        (_automation_site_key(url) == "weather" and profile == JARVIS_CHROME_PROFILE)
+        or
         host == "youtube.com"
         or host.endswith(".youtube.com")
         or host == "soundcloud.com"
@@ -781,17 +1508,19 @@ def _is_automation_url(url, profile=None):
 
 
 def open_chrome(profile, url):
+    _refresh_graphical_environment()
     previous_window_ids = CHROME_WINDOWS.snapshot_ids()
     if previous_window_ids is None:
         return False
     if _is_automation_url(url, profile):
         automation_host = (urlparse(url).hostname or "").lower()
-        target_hint = {
+        site_key = _automation_site_key(url) or {
             "chat.zalo.me": "zalo",
             "mail.google.com": "gmail",
             "soundcloud.com": "soundcloud",
             "www.soundcloud.com": "soundcloud",
         }.get(automation_host, "youtube")
+        target_hint = "thời tiết" if site_key == "weather" else site_key
         before_pages = _cdp_pages() if _jarvis_chrome_ready() else []
         if before_pages is None:
             return False
@@ -799,7 +1528,7 @@ def open_chrome(profile, url):
         opened = ensure_jarvis_chrome(url)
         owner_pid = _jarvis_debug_port_owner_pid() if opened else None
         target_owned = (
-            _record_managed_cdp_target(target_hint, before_target_ids)
+            _record_managed_cdp_target(site_key, before_target_ids)
             if owner_pid is not None else False
         )
         return bool(
@@ -820,7 +1549,7 @@ def open_chrome(profile, url):
         chrome_args.append(f"--app={url}")
     else:
         chrome_args.append(url)
-    subprocess.Popen(
+    launch_process = subprocess.Popen(
         chrome_args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -835,9 +1564,19 @@ def open_chrome(profile, url):
         "chat.zalo.me": "zalo",
         "www.google.com": "google",
     }.get(host)
-    return CHROME_WINDOWS.track_profile_window(
+    tracked = CHROME_WINDOWS.track_profile_window(
         profile, previous_window_ids, site_key=site_key
     )
+    if tracked:
+        return True
+    # A regular Chrome process may already be running natively on Wayland.
+    # Chrome then forwards this request to that process and the small launcher
+    # exits successfully, but wmctrl cannot see or own the new Wayland window.
+    # Report the accepted open request without inventing close ownership.
+    try:
+        return launch_process.wait(timeout=2) == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 # ==========================================================
@@ -970,6 +1709,16 @@ def handle_chrome_shortcut(command):
 
     site_name, url = shortcut
     opened = open_chrome(profile, url)
+
+    # Focusing an XWayland window may briefly fail while its title is still
+    # loading.  Do not report that Zalo/Gmail failed when the exact tab is
+    # already present in Jarvis' verified, isolated CDP browser.
+    if opened is False and profile == STUDY_PROFILE:
+        site_key = "zalo" if target_text in {"zalo", "zalo web"} else (
+            "gmail" if target_text in {"gmail", "mail"} else None
+        )
+        if site_key:
+            opened = _managed_cdp_site_is_open(site_key)
 
     if target_text in {"zalo", "zalo web"}:
         message = "✅ Đã mở Zalo." if opened else "❌ Không thể mở Zalo lúc này."
@@ -1162,7 +1911,21 @@ def _json_from_mcp_result(result, default=None):
     return default
 
 
-async def extract_videos_from_page(session, limit=10):
+async def evaluate_mcp_script(session, page_id, script):
+    """Run JavaScript on one explicit MCP page.
+
+    chrome-devtools-mcp 1.8 requires ``pageId`` for every page-scoped tool;
+    relying on the previously selected page now returns MCP error -32602.
+    """
+    if page_id is None:
+        raise ValueError("MCP pageId is required")
+    return await session.call_tool(
+        "evaluate_script",
+        arguments={"pageId": page_id, "function": script},
+    )
+
+
+async def extract_videos_from_page(session, page_id, limit=10):
     """Chỉ lấy link video thật (/watch?v=...), bỏ sidebar/kênh/menu."""
     script = r'''() => {
         const videos = new Map();
@@ -1203,10 +1966,7 @@ async def extract_videos_from_page(session, limit=10):
         return Array.from(videos.values());
     }'''
 
-    result = await session.call_tool(
-        "evaluate_script",
-        arguments={"function": script},
-    )
+    result = await evaluate_mcp_script(session, page_id, script)
 
     raw_videos = _json_from_mcp_result(result, default=[])
     if not isinstance(raw_videos, list):
@@ -1238,7 +1998,7 @@ async def extract_videos_from_page(session, limit=10):
     return videos
 
 
-async def extract_soundcloud_tracks_from_page(session, limit=10):
+async def extract_soundcloud_tracks_from_page(session, page_id, limit=10):
     """Read playable SoundCloud track links from the currently selected page."""
     script = r'''() => {
         const tracks = new Map();
@@ -1278,9 +2038,7 @@ async def extract_soundcloud_tracks_from_page(session, limit=10):
         }
         return Array.from(tracks.values());
     }'''
-    result = await session.call_tool(
-        "evaluate_script", arguments={"function": script}
-    )
+    result = await evaluate_mcp_script(session, page_id, script)
     raw_tracks = _json_from_mcp_result(result, default=[])
     if not isinstance(raw_tracks, list):
         return []
@@ -1383,16 +2141,27 @@ def rotate_mcp_error_log(
 
 
 def create_mcp_server():
+    # chrome-devtools-mcp can retain large page snapshots during a long-lived
+    # Jarvis session.  Node's default ~2 GiB old-space limit has proved too
+    # small in normal use, so give the dedicated MCP child some headroom while
+    # preserving an explicit NODE_OPTIONS value supplied by the user.
+    node_options = os.environ.get("NODE_OPTIONS", "").strip()
+    if not re.search(r"(?:^|\s)--max-old-space-size(?:=|\s)", node_options):
+        node_options = " ".join(
+            option for option in (node_options, "--max-old-space-size=4096")
+            if option
+        )
     return StdioServerParameters(
         command="npx",
         args=[
             "-y",
-            "chrome-devtools-mcp@latest",
+            "chrome-devtools-mcp@1.8.0",
             "--browserUrl",
             JARVIS_CHROME_DEBUG_URL,
             "--no-usage-statistics",
             "--no-performance-crux",
         ],
+        env={"NODE_OPTIONS": node_options},
     )
 
 
@@ -1509,11 +2278,22 @@ async def close_mcp_session():
 
 async def _find_owned_mcp_pages(session, site_key):
     owned_ids = set(managed_cdp_targets.get(site_key, set()))
-    if not owned_ids:
-        return []
     pages = _cdp_pages()
     if pages is None:
         return []
+    if not owned_ids:
+        # Jarvis may restart while its verified, isolated Chrome process keeps
+        # running. Recover ownership only for one unambiguous target in that
+        # browser; duplicates still fail closed.
+        candidates = [
+            page.get("id") for page in pages
+            if page.get("id")
+            and _automation_site_key(page.get("url", "")) == site_key
+        ]
+        if len(candidates) != 1 or not _jarvis_chrome_ready():
+            return []
+        managed_cdp_targets.setdefault(site_key, set()).add(candidates[0])
+        owned_ids = {candidates[0]}
     owned_urls = {
         str(page.get("url", "")).rstrip("/")
         for page in pages
@@ -1542,6 +2322,11 @@ async def find_youtube_page(session):
 
 async def find_soundcloud_page(session):
     matches = await _find_owned_mcp_pages(session, "soundcloud")
+    return matches[0][0] if len(matches) == 1 else None
+
+
+async def find_weather_page(session):
+    matches = await _find_owned_mcp_pages(session, "weather")
     return matches[0][0] if len(matches) == 1 else None
 
 
@@ -1619,6 +2404,7 @@ async def read_gmail_inbox(limit=20, unread_only=False, bring_to_front=False, fo
     if restore_inbox:
         navigated = await session.call_tool(
             "navigate_page", arguments={
+                "pageId": page_id,
                 "type": "url", "url": configured_gmail_folder_url("spam"),
             },
         )
@@ -1628,9 +2414,7 @@ async def read_gmail_inbox(limit=20, unread_only=False, bring_to_front=False, fo
     try:
         for attempt in range(5):
             result = _json_from_mcp_result(
-                await session.call_tool(
-                    "evaluate_script", arguments={"function": GMAIL_INBOX_SCRIPT}
-                ),
+                await evaluate_mcp_script(session, page_id, GMAIL_INBOX_SCRIPT),
                 default={},
             )
             if isinstance(result, dict) and (result.get("ok") or result.get("loginRequired")):
@@ -1642,6 +2426,7 @@ async def read_gmail_inbox(limit=20, unread_only=False, bring_to_front=False, fo
             try:
                 await session.call_tool(
                     "navigate_page", arguments={
+                        "pageId": page_id,
                         "type": "url", "url": configured_gmail_folder_url("inbox"),
                     },
                 )
@@ -1690,6 +2475,7 @@ async def mark_gmail_messages_read(messages, folder="inbox"):
     if restore_inbox:
         result = await session.call_tool(
             "navigate_page", arguments={
+                "pageId": page_id,
                 "type": "url", "url": configured_gmail_folder_url("spam"),
             },
         )
@@ -1761,7 +2547,7 @@ async def mark_gmail_messages_read(messages, folder="inbox"):
     }}'''
     try:
         result = _json_from_mcp_result(
-            await session.call_tool("evaluate_script", arguments={"function": script}),
+            await evaluate_mcp_script(session, page_id, script),
             default={},
         )
         return int(result.get("marked", 0)) if isinstance(result, dict) else 0
@@ -1770,6 +2556,7 @@ async def mark_gmail_messages_read(messages, folder="inbox"):
             try:
                 await session.call_tool(
                     "navigate_page", arguments={
+                        "pageId": page_id,
                         "type": "url", "url": configured_gmail_folder_url("inbox"),
                     },
                 )
@@ -1924,10 +2711,23 @@ async def close_managed_web_tab(site_key, site_name, url_needles):
     del url_needles  # Kept for command-call compatibility; URL matching is unsafe.
     owned = set(managed_cdp_targets.get(site_key, set()))
     if not owned:
-        message = f"❌ Không còn xác minh được tab {site_name} nào do Jarvis mở."
-        set_command_response(message)
-        print(f"Jarvis: {message}")
-        return False
+        # The service can restart while its isolated Chrome keeps running.
+        # Recover only one unambiguous site target from that verified browser;
+        # never adopt a tab from the user's regular Chrome profiles.
+        recovery_pages = _cdp_pages()
+        candidates = [
+            page.get("id") for page in recovery_pages or []
+            if page.get("id")
+            and _automation_site_key(page.get("url", "")) == site_key
+        ]
+        if _jarvis_chrome_ready() and len(candidates) == 1:
+            managed_cdp_targets.setdefault(site_key, set()).add(candidates[0])
+            owned = {candidates[0]}
+        else:
+            message = f"❌ Không còn xác minh được tab {site_name} nào do Jarvis mở."
+            set_command_response(message)
+            print(f"Jarvis: {message}")
+            return False
     pages = _cdp_pages()
     if pages is None:
         message = f"❌ Không thể xác minh tab {site_name}; giữ ownership để thử lại."
@@ -2089,9 +2889,7 @@ async def summarize_zalo_work(max_chats=20, selected_date=None, group_query=None
         prepared = {}
         for prepare_attempt in range(4):
             prepared = _json_from_mcp_result(
-                await session.call_tool(
-                    "evaluate_script", arguments={"function": prepare_script}
-                ),
+                await evaluate_mcp_script(session, page_id, prepare_script),
                 default={},
             )
             if isinstance(prepared, dict) and prepared.get("ok"):
@@ -2148,7 +2946,7 @@ async def summarize_zalo_work(max_chats=20, selected_date=None, group_query=None
               return {{ok:true, title, preview, content:content.slice(-1400)}};
             }}'''
             item = _json_from_mcp_result(
-                await session.call_tool("evaluate_script", arguments={"function": script}),
+                await evaluate_mcp_script(session, page_id, script),
                 default={},
             )
             if not isinstance(item, dict) or not item.get("ok"):
@@ -2235,6 +3033,7 @@ async def read_youtube_videos(
 
             videos = await extract_videos_from_page(
                 session,
+                youtube_page_id,
                 limit=10,
             )
 
@@ -2369,6 +3168,7 @@ async def get_current_youtube_videos(session, limit=20):
 
     videos = await extract_videos_from_page(
         session,
+        youtube_page_id,
         limit=limit,
     )
 
@@ -2482,6 +3282,7 @@ async def open_video(number):
         await session.call_tool(
             "navigate_page",
             arguments={
+                "pageId": youtube_page_id,
                 "type": "url",
                 "url": selected_url,
             },
@@ -2512,7 +3313,9 @@ async def open_video_by_name(query):
 
     try:
         session = await get_mcp_session()
-        _, current_videos = await get_current_youtube_videos(session, limit=40)
+        current_page_id, current_videos = await get_current_youtube_videos(
+            session, limit=40
+        )
 
         if not current_videos:
             message = "❌ Không đọc được video trên tab YouTube hiện tại."
@@ -2541,6 +3344,7 @@ async def open_video_by_name(query):
         await session.call_tool(
             "navigate_page",
             arguments={
+                "pageId": current_page_id,
                 "type": "url",
                 "url": selected_url,
             },
@@ -2594,10 +3398,7 @@ async def control_youtube_playback(should_play):
                 return {{ok: false, error: String(error)}};
             }}
         }}'''
-        result = await session.call_tool(
-            "evaluate_script",
-            arguments={"function": script},
-        )
+        result = await evaluate_mcp_script(session, youtube_page_id, script)
         state = _json_from_mcp_result(result, default={})
         if not isinstance(state, dict) or not state.get("ok"):
             detail = state.get("error") if isinstance(state, dict) else None
@@ -2723,9 +3524,7 @@ async def report_youtube_now_playing():
                 )
                 if _is_mcp_tool_error(selected):
                     raise RuntimeError("MCP select_page failed")
-                result = await session.call_tool(
-                    "evaluate_script", arguments={"function": script}
-                )
+                result = await evaluate_mcp_script(session, page_id, script)
                 if _is_mcp_tool_error(result):
                     raise RuntimeError("MCP evaluate_script failed")
                 candidate = _json_from_mcp_result(result, default={})
@@ -2868,6 +3667,7 @@ async def search_youtube(command):
             await session.call_tool(
                 "navigate_page",
                 arguments={
+                    "pageId": youtube_page_id,
                     "type": "url",
                     "url": search_url,
                 },
@@ -2890,6 +3690,7 @@ async def search_youtube(command):
 
             open_chrome(profile, search_url)
             await asyncio.sleep(0.8)
+            session = await get_mcp_session()
             youtube_page_id = await find_youtube_page(session)
 
         youtube_videos = []
@@ -3011,7 +3812,9 @@ async def get_current_soundcloud_tracks(session, limit=20, *, bring_to_front=Tru
         )
         if _is_mcp_tool_error(selected):
             return None, []
-    tracks = await extract_soundcloud_tracks_from_page(session, limit=limit)
+    tracks = await extract_soundcloud_tracks_from_page(
+        session, soundcloud_page_id, limit=limit
+    )
     return soundcloud_page_id, tracks
 
 
@@ -3100,6 +3903,8 @@ async def search_soundcloud(command):
             if not open_chrome(JARVIS_CHROME_PROFILE, search_url):
                 raise RuntimeError("open failed")
             await asyncio.sleep(0.8)
+            session = await get_mcp_session()
+            soundcloud_page_id = await find_soundcloud_page(session)
         else:
             selected = await session.call_tool(
                 "select_page",
@@ -3108,7 +3913,10 @@ async def search_soundcloud(command):
             if _is_mcp_tool_error(selected):
                 raise RuntimeError("select failed")
             navigated = await session.call_tool(
-                "navigate_page", arguments={"type": "url", "url": search_url}
+                "navigate_page", arguments={
+                    "pageId": soundcloud_page_id,
+                    "type": "url", "url": search_url,
+                }
             )
             if _is_mcp_tool_error(navigated):
                 raise RuntimeError("navigate failed")
@@ -3165,7 +3973,9 @@ async def open_soundcloud_track(number=None, query=""):
             set_command_response(message)
             return False
         navigated = await session.call_tool(
-            "navigate_page", arguments={"type": "url", "url": url}
+            "navigate_page", arguments={
+                "pageId": soundcloud_page_id, "type": "url", "url": url,
+            }
         )
         if _is_mcp_tool_error(navigated):
             raise RuntimeError("navigate failed")
@@ -3223,9 +4033,7 @@ async def control_soundcloud_playback(should_play):
                 return {{ok: true}};
             }} catch (_) {{ return {{ok: false}}; }}
         }}'''
-        result = await session.call_tool(
-            "evaluate_script", arguments={"function": script}
-        )
+        result = await evaluate_mcp_script(session, soundcloud_page_id, script)
         state = _json_from_mcp_result(result, default={})
         if _is_mcp_tool_error(result) or not isinstance(state, dict) or not state.get("ok"):
             raise RuntimeError("playback failed")
@@ -3286,7 +4094,7 @@ async def report_soundcloud_now_playing():
                 pageUrl: location.href
             };
         }'''
-        result = await session.call_tool("evaluate_script", arguments={"function": script})
+        result = await evaluate_mcp_script(session, soundcloud_page_id, script)
         state = _json_from_mcp_result(result, default={})
         if _is_mcp_tool_error(result) or not isinstance(state, dict) or not _is_soundcloud_url(
             state.get("pageUrl", "")
@@ -3373,7 +4181,10 @@ async def go_soundcloud_home():
         )
         navigated = await session.call_tool(
             "navigate_page",
-            arguments={"type": "url", "url": "https://soundcloud.com/discover"},
+            arguments={
+                "pageId": soundcloud_page_id,
+                "type": "url", "url": "https://soundcloud.com/discover",
+            },
         )
         if _is_mcp_tool_error(navigated):
             raise RuntimeError("navigate failed")
@@ -3551,12 +4362,14 @@ async def go_youtube_home():
 
             open_chrome(profile, "https://www.youtube.com/")
             await asyncio.sleep(0.8)
+            session = await get_mcp_session()
             youtube_page_id = await find_youtube_page(session)
         else:
             # Điều hướng NGAY TRÊN TAB HIỆN TẠI, không tạo tab mới.
             await session.call_tool(
                 "navigate_page",
                 arguments={
+                    "pageId": youtube_page_id,
                     "type": "url",
                     "url": "https://www.youtube.com/",
                 },
@@ -3743,6 +4556,274 @@ def search_google(command, *, allow_prompt=True):
     print(f"Jarvis: {message}")
     set_command_response(message)
     return opened is not False
+
+
+def weather_period_from_command(command):
+    """Return a Google weather query and spoken period for direct commands."""
+    plain = normalize_core_text(command)
+    weather_first = re.match(r"^(?:du bao )?thoi tiet\b", plain)
+    period_first = re.match(
+        r"^(?:hom nay|tuan nay|tuan toi|(?:1|mot) tuan nua) "
+        r"(?:du bao )?thoi tiet\b",
+        plain,
+    )
+    if not weather_first and not period_first:
+        return None
+    if "tuan toi" in plain:
+        return "thời tiết tuần tới", "tuần tới"
+    if re.search(r"\b(?:1|mot) tuan nua\b", plain):
+        return "thời tiết một tuần nữa", "một tuần nữa"
+    if "tuan nay" in plain:
+        return "thời tiết tuần này", "tuần này"
+    if re.search(r"\b(?:(?:1|mot) tuan|7 ngay)\b", plain):
+        return "thời tiết 7 ngày tới", "một tuần"
+    if "hom nay" in plain or "bay gio" in plain:
+        return "thời tiết", "hôm nay"
+    return "thời tiết", "hiện tại"
+
+
+WEATHER_CARD_SCRIPT = r'''() => {
+  const text = selector => (document.querySelector(selector)?.textContent || '').trim();
+  const selected = document.querySelector('#wob_dp .wob_df.wob_ds');
+  const temperatures = (selected?.innerText.match(/-?\d+/g) || []).slice(-2);
+  return {
+    temperature: text('#wob_tm'),
+    precipitation: text('#wob_pp'),
+    condition: text('#wob_dc'),
+    location: text('#wob_loc'),
+    selectedIndex: selected?.getAttribute('data-wob-di') || '',
+    dayLabel: selected?.querySelector('[aria-label]')?.getAttribute('aria-label') || '',
+    high: temperatures[0] || '',
+    low: temperatures[1] || '',
+  };
+}'''
+
+def weather_select_day_script(index):
+    """Build the DOM action for one of Google's eight forecast tiles."""
+    index = int(index)
+    if not 0 <= index <= 7:
+        raise ValueError("weather day index must be between 0 and 7")
+    return rf'''() => {{
+  const day = document.querySelector('#wob_dp .wob_df[data-wob-di="{index}"]');
+  if (!day) return false;
+  day.click();
+  return true;
+}}'''
+
+
+def format_google_weather_report(data, period):
+    """Format only verified fields read from Google's weather card."""
+    if not isinstance(data, dict):
+        return None
+    weekly_periods = {"một tuần", "một tuần nữa", "tuần này", "tuần tới"}
+    if period in weekly_periods:
+        days = data.get("days")
+        if not isinstance(days, list) or len(days) not in {7, 8}:
+            return None
+        reports = []
+        rain_chances = []
+        sunny_days = 0
+        for index, day in enumerate(days):
+            if not isinstance(day, dict):
+                return None
+            high = str(day.get("high", "")).strip()
+            low = str(day.get("low", "")).strip()
+            precipitation = str(day.get("precipitation", "")).strip()
+            condition = " ".join(str(day.get("condition", "")).split())[:80]
+            day_label = " ".join(str(day.get("dayLabel", "")).split())[:40]
+            if (
+                str(day.get("selectedIndex", "")) != str(index)
+                or not day_label
+                or not re.fullmatch(r"-?\d{1,3}", high)
+                or not re.fullmatch(r"-?\d{1,3}", low)
+            ):
+                return None
+            rain_match = re.fullmatch(r"(\d{1,3})\s*%", precipitation)
+            if not rain_match:
+                return None
+            rain_chance = min(int(rain_match.group(1)), 100)
+            rain_chances.append(rain_chance)
+            normalized_condition = normalize_core_text(condition)
+            if any(
+                marker in normalized_condition
+                for marker in ("nang", "troi quang", "quang may", "troi trong")
+            ):
+                sunny_days += 1
+            if index == 0:
+                subject = f"Hôm nay, {day_label}"
+            elif index == 7:
+                subject = f"{day_label} tuần sau"
+            else:
+                subject = day_label
+            details = f"{subject}: từ {low} đến {high} độ C"
+            if condition:
+                details += f", {condition.casefold()}"
+            details += f", khả năng mưa {rain_chance} phần trăm"
+            reports.append(details)
+        average_rain = round(sum(rain_chances) / len(rain_chances))
+        maximum_rain = max(rain_chances)
+        maximum_index = rain_chances.index(maximum_rain)
+        maximum_day = " ".join(
+            str(days[maximum_index].get("dayLabel", "")).split()
+        )[:40]
+        high_rain_days = sum(chance >= 50 for chance in rain_chances)
+        summary = (
+            "Tóm tắt tuần: khả năng mưa trung bình mỗi ngày "
+            f"{average_rain} phần trăm, cao nhất {maximum_rain} phần trăm "
+            f"vào {maximum_day}"
+        )
+        if maximum_rain == 0:
+            summary += ", dự báo hiện tại cho thấy cả tuần không mưa"
+        elif high_rain_days >= (len(days) + 1) // 2:
+            summary += (
+                ", khả năng mưa cao trong phần lớn tuần, có "
+                f"{high_rain_days} ngày từ 50 phần trăm trở lên"
+            )
+        elif high_rain_days:
+            summary += (
+                f", có {high_rain_days} ngày khả năng mưa cao từ "
+                "50 phần trăm trở lên"
+            )
+        elif maximum_rain <= 20:
+            summary += ", khả năng mưa thấp trong cả tuần"
+        else:
+            summary += ", khả năng mưa nhìn chung ở mức thấp đến vừa"
+        if sunny_days >= (len(days) + 1) // 2:
+            summary += ", thời tiết chủ yếu có nắng hoặc trời quang"
+        return (
+            f"Dự báo {len(days)} ngày. " + ". ".join(reports)
+            + f". {summary}."
+        )
+    temperature = str(data.get("temperature", "")).strip()
+    precipitation = str(data.get("precipitation", "")).strip()
+    condition = " ".join(str(data.get("condition", "")).split())[:80]
+    location = " ".join(str(data.get("location", "")).split())[:80]
+    if normalize_core_text(location) in {"thoi tiet", "weather"}:
+        location = ""
+    if not re.fullmatch(r"-?\d{1,3}", temperature):
+        return None
+    rain_match = re.fullmatch(r"(\d{1,3})\s*%", precipitation)
+    rain_chance = min(int(rain_match.group(1)), 100) if rain_match else None
+    rain_now = "mưa" in condition.casefold()
+    parts = []
+    if location:
+        parts.append(f"Thời tiết {period} tại {location}")
+    else:
+        parts.append(f"Thời tiết {period}")
+    parts.append(f"nhiệt độ {temperature} độ C")
+    if condition:
+        parts.append(condition.casefold())
+    parts.append("hiện có mưa" if rain_now else "hiện không mưa")
+    if rain_chance is not None:
+        parts.append(f"khả năng mưa {rain_chance} phần trăm")
+    return ". ".join(parts) + "."
+
+
+async def read_google_weather_card(period=""):
+    """Read the unique Jarvis-owned Google weather card through Chrome DOM."""
+    try:
+        session = await get_mcp_session()
+        for _attempt in range(16):
+            page_id = await find_weather_page(session)
+            if page_id is not None:
+                await session.call_tool(
+                    "select_page",
+                    arguments={"pageId": page_id, "bringToFront": True},
+                )
+                if period in {"một tuần", "một tuần nữa", "tuần này", "tuần tới"}:
+                    days = []
+                    for index in range(8):
+                        selected_data = None
+                        for _selection_attempt in range(4):
+                            clicked = _json_from_mcp_result(
+                                await evaluate_mcp_script(
+                                    session,
+                                    page_id,
+                                    weather_select_day_script(index),
+                                ),
+                                default=False,
+                            )
+                            if clicked is not True:
+                                await asyncio.sleep(0.25)
+                                continue
+                            await asyncio.sleep(0.25)
+                            candidate = _json_from_mcp_result(
+                                await evaluate_mcp_script(
+                                    session, page_id, WEATHER_CARD_SCRIPT
+                                ),
+                                default={},
+                            )
+                            if (
+                                str(candidate.get("selectedIndex", ""))
+                                == str(index)
+                                and str(candidate.get("high", "")).strip()
+                                and str(candidate.get("low", "")).strip()
+                                and re.fullmatch(
+                                    r"\d{1,3}\s*%",
+                                    str(candidate.get("precipitation", "")).strip(),
+                                )
+                            ):
+                                selected_data = candidate
+                                break
+                        if selected_data is None:
+                            break
+                        days.append(selected_data)
+                    if len(days) == 8:
+                        return {"days": days}
+                    # Seven complete tiles are already a full-week forecast.
+                    # Keep it when Google's eighth tile is slow or unavailable.
+                    if len(days) == 7:
+                        return {"days": days}
+                    await asyncio.sleep(0.4)
+                    continue
+                data = _json_from_mcp_result(
+                    await evaluate_mcp_script(
+                        session, page_id, WEATHER_CARD_SCRIPT
+                    ),
+                    default={},
+                )
+                if str(data.get("temperature", "")).strip():
+                    return data
+            await asyncio.sleep(0.4)
+    except Exception as error:
+        print(
+            "Jarvis: Không đọc được thẻ thời tiết Google: "
+            f"{type(error).__name__}: {error}",
+            flush=True,
+        )
+    return None
+
+
+async def open_weather_page(command):
+    """Open Google weather and speak values verified from its weather card."""
+    parsed = weather_period_from_command(command)
+    if parsed is None:
+        return False
+    query, period = parsed
+    url = "https://www.google.com/search?hl=vi&q=" + quote_plus(query)
+    opened = await asyncio.to_thread(
+        open_chrome, JARVIS_CHROME_PROFILE, url
+    )
+    if opened is False:
+        set_command_response("❌ Không thể mở trang thời tiết Google lúc này.")
+        return True
+    report = format_google_weather_report(
+        await read_google_weather_card(period), period
+    )
+    if report is None:
+        set_command_response(
+            "⚠️ Đã mở Google nhưng chưa đọc được thẻ thời tiết. "
+            "Hãy kiểm tra Google đã xác định đúng vị trí hay chưa.",
+            spoken_message=(
+                "Đã mở Google nhưng Jarvis chưa đọc được thông tin thời tiết."
+            ),
+        )
+        return True
+    set_command_response(
+        f"🌦️ {report}",
+        spoken_message=report,
+    )
+    return True
 
 
 # ==========================================================
@@ -4520,13 +5601,119 @@ def show_desktop():
 # PHẢN HỒI DÙNG CHUNG CHO DISCORD
 # ==========================================================
 
-def set_command_response(message, *, spoken_message=None):
+def set_command_response(message, *, spoken_message=None, attachment_path=None):
     """Lưu phản hồi; ``spoken_message=False`` tắt TTS cho phản hồi đó."""
-    global last_command_response, last_spoken_response
+    global last_command_response, last_spoken_response, last_response_attachment
     last_command_response = message
+    last_response_attachment = str(attachment_path) if attachment_path else None
     last_spoken_response = (
         False if spoken_message is False else (spoken_message or message)
     )
+
+
+def safe_response_attachment():
+    """Return only a private screenshot created inside Jarvis' data folder."""
+    if not last_response_attachment:
+        return None
+    try:
+        path = Path(last_response_attachment).resolve()
+        screenshot_root = DESKTOP.screenshot_dir.resolve()
+        if path.parent != screenshot_root or not path.is_file():
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return path
+
+
+def _is_marked_screenshot_request(command):
+    return normalize_core_text(command) in {
+        "chup man hinh de chon", "chup man hinh chon diem",
+        "chup man hinh de danh dau", "chup anh de chon",
+    }
+
+
+def _remember_marked_screenshot(user_id, channel_id, path):
+    resolved = Path(path).resolve()
+    pending_marked_screenshots[(int(user_id), int(channel_id))] = {
+        "path": str(resolved),
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+        "created": time.monotonic(),
+    }
+
+
+async def _handle_discord_marked_screenshot(message):
+    """Click one red point added to the last selection screenshot."""
+    key = (int(message.author.id), int(message.channel.id))
+    pending = pending_marked_screenshots.get(key)
+    if pending is None:
+        return False
+    if time.monotonic() - pending["created"] > MARKED_SCREENSHOT_TTL_SECONDS:
+        pending_marked_screenshots.pop(key, None)
+        await message.reply(
+            "⌛ Ảnh chọn điểm đã hết hạn. Hãy dùng `chụp màn hình để chọn` lần nữa.",
+            mention_author=False,
+        )
+        return True
+    image_attachment = next((
+        item for item in message.attachments
+        if str(getattr(item, "content_type", "") or "").startswith("image/")
+        or str(getattr(item, "filename", "")).lower().endswith(
+            (".png", ".jpg", ".jpeg", ".webp")
+        )
+    ), None)
+    if image_attachment is None:
+        return False
+    if not CORE.security.settings()["discord_enabled"]:
+        await message.reply(
+            "🔒 Điều khiển Discord đang bị khóa trên Ubuntu.",
+            mention_author=False,
+        )
+        return True
+    if int(getattr(image_attachment, "size", 0) or 0) > MARKED_SCREENSHOT_MAX_BYTES:
+        await message.reply("❌ Ảnh đánh dấu lớn hơn 15 MB.", mention_author=False)
+        return True
+    try:
+        data = await image_attachment.read()
+    except Exception:
+        await message.reply("❌ Không tải được ảnh đánh dấu từ Discord.", mention_author=False)
+        return True
+    if not data or len(data) > MARKED_SCREENSHOT_MAX_BYTES:
+        await message.reply("❌ Ảnh đánh dấu trống hoặc quá lớn.", mention_author=False)
+        return True
+    if hashlib.sha256(data).hexdigest() == pending.get("sha256"):
+        await message.reply(
+            "ℹ️ Đây vẫn là ảnh gốc Jarvis đã gửi và chưa có dấu chấm. "
+            "Hãy chỉnh sửa ảnh rồi gửi lại.",
+            mention_author=False,
+        )
+        return True
+    DESKTOP.screenshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    marked_path = DESKTOP.screenshot_dir / f"marked-{time.time_ns()}.img"
+    try:
+        marked_path.write_bytes(data)
+        marked_path.chmod(0o600)
+        target = await asyncio.to_thread(
+            detect_added_red_marker, pending["path"], marked_path
+        )
+    except (OSError, MarkedScreenshotError) as error:
+        await message.reply(f"❌ {error}", mention_author=False)
+        return True
+    clicked = await asyncio.to_thread(DESKTOP.click, target["x"], target["y"])
+    if not clicked:
+        await message.reply(
+            "❌ Đã thấy dấu chấm nhưng desktop không cho phép bấm vị trí đó.",
+            mention_author=False,
+        )
+        return True
+    pending_marked_screenshots.pop(key, None)
+    CORE.security.audit(
+        "discord", "ảnh đánh dấu", "normal", "accepted",
+        message.author.id, message.channel.id,
+    )
+    response = f"✅ Đã nhấn vị trí đánh dấu tại ({target['x']}, {target['y']})."
+    CORE.conversation.add("discord", "assistant", response)
+    await message.reply(response, mention_author=False)
+    return True
 
 
 def format_youtube_list(title, videos):
@@ -4827,7 +6014,9 @@ def parse_deep_sleep_delay(command):
       hẹn sleep sâu sau 30 phút
       sleep sâu sau 30p
       sleep sâu sau 45s
+      sleep sâu sau 1h30
       sleep sâu sau 1h30p
+      sleep sâu sau 1:30
       sleep sâu sau 1h 20p 15s
 
     Đơn vị:
@@ -4851,12 +6040,35 @@ def parse_deep_sleep_delay(command):
     # Chấp nhận cả ký hiệu ngắn và đơn vị tiếng Việt/Anh.
     unit_aliases = (
         (r"(?:gio|tieng|hours?|hrs?)", "h"),
-        (r"(?:phut|minutes?|mins?)", "p"),
+        (r"(?:phut|minutes?|mins?|m)", "p"),
         (r"(?:giay|seconds?|secs?)", "s"),
     )
     for pattern, replacement in unit_aliases:
         duration_text = re.sub(pattern, replacement, duration_text)
     duration_text = re.sub(r"\s+", "", duration_text)
+
+    # Sau từ "sau", dạng 1:30 là khoảng thời gian 1 giờ 30 phút;
+    # lệnh giờ đồng hồ vẫn phải viết rõ "lúc 01:30".
+    colon_duration = re.fullmatch(
+        r"(\d+):(\d{1,2})(?::(\d{1,2}))?", duration_text
+    )
+    if colon_duration:
+        hours = int(colon_duration.group(1))
+        minutes = int(colon_duration.group(2))
+        seconds = int(colon_duration.group(3) or 0)
+        if minutes > 59 or seconds > 59:
+            return None
+        total_seconds = hours * 3600 + minutes * 60 + seconds
+        return total_seconds if total_seconds > 0 else None
+
+    # Cách viết tự nhiên "1h30" nghĩa là 1 giờ 30 phút. Chỉ nhận phần
+    # phút 0-59 để tránh diễn giải nhầm các chuỗi thiếu đơn vị khác.
+    shorthand = re.fullmatch(r"(\d+)h(\d{1,2})", duration_text)
+    if shorthand:
+        shorthand_minutes = int(shorthand.group(2))
+        if shorthand_minutes > 59:
+            return None
+        duration_text = f"{shorthand.group(1)}h{shorthand_minutes}p"
 
     duration_match = re.fullmatch(
         r"(?:(\d+)h)?(?:(\d+)p)?(?:(\d+)s)?",
@@ -5028,7 +6240,8 @@ async def handle_deep_sleep_timer_command(command):
         if incomplete_timer:
             message = (
                 "ℹ️ Thời gian Sleep chưa đầy đủ hoặc chưa hợp lệ. Ví dụ: "
-                "`sleep sâu sau 30p` hoặc `sleep sâu lúc 23:30`."
+                "`sleep sâu sau 30p`, `sleep sâu sau 2h15` hoặc "
+                "`sleep sâu lúc 23:30`."
             )
             print(f"Jarvis: {message}")
             set_command_response(message)
@@ -5191,6 +6404,7 @@ async def send_zalo_message(recipient, content, send=False, tag=""):
     if page_id is None:
         open_chrome(STUDY_PROFILE, "https://chat.zalo.me/")
         await asyncio.sleep(2.5)
+        session = await get_mcp_session()
         page_id = await find_zalo_page(session)
     if page_id is None:
         return False, "Không tìm thấy tab Zalo Web."
@@ -5222,7 +6436,7 @@ async def send_zalo_message(recipient, content, send=False, tag=""):
       return {{ok:true,name:matches[0].name,existingCount}};
     }}'''
     result = _json_from_mcp_result(
-        await session.call_tool("evaluate_script", arguments={"function": script}), default={}
+        await evaluate_mcp_script(session, page_id, script), default={}
     )
     if not isinstance(result, dict) or not result.get("ok"):
         detail = result.get("error", "Không thể soạn tin Zalo.") if isinstance(result, dict) else "Không thể soạn tin Zalo."
@@ -5231,7 +6445,9 @@ async def send_zalo_message(recipient, content, send=False, tag=""):
             detail += " Tên đang thấy: " + ", ".join(str(name) for name in candidates if name)[:300]
         return False, detail
     if send:
-        await session.call_tool("press_key", arguments={"key": "Enter"})
+        await session.call_tool(
+            "press_key", arguments={"pageId": page_id, "key": "Enter"}
+        )
         verify_script = f'''() => {{
           const content = {json.dumps(content)};
           const editor = document.querySelector('main [contenteditable="true"]');
@@ -5247,7 +6463,7 @@ async def send_zalo_message(recipient, content, send=False, tag=""):
         for _attempt in range(3):
             await asyncio.sleep(0.7)
             verified = _json_from_mcp_result(
-                await session.call_tool("evaluate_script", arguments={"function": verify_script}),
+                await evaluate_mcp_script(session, page_id, verify_script),
                 default={},
             )
             if isinstance(verified, dict) and verified.get("editorEmpty") and verified.get("messageAdded"):
@@ -5650,7 +6866,18 @@ def send_wake_on_lan(
     return max(1, int(repeat))
 
 
-def shutdown_remote_pc(user=None, host=None):
+def send_reliable_wake_on_lan(*, bursts=5, interval=1.0):
+    """Spread repeated WOL bursts over time for sleeping network adapters."""
+    total = 0
+    burst_count = max(1, int(bursts))
+    for index in range(burst_count):
+        total += send_wake_on_lan(repeat=3)
+        if index + 1 < burst_count:
+            time.sleep(max(0.0, float(interval)))
+    return total
+
+
+def shutdown_remote_pc(user=None, host=None, *, attempts=3, retry_delay=2.0):
     """Shut down the configured Windows PC over non-interactive SSH."""
     target_user = str(user or PC_SSH_USER).strip()
     target_host = str(host or PC_SSH_HOST).strip()
@@ -5658,6 +6885,89 @@ def shutdown_remote_pc(user=None, host=None):
         raise ValueError("PC_SSH_USER chưa được cấu hình hợp lệ")
     if not re.fullmatch(r"[A-Za-z0-9.-]+", target_host):
         raise ValueError("PC_SSH_HOST chưa được cấu hình hợp lệ")
+    total_attempts = max(1, int(attempts))
+    for attempt in range(total_attempts):
+        try:
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=10",
+                    "-o", "ConnectionAttempts=1",
+                    f"{target_user}@{target_host}",
+                    "shutdown /s /t 0",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except FileNotFoundError as error:
+            raise OSError("không tìm thấy chương trình ssh") from error
+        except subprocess.TimeoutExpired:
+            result = None
+        if result is not None and result.returncode == 0:
+            return True
+        if attempt + 1 < total_attempts:
+            time.sleep(max(0.0, float(retry_delay)))
+    raise OSError(
+        "SSH thất bại sau nhiều lần thử; hãy kiểm tra PC đang bật, "
+        "OpenSSH Server, SSH key và known_hosts"
+    )
+
+
+def parse_remote_pc_volume_command(command):
+    """Parse PC audio commands while requiring the explicit word ``PC``."""
+    plain = normalize_core_text(command)
+    if not re.search(r"\bpc\b", plain):
+        return None
+    local_command = re.sub(r"\bpc\b", " ", plain)
+    local_command = re.sub(r"\s+", " ", local_command).strip()
+
+    if local_command in {
+        "am luong", "am luong hien tai", "muc am luong", "volume",
+        "volume hien tai", "current volume", "cho toi biet am luong",
+    }:
+        return "get", None
+
+    set_match = re.fullmatch(
+        r"(?:dat\s+|set\s+)?(?:am\s+luong|volume)\s+(\d{1,3})%?",
+        local_command,
+    )
+    if set_match:
+        return "set", max(0, min(100, int(set_match.group(1))))
+
+    increase_match = re.fullmatch(
+        r"(?:tang\s+am\s+luong|volume\s+up|tang)(?:\s+(\d{1,3})%?)?",
+        local_command,
+    )
+    if increase_match:
+        return "change", int(increase_match.group(1) or 5)
+
+    decrease_match = re.fullmatch(
+        r"(?:giam\s+am\s+luong|volume\s+down|giam)(?:\s+(\d{1,3})%?)?",
+        local_command,
+    )
+    if decrease_match:
+        return "change", -int(decrease_match.group(1) or 5)
+
+    if local_command in {"tat tieng", "mute"}:
+        return "mute", None
+    if local_command in {"bat tieng", "unmute"}:
+        return "unmute", None
+    return None
+
+
+def control_remote_pc_volume(action, value=None, user=None, host=None):
+    """Control the Windows default output through SSH and native Core Audio."""
+    target_user = str(user or PC_SSH_USER).strip()
+    target_host = str(host or PC_SSH_HOST).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", target_user):
+        raise ValueError("PC_SSH_USER chưa được cấu hình hợp lệ")
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", target_host):
+        raise ValueError("PC_SSH_HOST chưa được cấu hình hợp lệ")
+    remote_command = build_windows_audio_command(action, value)
     try:
         result = subprocess.run(
             [
@@ -5666,23 +6976,53 @@ def shutdown_remote_pc(user=None, host=None):
                 "-o", "ConnectTimeout=10",
                 "-o", "ConnectionAttempts=1",
                 f"{target_user}@{target_host}",
-                "shutdown /s /t 0",
+                *remote_command,
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
-            timeout=15,
+            timeout=25,
             check=False,
         )
     except FileNotFoundError as error:
         raise OSError("không tìm thấy chương trình ssh") from error
     except subprocess.TimeoutExpired as error:
-        raise OSError("kết nối SSH quá thời gian") from error
+        raise OSError("kết nối SSH tới PC quá thời gian") from error
     if result.returncode != 0:
-        raise OSError(
-            "SSH thất bại; hãy kiểm tra PC đang bật, OpenSSH Server, "
-            "SSH key và known_hosts"
-        )
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        reason = detail[-1][:240] if detail else "không rõ nguyên nhân"
+        raise OSError(f"điều khiển âm lượng Windows thất bại: {reason}")
+    try:
+        return parse_windows_audio_output(result.stdout)
+    except ValueError as error:
+        raise OSError(str(error)) from error
+
+
+async def handle_remote_pc_volume_command(command):
+    """Handle only volume commands that explicitly contain the word PC."""
+    parsed = parse_remote_pc_volume_command(command)
+    if parsed is None:
+        return False
+    action, value = parsed
+    try:
+        state = await asyncio.to_thread(control_remote_pc_volume, action, value)
+        before, volume, muted = state["before"], state["volume"], state["muted"]
+        if action == "get":
+            suffix = " (đang tắt tiếng)" if muted else ""
+            message = f"🔊 Âm lượng PC hiện tại: {volume}%{suffix}"
+        elif action == "set":
+            message = f"🔊 Đã đặt âm lượng PC: {volume}%"
+        elif action == "change" and value > 0:
+            message = f"🔊 Đã tăng âm lượng PC: {before}% → {volume}%"
+        elif action == "change":
+            message = f"🔊 Đã giảm âm lượng PC: {before}% → {volume}%"
+        elif action == "mute":
+            message = "🔇 Đã tắt tiếng PC."
+        else:
+            message = f"🔊 Đã bật tiếng PC. Âm lượng hiện tại: {volume}%"
+    except (OSError, ValueError) as error:
+        message = f"❌ Không thể điều khiển âm lượng PC: {error}."
+    print(f"Jarvis: {message}")
+    set_command_response(message)
     return True
 
 
@@ -6005,7 +7345,7 @@ def _show_help_legacy():
     print("  sleep sâu sau 1h")
     print("  sleep sâu sau 30p")
     print("  sleep sâu sau 45s")
-    print("  sleep sâu sau 1h30p")
+    print("  sleep sâu sau 1h30  # tương đương 1 giờ 30 phút")
     print("  hủy sleep sâu")
     print("  lịch sleep sâu")
     print("  tắt màn hình")
@@ -6319,6 +7659,428 @@ def _suggest_known_command(command):
     return None
 
 
+DESKTOP_APP_ALIASES = {
+    "zalo": "zalo",
+    "zalo web": "zalo",
+    "gmail": "gmail",
+    "mail": "gmail",
+}
+
+
+def _verified_automation_window_id():
+    """Return the window only when it still belongs to Jarvis Chrome."""
+    window_id = CHROME_WINDOWS.automation_window_id
+    owner_pid = _jarvis_debug_port_owner_pid()
+    if not window_id or owner_pid is None:
+        return None
+    return window_id if CHROME_WINDOWS._window_pid(window_id) == owner_pid else None
+
+
+def _move_opened_automation_app(app_key, role):
+    window_id = _verified_automation_window_id()
+    if window_id is None or not _managed_cdp_site_is_open(app_key):
+        return False, "Không xác minh được cửa sổ do Jarvis mở."
+    return DESKTOP.move_window(window_id, role)
+
+
+def handle_desktop_command(command):
+    """Handle explicit observation and XWayland pointer/window commands."""
+    plain = normalize_core_text(command)
+
+    if plain in {
+        "trang thai man hinh", "bo cuc man hinh", "kiem tra man hinh",
+    }:
+        set_command_response(DESKTOP.describe(CHROME_WINDOWS.list_windows()))
+        return True
+
+    if plain in {
+        "chup man hinh", "xem man hinh", "cho toi xem man hinh",
+        "man hinh dang hien thi gi", "chup man hinh de chon",
+        "chup man hinh chon diem", "chup man hinh de danh dau",
+        "chup anh de chon",
+    }:
+        path = DESKTOP.capture_screen()
+        if path is None:
+            set_command_response("❌ Không thể chụp màn hình trên phiên desktop hiện tại.")
+        else:
+            if _is_marked_screenshot_request(command):
+                set_command_response(
+                    "📍 Hãy giữ nguyên kích thước ảnh, thêm đúng một dấu chấm "
+                    "có màu tương phản vào vị trí cần nhấn rồi gửi lại trong 10 phút.",
+                    spoken_message="Đã gửi ảnh để bạn đánh dấu.",
+                    attachment_path=path,
+                )
+            else:
+                set_command_response(
+                    "📸 Đã chụp màn hình hiện tại.",
+                    spoken_message="Đã chụp màn hình.",
+                    attachment_path=path,
+                )
+        return True
+
+    role = parse_monitor_role(command)
+    if role and any(term in plain for term in ("chuyen cua so", "dua cua so")):
+        window_id = DESKTOP.active_window_id()
+        if window_id is None:
+            set_command_response("❌ Không xác minh được cửa sổ đang hoạt động.")
+        else:
+            ok, detail = DESKTOP.move_window(window_id, role)
+            set_command_response(("✅ " if ok else "❌ ") + detail)
+        return True
+
+    remember = re.fullmatch(
+        r"nho\s+(zalo web|zalo|gmail|mail)\s+mo\s+tren\s+man hinh\s+(chinh|phu|\d+)",
+        plain,
+    )
+    if remember:
+        app_key = DESKTOP_APP_ALIASES[remember.group(1)]
+        role = parse_monitor_role(f"man hinh {remember.group(2)}")
+        DESKTOP.set_preference(app_key, role)
+        set_command_response(f"✅ Đã nhớ vị trí mở {app_key}.")
+        return True
+
+    forget = re.fullmatch(r"quen man hinh (zalo web|zalo|gmail|mail)", plain)
+    if forget:
+        app_key = DESKTOP_APP_ALIASES[forget.group(1)]
+        removed = DESKTOP.clear_preference(app_key)
+        set_command_response(
+            f"✅ Đã quên vị trí mở {app_key}." if removed
+            else f"ℹ️ Chưa lưu vị trí mở {app_key}."
+        )
+        return True
+
+    pointer = re.fullmatch(
+        r"(?:di chuot den|bam chuot tai|nhap chuot tai|click)\s+(\d+)\s*[ ,]\s*(\d+)",
+        plain,
+    )
+    if pointer:
+        x, y = map(int, pointer.groups())
+        clicked = not plain.startswith("di chuot")
+        ok = DESKTOP.click(x, y) if clicked else DESKTOP.move_pointer(x, y)
+        action = "bấm chuột" if clicked else "di chuyển chuột"
+        set_command_response(
+            f"✅ Đã {action} tới ({x}, {y})." if ok else
+            f"❌ Không thể {action}; tọa độ hoặc phiên XWayland không hợp lệ."
+        )
+        return True
+
+    scroll = re.fullmatch(r"cuon (len|xuong)(?:\s+(\d+))?", plain)
+    if scroll:
+        steps = min(int(scroll.group(2) or 3), 20)
+        amount = steps if scroll.group(1) == "len" else -steps
+        ok = DESKTOP.scroll(amount)
+        set_command_response(
+            f"✅ Đã cuộn {scroll.group(1)} {steps} nấc." if ok else
+            "❌ Không thể cuộn trên phiên XWayland hiện tại."
+        )
+        return True
+
+    return False
+
+
+def handle_automation_open_on_monitor(command):
+    """Open Zalo/Gmail, then move only the verified Jarvis-owned window."""
+    role = parse_monitor_role(command)
+    if role is None:
+        return False
+    base_command = strip_monitor_suffix(command)
+    plain_base = normalize_core_text(base_command)
+    match = re.fullmatch(r"(?:mo|vao)(?:\s+tab)?\s+(zalo web|zalo|gmail|mail)", plain_base)
+    if not match:
+        return False
+    app_key = DESKTOP_APP_ALIASES[match.group(1)]
+    if not handle_chrome_shortcut(base_command):
+        return False
+    if not last_command_response or not last_command_response.startswith("✅"):
+        return True
+    ok, detail = _move_opened_automation_app(app_key, role)
+    if ok:
+        set_command_response(f"{last_command_response} {detail}")
+    else:
+        set_command_response(f"{last_command_response}\n⚠️ {detail}")
+    return True
+
+
+def _active_xwayland_window_title():
+    window_id = DESKTOP.active_window_id()
+    if window_id is None:
+        return ""
+    try:
+        expected = int(window_id, 16)
+    except (TypeError, ValueError):
+        return ""
+    for window in CHROME_WINDOWS.list_windows():
+        try:
+            if int(str(window.get("id", "")), 16) == expected:
+                return str(window.get("title", ""))
+        except (TypeError, ValueError):
+            continue
+    return ""
+
+
+async def handle_semantic_click_command(command):
+    """Activate a named control, with Qwen VL screenshot vision as fallback."""
+    plain = normalize_core_text(command)
+    match = re.fullmatch(
+        r"(?:bam|nhan|click)(?:\s+vao)?(?:\s+(?:nut|o|muc|lien ket))?\s+(.+)",
+        plain,
+    )
+    if not match or re.search(r"\d+\s*[, ]\s*\d+", match.group(1)):
+        return False
+    requested = match.group(1).strip()
+    window_title = _active_xwayland_window_title()
+    browser_context = await _semantic_browser_controls(window_title)
+    if browser_context is not None:
+        controls = browser_context["controls"]
+    else:
+        controls = await asyncio.to_thread(SEMANTIC_DESKTOP.controls, window_title)
+    if not controls:
+        return await _handle_visual_click(requested)
+
+    # Never offer Qwen controls that merely share one generic word. This used
+    # to turn "thư rác" into "Tìm kiếm trong thư" and "hiện thêm" into
+    # "Thêm nhãn". Qwen chooses only among labels matching the whole phrase
+    # or nearly all meaningful words.
+    candidates = [
+        control for control in controls
+        if _semantic_label_matches(requested, control.get("name", ""))
+    ][:80]
+    if not candidates:
+        return await _handle_visual_click(requested)
+    try:
+        selected = await asyncio.to_thread(
+            CORE.local_ai.choose_accessible_target, requested, candidates
+        )
+    except RuntimeError as error:
+        set_command_response(f"❌ {error}")
+        return True
+    if selected is None:
+        set_command_response(
+            f"🤔 Qwen chưa xác định chắc chắn mục “{requested}”. "
+            "Hãy nói rõ tên đang hiển thị trên nút."
+        )
+        return True
+    if not _semantic_label_matches(requested, selected.get("name", "")):
+        set_command_response(
+            "❌ Qwen chọn một mục không khớp đủ tên yêu cầu nên Jarvis đã hủy thao tác."
+        )
+        return True
+    pointer_moved = await _move_pointer_to_semantic_control(selected)
+    if browser_context is not None:
+        ok = await _activate_semantic_browser_control(browser_context, selected["id"])
+    else:
+        ok, _detail = await asyncio.to_thread(
+            SEMANTIC_DESKTOP.activate, selected["id"], window_title
+        )
+    if ok:
+        movement = "Đã di chuột và nhấn" if pointer_moved else "Đã nhấn"
+        set_command_response(
+            f"✅ {movement} “{selected['name']}” trong {selected.get('app') or 'ứng dụng hiện tại'}.",
+            spoken_message=f"{movement} {selected['name']}.",
+        )
+    else:
+        set_command_response(
+            "❌ Giao diện đã thay đổi trước khi bấm nên Jarvis đã dừng để tránh nhấn nhầm."
+        )
+    return True
+
+
+async def _handle_visual_click(requested):
+    """Use Qwen VL only when accessibility metadata cannot identify a target."""
+    screenshot = await asyncio.to_thread(DESKTOP.capture_screen)
+    if screenshot is None:
+        set_command_response(
+            "❌ Jarvis không chụp được màn hình nên đã dừng để tránh nhấn nhầm."
+        )
+        return True
+    try:
+        target = await asyncio.to_thread(
+            CORE.local_ai.choose_visual_target, requested, screenshot
+        )
+    except RuntimeError as error:
+        set_command_response(f"❌ {error}")
+        return True
+    if target is None:
+        set_command_response(
+            f"🤔 Qwen VL không nhìn thấy chắc chắn mục “{requested}”. "
+            "Jarvis chưa bấm gì để tránh nhấn nhầm."
+        )
+        return True
+    clicked = await asyncio.to_thread(
+        DESKTOP.click, target["x"], target["y"]
+    )
+    if not clicked:
+        set_command_response(
+            "❌ Đã tìm thấy mục tiêu nhưng desktop không cho phép Jarvis điều khiển chuột."
+        )
+        return True
+    set_command_response(
+        f"✅ Qwen VL đã nhìn màn hình và nhấn đúng mục bạn yêu cầu "
+        f"tại ({target['x']}, {target['y']}).",
+        spoken_message="Đã nhấn đúng mục bạn yêu cầu.",
+    )
+    return True
+
+
+async def _move_pointer_to_semantic_control(control):
+    bounds = control.get("screenBounds") or control.get("bounds")
+    if not isinstance(bounds, list) or len(bounds) != 4:
+        return False
+    try:
+        x, y, width, height = [int(value) for value in bounds]
+    except (TypeError, ValueError):
+        return False
+    if width < 2 or height < 2:
+        return False
+    return await asyncio.to_thread(
+        DESKTOP.move_pointer, x + width // 2, y + height // 2
+    )
+
+
+def _semantic_label_matches(requested, label):
+    """Require phrase-level evidence before allowing any semantic click."""
+    requested_plain = normalize_core_text(requested)
+    label_plain = normalize_core_text(label)
+    if not requested_plain or not label_plain:
+        return False
+    if requested_plain in label_plain or label_plain in requested_plain:
+        return True
+    ignored = {
+        "nut", "o", "muc", "lien", "ket", "vao", "cho", "toi",
+        "hay", "giup", "trong", "tren",
+    }
+    requested_words = {
+        word for word in requested_plain.split() if word not in ignored
+    }
+    label_words = {word for word in label_plain.split() if word not in ignored}
+    if not requested_words or not label_words:
+        return False
+    overlap = requested_words & label_words
+    coverage = len(overlap) / len(requested_words)
+    # Two-word requests must match both words. Longer requests may miss one
+    # insignificant word, but still require at least 80% request coverage.
+    required = 1.0 if len(requested_words) <= 2 else 0.8
+    return coverage >= required
+
+
+async def _semantic_browser_controls(window_title=""):
+    """Read named interactive elements from one exact Jarvis-owned web tab."""
+    pages = _cdp_pages()
+    if pages is None:
+        return None
+    title_plain = normalize_core_text(window_title)
+    candidates = []
+    for page in pages:
+        site_key = _automation_site_key(page.get("url", ""))
+        target_id = page.get("id")
+        if not site_key or target_id not in managed_cdp_targets.get(site_key, set()):
+            continue
+        candidates.append((site_key, page))
+    if len(candidates) > 1 and title_plain:
+        title_matches = [item for item in candidates if (
+            normalize_core_text(item[1].get("title", "")) in title_plain
+            or item[0] in title_plain
+        )]
+        if len(title_matches) == 1:
+            candidates = title_matches
+    if len(candidates) != 1:
+        return None
+    site_key, cdp_page = candidates[0]
+    try:
+        session = await get_mcp_session()
+        matches = await _find_owned_mcp_pages(session, site_key)
+        if len(matches) != 1:
+            return None
+        page_id = matches[0][0]
+        token = hashlib.sha256(
+            f"{time.monotonic_ns()}:{cdp_page.get('id')}".encode()
+        ).hexdigest()[:16]
+        script = f'''() => {{
+          const token = {json.dumps(token)};
+          document.querySelectorAll('[data-jarvis-control]').forEach(
+            el => el.removeAttribute('data-jarvis-control'));
+          const selectors = [
+            'button', 'a[href]', 'input', 'textarea', 'select',
+            '[role="button"]', '[role="link"]', '[role="menuitem"]',
+            '[role="tab"]', '[role="checkbox"]', '[contenteditable="true"]'
+          ];
+          const output = [];
+          const seen = new Set();
+          for (const element of document.querySelectorAll(selectors.join(','))) {{
+            if (seen.has(element)) continue;
+            seen.add(element);
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            if (rect.width < 2 || rect.height < 2 || style.display === 'none' ||
+                style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+            const name = String(
+              element.getAttribute('aria-label') || element.getAttribute('title') ||
+              element.getAttribute('placeholder') || element.innerText ||
+              element.value || element.textContent || ''
+            ).replace(/\\s+/g, ' ').trim().slice(0, 180);
+            if (!name) continue;
+            const id = `${{token}}-${{output.length}}`;
+            element.setAttribute('data-jarvis-control', id);
+            output.push({{
+              id, name, role: element.getAttribute('role') ||
+                element.tagName.toLowerCase(), app: {json.dumps(site_key)},
+              window: document.title,
+              bounds: [Math.round(rect.x), Math.round(rect.y),
+                Math.round(rect.width), Math.round(rect.height)],
+              screenBounds: [
+                Math.round(window.screenX + rect.x),
+                Math.round(window.screenY + (window.outerHeight - window.innerHeight) + rect.y),
+                Math.round(rect.width), Math.round(rect.height)
+              ]
+            }});
+            if (output.length >= 160) break;
+          }}
+          return output;
+        }}'''
+        result = await evaluate_mcp_script(session, page_id, script)
+        controls = _json_from_mcp_result(result, default=[])
+        if not isinstance(controls, list) or not controls:
+            return None
+        valid = [item for item in controls if isinstance(item, dict) and str(
+            item.get("id", "")
+        ).startswith(token + "-")]
+        return {
+            "session": session, "page_id": page_id, "token": token,
+            "controls": valid,
+        } if valid else None
+    except Exception:
+        return None
+
+
+async def _activate_semantic_browser_control(context, target_id):
+    token = str(context.get("token", ""))
+    target_id = str(target_id)
+    if not token or not target_id.startswith(token + "-"):
+        return False
+    script = f'''() => {{
+      const id = {json.dumps(target_id)};
+      const matches = Array.from(document.querySelectorAll('[data-jarvis-control]'))
+        .filter(element => element.getAttribute('data-jarvis-control') === id);
+      if (matches.length !== 1) return false;
+      const element = matches[0];
+      const rect = element.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return false;
+      element.scrollIntoView({{block: 'center', inline: 'center'}});
+      element.focus({{preventScroll: true}});
+      element.click();
+      document.querySelectorAll('[data-jarvis-control]').forEach(
+        item => item.removeAttribute('data-jarvis-control'));
+      return true;
+    }}'''
+    try:
+        result = await evaluate_mcp_script(
+            context["session"], context["page_id"], script
+        )
+        return _json_from_mcp_result(result, default=False) is True
+    except Exception:
+        return False
+
+
 async def route_command(command, *, allow_local_ai=True, source="terminal"):
     command = command.strip()
 
@@ -6338,12 +8100,41 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         print(f"Jarvis: {last_command_response}")
         return True
 
+    # Physical-device commands are deterministic and must never fall through
+    # to the conversational model, which cannot operate the ESP32 itself.
+    if await handle_esp32_device_command(command):
+        return True
+
+    if handle_automation_open_on_monitor(command):
+        return True
+
+    if handle_desktop_command(command):
+        return True
+
+    if await handle_semantic_click_command(command):
+        return True
+
     # Truy vấn chỉ đọc phải được nhận diện trước local AI. Các hàm này không
     # phát/dừng media, reload trang hoặc đưa Chrome ra trước màn hình.
     if is_soundcloud_now_playing_command(command):
         return await report_soundcloud_now_playing()
     if is_youtube_now_playing_command(command):
         return await report_youtube_now_playing()
+
+    lunar_answer = answer_lunar_calendar(command)
+    if lunar_answer is not None:
+        print(f"Jarvis: {lunar_answer}")
+        set_command_response(lunar_answer)
+        return True
+
+    if weather_period_from_command(command) is not None:
+        return await open_weather_page(command)
+
+    if normalize_core_text(command) == "thank you":
+        message = "Chúc bạn một ngày tốt lành."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return True
 
     command_lower_raw = command.casefold()
     for prefix in ("mở đường dẫn ", "mo duong dan "):
@@ -6503,6 +8294,11 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
     # ÂM LƯỢNG
     # ------------------------------------------------------
 
+    # Chỉ câu có từ PC mới đi qua SSH tới Windows. Các câu không có PC tiếp
+    # tục dùng pactl để điều khiển Ubuntu như trước.
+    if await handle_remote_pc_volume_command(command):
+        return True
+
     if handle_volume_command(command):
         return True
 
@@ -6596,8 +8392,8 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
             "🔇 Cảm biến vỗ tay và giọng nói đang tạm tắt. "
             "Dùng `bật giọng nói` để khôi phục."
             if paused else
-            "🎙️ Cảm biến âm thanh đang bật. Vỗ tay 2 lần hoặc búng tay "
-            "1 lần, chờ Jarvis nói 'Jarvis đang nghe' xong rồi nói lệnh."
+            "👏 Cảm biến INMP441 đang bật và nhận hai tiếng vỗ; chức năng nhận "
+            "lệnh giọng nói đang tắt."
             if ready else
             "ℹ️ Cảm biến âm thanh chưa hoạt động. Hãy kiểm tra model, microphone "
             "và cấu hình VOICE_TRIGGER_ENABLED."
@@ -6718,6 +8514,21 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         return True
 
     if handle_chrome_shortcut(command):
+        plain_open = normalize_core_text(command)
+        match = re.fullmatch(
+            r"(?:mo|vao)(?:\s+tab)?\s+(zalo web|zalo|gmail|mail)",
+            plain_open,
+        )
+        if match and last_command_response and last_command_response.startswith("✅"):
+            app_key = DESKTOP_APP_ALIASES[match.group(1)]
+            role = DESKTOP.preference(app_key)
+            if role:
+                original_response = last_command_response
+                ok, detail = _move_opened_automation_app(app_key, role)
+                set_command_response(
+                    f"{original_response} {detail}" if ok
+                    else f"{original_response}\n⚠️ {detail}"
+                )
         return True
 
 
@@ -7640,6 +9451,105 @@ def _discord_command_needs_profile(command):
     return False
 
 
+async def handle_discord_voice_channel_command(
+    message, command, configured_voice_channel_id=None, command_callback=None
+):
+    """Handle owner-only Discord voice connection commands.
+
+    Authorization and the configured text-channel restriction are enforced by
+    ``on_message`` before this helper is called.
+    """
+    normalized = str(command).strip().casefold()
+    if normalized not in {"!join", "!leave"}:
+        return False
+
+    guild = getattr(message, "guild", None)
+    if guild is None:
+        await message.reply(
+            "Lệnh này chỉ dùng được trong máy chủ Discord.",
+            mention_author=False,
+        )
+        return True
+
+    voice_client = getattr(guild, "voice_client", None)
+    if normalized == "!leave":
+        if voice_client is None or not voice_client.is_connected():
+            await message.reply(
+                "Jarvis hiện không ở trong kênh thoại.",
+                mention_author=False,
+            )
+            return True
+        if hasattr(voice_client, "stop_listening"):
+            voice_client.stop_listening()
+        await voice_client.disconnect(force=True)
+        await message.reply(
+            "👋 Jarvis đã rời kênh thoại.",
+            mention_author=False,
+        )
+        return True
+
+    voice_state = getattr(message.author, "voice", None)
+    target_channel = getattr(voice_state, "channel", None)
+    if target_channel is None and configured_voice_channel_id is not None:
+        target_channel = guild.get_channel(configured_voice_channel_id)
+    if target_channel is None:
+        await message.reply(
+            "Bạn hãy vào một kênh thoại trước rồi gửi `!join`.",
+            mention_author=False,
+        )
+        return True
+
+    if (
+        voice_client is not None
+        and voice_client.is_connected()
+        and command_callback is not None
+        and not isinstance(voice_client, voice_recv.VoiceRecvClient)
+    ):
+        await voice_client.disconnect(force=True)
+        voice_client = None
+
+    if voice_client is not None and voice_client.is_connected():
+        current_channel = getattr(voice_client, "channel", None)
+        if getattr(current_channel, "id", None) == target_channel.id:
+            action = "đã ở trong"
+        else:
+            await voice_client.move_to(target_channel)
+            action = "đã chuyển tới"
+    else:
+        connect_options = (
+            {"cls": voice_recv.VoiceRecvClient}
+            if command_callback is not None else {}
+        )
+        voice_client = await target_channel.connect(**connect_options)
+        action = "đã vào"
+
+    if command_callback is not None:
+        sink = start_discord_voice_listening(
+            voice_client,
+            owner_id=message.author.id,
+            model_path=DISCORD_VOICE_MODEL_PATH,
+            loop=asyncio.get_running_loop(),
+            command_callback=command_callback,
+            heard_callback=lambda heard, accepted: (
+                handle_discord_voice_heard(
+                    heard, accepted, target_channel
+                )
+            ),
+        )
+        print(
+            "Jarvis: Discord voice listener "
+            f"{'đã chạy' if sink is not None else 'đã tồn tại'} "
+            f"channel={target_channel.id} owner={message.author.id}",
+            flush=True,
+        )
+
+    await message.reply(
+        f"🎧 Jarvis {action} **{target_channel.name}**.",
+        mention_author=False,
+    )
+    return True
+
+
 async def start_discord_bot():
     """Chạy Discord bot song song với giao diện Terminal của Jarvis."""
     global discord_client, discord_notification_channel_id
@@ -7647,6 +9557,7 @@ async def start_discord_bot():
     token = os.getenv("DISCORD_TOKEN", "").strip()
     owner_id = _env_int("DISCORD_USER_ID")
     channel_id = _env_int("DISCORD_CHANNEL_ID")
+    voice_channel_id = _env_int("DISCORD_VOICE_CHANNEL_ID")
 
     if not token:
         print("Jarvis: Discord chưa chạy vì thiếu DISCORD_TOKEN trong .env.")
@@ -7669,10 +9580,54 @@ async def start_discord_bot():
     @client.event
     async def on_ready():
         print()
-        print(f"Jarvis: Discord đã kết nối: {client.user}")
-        print('Jarvis: Discord nhận lệnh trực tiếp, ví dụ: mở vscode')
+        print(f"Jarvis: Discord đã kết nối: {client.user}", flush=True)
+        print(
+            'Jarvis: Discord nhận lệnh trực tiếp, ví dụ: mở vscode',
+            flush=True,
+        )
         if channel_id is not None:
-            print(f"Jarvis: Chỉ nhận lệnh trong channel ID {channel_id}.")
+            print(
+                f"Jarvis: Chỉ nhận lệnh trong channel ID {channel_id}.",
+                flush=True,
+            )
+        if voice_channel_id is not None:
+            try:
+                target = client.get_channel(voice_channel_id)
+                if target is None:
+                    target = await client.fetch_channel(voice_channel_id)
+                voice_client = getattr(target.guild, "voice_client", None)
+                if voice_client is None or not voice_client.is_connected():
+                    voice_client = await target.connect(
+                        cls=voice_recv.VoiceRecvClient
+                    )
+                sink = start_discord_voice_listening(
+                    voice_client,
+                    owner_id=owner_id,
+                    model_path=DISCORD_VOICE_MODEL_PATH,
+                    loop=asyncio.get_running_loop(),
+                    command_callback=lambda spoken_command: (
+                        handle_discord_spoken_command(
+                            spoken_command, target, owner_id=owner_id
+                        )
+                    ),
+                    heard_callback=lambda heard, accepted: (
+                        handle_discord_voice_heard(
+                            heard, accepted, target
+                        )
+                    ),
+                )
+                print(
+                    "Jarvis: Discord voice tự động sẵn sàng "
+                    f"channel={voice_channel_id} "
+                    f"listener={int(sink is not None)}",
+                    flush=True,
+                )
+            except Exception as error:
+                print(
+                    "Jarvis: Discord voice tự động kết nối thất bại: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
 
     @client.event
     async def on_message(message):
@@ -7683,17 +9638,85 @@ async def start_discord_bot():
         if message.author.id != owner_id:
             return
 
-        if channel_id is not None and message.channel.id != channel_id:
+        raw_command = message.content.strip()
+        is_voice_control = raw_command.casefold() in {"!join", "!leave"}
+        allowed_voice_channels = {channel_id, voice_channel_id}
+        allowed_voice_channels.discard(None)
+        wrong_command_channel = (
+            channel_id is not None and message.channel.id != channel_id
+        )
+        if (
+            wrong_command_channel
+            and not (
+                is_voice_control
+                and message.channel.id in allowed_voice_channels
+            )
+        ):
+            if raw_command.casefold() in {"!join", "!leave"}:
+                print(
+                    "Jarvis: Discord voice command bị bỏ qua vì sai channel: "
+                    f"received={message.channel.id} allowed={channel_id}",
+                    flush=True,
+                )
+                await message.reply(
+                    "Lệnh voice chỉ được dùng trong text channel điều khiển "
+                    f"có ID `{channel_id}`.",
+                    mention_author=False,
+                )
             return
 
         # Khi .env không khóa một channel cụ thể, dùng kênh hợp lệ gần nhất
         # của chính chủ làm nơi gửi lời nhắc chủ động.
         discord_notification_channel_id = message.channel.id
 
-        command = message.content.strip()
+        command = raw_command
+
+        if message.attachments and await _handle_discord_marked_screenshot(message):
+            return
+
+        if message.attachments and await handle_discord_chat_voice_message(message):
+            return
 
         if not command:
             return
+
+        if command.casefold() in {"!join", "!leave"}:
+            print(
+                f"Jarvis: Discord nhận voice command {command.casefold()} "
+                f"từ user={message.author.id} guild="
+                f"{getattr(getattr(message, 'guild', None), 'id', None)}",
+                flush=True,
+            )
+            try:
+                if await handle_discord_voice_channel_command(
+                    message,
+                    command,
+                    voice_channel_id,
+                    command_callback=lambda spoken_command: (
+                        handle_discord_spoken_command(
+                            spoken_command,
+                            getattr(
+                                getattr(message.author, "voice", None),
+                                "channel", None,
+                            )
+                            or message.channel,
+                            owner_id=message.author.id,
+                        )
+                    ),
+                ):
+                    return
+            except Exception as error:
+                print(
+                    "Jarvis: Discord voice command thất bại: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
+                await message.reply(
+                    "❌ Jarvis chưa thể kết nối voice: "
+                    f"`{type(error).__name__}: {redact_sensitive(str(error))}`",
+                    mention_author=False,
+                )
+                return
 
         command, confirmation_note = resolve_command_confirmation(command, "discord")
         if confirmation_note and normalize_core_text(message.content) in SUGGESTION_REJECTIONS:
@@ -7829,8 +9852,9 @@ async def start_discord_bot():
             return
 
         try:
-            global last_command_response
+            global last_command_response, last_response_attachment
             last_command_response = None
+            last_response_attachment = None
 
             async with discord_command_lock:
                 await route_command(command, source="discord")
@@ -7868,9 +9892,16 @@ async def start_discord_bot():
                         split_at = 1900
                     chunks.append(remaining[:split_at].rstrip())
                     remaining = remaining[split_at:].lstrip()
+                attachment = safe_response_attachment()
+                reply_file = discord.File(str(attachment)) if attachment else None
                 await message.reply(
-                    chunks[0], mention_author=False, view=response_view
+                    chunks[0], mention_author=False, view=response_view,
+                    file=reply_file,
                 )
+                if attachment and _is_marked_screenshot_request(command):
+                    _remember_marked_screenshot(
+                        message.author.id, message.channel.id, attachment
+                    )
                 for chunk in chunks[1:]:
                     await message.channel.send(chunk)
             else:
@@ -8006,27 +10037,62 @@ async def main():
     discord_task = asyncio.create_task(supervise_discord_bot())
     reminder_task = asyncio.create_task(reminder_dispatch_loop())
     gmail_task = asyncio.create_task(gmail_monitor_loop())
+
+    async def warm_local_ai():
+        try:
+            await asyncio.to_thread(CORE.local_ai.warmup)
+            print(
+                f"Jarvis: AI local {CORE.local_ai.model} đã nạp sẵn.",
+                flush=True,
+            )
+        except RuntimeError as error:
+            # Ollama is optional for deterministic commands. A failed warm-up
+            # must not stop IPC, ESP32 control, or the desktop application.
+            print(f"Jarvis: AI local chưa nạp sẵn: {error}", flush=True)
+
+    local_ai_warmup_task = asyncio.create_task(warm_local_ai())
     voice_task = None
     if VOICE_TRIGGER_ENABLED:
         voice_trigger_engine = VoiceTriggerEngine(
             VOICE_TRIGGER_MODEL_PATH,
             source=VOICE_TRIGGER_SOURCE,
+            serial_port=VOICE_TRIGGER_SERIAL_PORT,
+            serial_audio=VOICE_AUDIO_FROM_ESP32,
             suppression_callback=voice_trigger_is_suppressed,
         )
         if voice_trigger_engine.available():
-            voice_task = asyncio.create_task(run_voice_trigger_loop(
-                voice_trigger_engine,
-                handle_voice_command,
-                ready_callback=announce_voice_ready,
-                cancelled_callback=announce_voice_cancelled,
-                unrecognized_callback=announce_voice_unrecognized,
-                trigger_callback=handle_screen_wake_trigger,
-                ready_sound=VOICE_TRIGGER_READY_SOUND,
-            ))
-            print(
-                "Jarvis: Cảm biến âm thanh đã bật "
-                "(vỗ tay 2 lần hoặc búng tay 1 lần)."
-            )
+            if VOICE_DEVICE_COMMANDS_ENABLED:
+                voice_task = asyncio.create_task(run_exact_voice_command_loop(
+                    voice_trigger_engine,
+                    handle_exact_voice_device_command,
+                    VOICE_DEVICE_COMMANDS,
+                ))
+                print(
+                    "Jarvis: Điều khiển bằng vỗ tay đã tắt. Đang nghe chính xác "
+                    "'bật thiết bị' hoặc 'tắt thiết bị' bằng "
+                    f"{'INMP441 trên ESP32' if VOICE_AUDIO_FROM_ESP32 else 'microphone máy tính'}."
+                )
+            else:
+                voice_task = asyncio.create_task(run_voice_trigger_loop(
+                    voice_trigger_engine,
+                    handle_voice_command,
+                    ready_callback=announce_voice_ready,
+                    cancelled_callback=announce_voice_cancelled,
+                    unrecognized_callback=announce_voice_unrecognized,
+                    trigger_callback=(
+                        handle_screen_wake_trigger
+                        if VOICE_COMMAND_CAPTURE_ENABLED
+                        else handle_device_clap_trigger
+                    ),
+                    ready_sound=VOICE_TRIGGER_READY_SOUND,
+                    capture_commands=VOICE_COMMAND_CAPTURE_ENABLED,
+                ))
+                print(
+                    "Jarvis: Cảm biến vỗ tay đã bật "
+                    f"(ESP32: {VOICE_TRIGGER_SERIAL_PORT or 'tắt'}; "
+                    f"vỗ tay 2 lần; giọng nói: "
+                    f"{'bật' if VOICE_COMMAND_CAPTURE_ENABLED else 'tắt'})."
+                )
         else:
             print(
                 "Jarvis: Cảm biến âm thanh chưa sẵn sàng; "
@@ -8095,6 +10161,8 @@ async def main():
             reminder_task.cancel()
         if not gmail_task.done():
             gmail_task.cancel()
+        if not local_ai_warmup_task.done():
+            local_ai_warmup_task.cancel()
         if voice_task is not None and not voice_task.done():
             voice_task.cancel()
 
@@ -8108,6 +10176,10 @@ async def main():
             pass
         try:
             await gmail_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await local_ai_warmup_task
         except asyncio.CancelledError:
             pass
 

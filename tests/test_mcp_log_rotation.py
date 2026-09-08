@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import jarvis
 
@@ -11,6 +12,34 @@ class MCPLogRotationTests(unittest.TestCase):
         server = jarvis.create_mcp_server()
 
         self.assertIn("--no-performance-crux", server.args)
+
+    def test_mcp_version_is_pinned(self):
+        server = jarvis.create_mcp_server()
+
+        self.assertIn("chrome-devtools-mcp@1.8.0", server.args)
+        self.assertNotIn("chrome-devtools-mcp@latest", server.args)
+
+    def test_mcp_has_larger_node_heap(self):
+        with patch.dict(os.environ, {}, clear=True):
+            server = jarvis.create_mcp_server()
+
+        self.assertEqual(
+            server.env["NODE_OPTIONS"],
+            "--max-old-space-size=4096",
+        )
+
+    def test_mcp_preserves_explicit_node_heap(self):
+        with patch.dict(
+            os.environ,
+            {"NODE_OPTIONS": "--max-old-space-size=6144 --trace-warnings"},
+            clear=True,
+        ):
+            server = jarvis.create_mcp_server()
+
+        self.assertEqual(
+            server.env["NODE_OPTIONS"],
+            "--max-old-space-size=6144 --trace-warnings",
+        )
 
     def test_mcp_log_filter_drops_only_known_upstream_warning(self):
         with tempfile.TemporaryDirectory() as temp_dir:

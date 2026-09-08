@@ -3,6 +3,7 @@ __pycache__/
 .env
 venv/
 .venv/
+.pio/
 
 mcp_errors.log
 mcp_errors.log.*

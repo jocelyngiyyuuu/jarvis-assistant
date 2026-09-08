@@ -81,13 +81,36 @@ class ZaloCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("about%3Ablank", opened.call_args_list[0].args[0].full_url)
         self.assertIn("/json/close/owned-zalo", opened.call_args_list[1].args[0])
 
-    async def test_close_zalo_without_registry_fails_closed_without_url_scan(self):
+    async def test_close_zalo_without_registry_recovers_unique_isolated_tab(self):
         jarvis.managed_cdp_targets["zalo"].clear()
-        with patch("jarvis._cdp_pages") as pages, patch("jarvis.urlopen") as close:
+        target = {
+            "id": "recovered-zalo", "type": "page", "url": "https://chat.zalo.me/",
+        }
+        other = {"id": "other", "type": "page", "url": "about:blank"}
+        response = Mock(status=200)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch("jarvis._cdp_pages", side_effect=[[target, other], [target, other], [other]]), patch(
+            "jarvis._jarvis_chrome_ready", return_value=True
+        ), patch("jarvis.urlopen", return_value=response) as close:
+            self.assertTrue(await jarvis.close_managed_web_tab(
+                "zalo", "Zalo", ("https://chat.zalo.me/",)
+            ))
+        self.assertIn("/json/close/recovered-zalo", close.call_args.args[0])
+        self.assertEqual(jarvis.managed_cdp_targets["zalo"], set())
+
+    async def test_close_zalo_without_registry_rejects_ambiguous_tabs(self):
+        jarvis.managed_cdp_targets["zalo"].clear()
+        duplicates = [
+            {"id": "one", "url": "https://chat.zalo.me/"},
+            {"id": "two", "url": "https://chat.zalo.me/"},
+        ]
+        with patch("jarvis._cdp_pages", return_value=duplicates), patch(
+            "jarvis._jarvis_chrome_ready", return_value=True
+        ), patch("jarvis.urlopen") as close:
             self.assertFalse(await jarvis.close_managed_web_tab(
                 "zalo", "Zalo", ("https://chat.zalo.me/",)
             ))
-        pages.assert_not_called()
         close.assert_not_called()
 
     async def test_close_zalo_cdp_outage_retains_registry_for_retry(self):

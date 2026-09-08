@@ -61,7 +61,7 @@ lsof -v
   với model:
 
   ```text
-  qwen3:4b
+  qwen3-vl:4b
   ```
 
 - VieNeu-TTS cho giọng nói tiếng Việt. Đây là submodule có dependency và môi trường riêng; xem tài liệu trong `tts/VieNeu-TTS` trước khi cài vì yêu cầu CPU/GPU phụ thuộc máy.
@@ -204,15 +204,36 @@ DISCORD_USER_ID=thay_bang_user_id_duoc_phep
 
 # Khuyến nghị: giới hạn Jarvis vào đúng một channel
 DISCORD_CHANNEL_ID=thay_bang_channel_id
+DISCORD_VOICE_CHANNEL_ID=thay_bang_voice_channel_id
 
 # Tùy chọn: AI cục bộ
 OLLAMA_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=qwen3:4b
+OLLAMA_MODEL=qwen3-vl:4b
+OLLAMA_TEXT_MODEL=qwen3-vl:4b
+OLLAMA_VISION_MODEL=qwen3-vl:4b
+OLLAMA_KEEP_ALIVE=-1
+OLLAMA_VISION_KEEP_ALIVE=10m
 
 # Tùy chọn: cảm biến âm thanh (mặc định bật khi đã có model)
 VOICE_TRIGGER_ENABLED=1
 # VOICE_TRIGGER_SOURCE=alsa_input.pci-0000_06_00.6.analog-stereo
+# VOICE_TRIGGER_SERIAL_PORT=/dev/ttyACM0
+VOICE_COMMAND_CAPTURE_ENABLED=0
+CLAP_PC_CONTROL_ENABLED=1
 ```
+
+Khi `DISCORD_VOICE_CHANNEL_ID` được cấu hình, Jarvis tự vào kênh thoại và chỉ
+nhận giọng nói của tài khoản `DISCORD_USER_ID`. Bắt đầu mỗi lệnh bằng từ đánh
+thức `Jarvis`, ví dụ: `Jarvis tình trạng hệ thống`, `Jarvis mở YouTube cá nhân`
+hoặc `Jarvis tóm tắt Gmail`.
+
+Trong channel chat được cấu hình bởi `DISCORD_CHANNEL_ID`, chủ tài khoản cũng
+có thể bấm nút micro và gửi Discord Voice Message dài tối đa 15 giây. Voice
+Message là một yêu cầu chủ động nên không cần nói từ đánh thức; chỉ cần nói
+thẳng `tình trạng hệ thống`, `mở YouTube cá nhân` hoặc lệnh khác. Kết quả và file
+đính kèm được trả về chính channel chat đó. Lệnh nguy hiểm không chạy ngay;
+Jarvis gửi nút xác nhận chỉ chủ tài khoản dùng được và tự hết hạn sau 60 giây.
+Lệnh đọc bí mật hoặc xóa vĩnh viễn vẫn luôn bị từ chối.
 
 Siết quyền file:
 
@@ -296,6 +317,12 @@ nối LAN và giữ nguồn chờ cho card mạng. Dùng `tắt PC` để chạy
 không cần mật khẩu và host key phải có sẵn trong `known_hosts`. Lệnh tắt từ
 Discord luôn yêu cầu xác nhận trước khi thực hiện.
 
+Jarvis cũng điều khiển âm lượng output mặc định của Windows qua Core Audio và
+SSH, không cần cài NirCmd. Lệnh phải có từ `PC` để không nhầm với âm lượng của
+Ubuntu: `âm lượng PC hiện tại`, `tăng âm lượng PC`, `giảm âm lượng PC 10`,
+`âm lượng PC 50`, `tắt tiếng PC` hoặc `bật tiếng PC`. Các lệnh không có từ
+`PC` vẫn chỉ điều khiển Ubuntu như trước.
+
 Toàn bộ âm thanh được nhận dạng cục bộ bằng Vosk. Jarvis không lưu file thu âm.
 Để chọn microphone khác, đặt `VOICE_TRIGGER_SOURCE` trong `.env` bằng tên lấy từ
 `pactl list short sources`. Đặt `VOICE_TRIGGER_ENABLED=0` để tắt cảm biến.
@@ -313,6 +340,8 @@ After=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sh -c 'until test -x %h/Projects/jarvis/.venv/bin/python; do sleep 2; done'
+TimeoutStartSec=2min
 WorkingDirectory=%h/Projects/jarvis
 ExecStart=%h/Projects/jarvis/.venv/bin/python %h/Projects/jarvis/jarvis.py
 Restart=on-failure
@@ -322,6 +351,9 @@ RestartSec=5
 WantedBy=default.target
 EOF
 ```
+
+`ExecStartPre` giúp Jarvis chờ ổ chứa repository được mount khi đăng nhập,
+thay vì lặp lỗi `203/EXEC` vì `.venv/bin/python` tạm thời chưa xuất hiện.
 
 Nếu repository nằm ở đường dẫn khác, sửa `WorkingDirectory` và `ExecStart` trước khi khởi động.
 
@@ -538,7 +570,7 @@ Jarvis lưu lịch nhưng vẫn yêu cầu xác nhận trong Discord trước kh
 Cài và chạy Ollama theo tài liệu chính thức, sau đó tải model mặc định:
 
 ```bash
-ollama pull qwen3:4b
+ollama pull qwen3-vl:4b
 ollama serve
 ```
 

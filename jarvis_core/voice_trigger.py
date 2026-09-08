@@ -37,6 +37,29 @@ def pcm_metrics(data):
     return rms, peak, zcr
 
 
+def find_allowed_phrase(words, recognition_phrases):
+    """Find one complete allowed phrase in a noisy Vosk result.
+
+    Vosk can repeat a constrained phrase when steady room noise prevents its
+    normal endpoint detector from closing the utterance.  Accept one or more
+    repetitions of the same complete phrase, but reject a phrase embedded in
+    unrelated words.  Single action words cannot match either.
+    """
+    normalized = [
+        str(word.get("word", "")).strip().casefold()
+        for word in words if isinstance(word, dict)
+    ]
+    for phrase, command in recognition_phrases.items():
+        phrase_words = phrase.split()
+        width = len(phrase_words)
+        if not normalized or len(normalized) % width:
+            continue
+        repetitions = len(normalized) // width
+        if normalized == phrase_words * repetitions:
+            return command, phrase, words[:width]
+    return None, "", []
+
+
 class ImpulsePatternDetector:
     """Detect one high-frequency snap or two clap-like impulses."""
 
@@ -207,25 +230,41 @@ class ImpulsePatternDetector:
 class VoiceTriggerEngine:
     """Own the microphone process, wake detector and cached Vosk model."""
 
-    def __init__(self, model_path, *, source="", suppression_callback=None):
+    def __init__(
+        self,
+        model_path,
+        *,
+        source="",
+        serial_port="",
+        serial_audio=False,
+        suppression_callback=None,
+    ):
         self.model_path = Path(model_path)
         self.source = str(source).strip()
+        self.serial_port = str(serial_port).strip()
+        self.serial_audio = bool(serial_audio)
+        self.serial_audio_buffer = bytearray()
         self.suppression_callback = suppression_callback or (lambda: False)
         self.stop_event = threading.Event()
         self.paused_event = threading.Event()
         self.screen_wake_event = threading.Event()
         self.process = None
+        self.serial_connection = None
+        self.serial_lock = threading.Lock()
+        self.serial_error_logged_at = 0.0
         self.model = None
         self.last_capture_cancelled = False
         self.last_cancel_trigger = None
 
     def available(self):
-        return bool(
+        model_ready = bool(
             self.model_path.is_dir()
             and (self.model_path / "am").is_dir()
             and (self.model_path / "conf").is_dir()
-            and shutil_which("parec")
         )
+        if self.serial_audio:
+            return model_ready and bool(self.serial_port)
+        return model_ready and bool(shutil_which("parec"))
 
     def _start_capture(self):
         args = [
@@ -251,9 +290,96 @@ class VoiceTriggerEngine:
             process.kill()
             process.wait(timeout=1)
 
+    def _start_serial(self):
+        if self.serial_connection is not None:
+            return self.serial_connection
+        import serial
+        from serial.tools import list_ports
+
+        candidates = [self.serial_port]
+        for info in list_ports.comports():
+            if info.vid == 0x303A and info.device not in candidates:
+                candidates.append(info.device)
+
+        last_error = None
+        for device in candidates:
+            connection = serial.Serial(port=None, baudrate=115200, timeout=0.25)
+            # Keeping DTR asserted can reset some ESP32-S3 native USB boards
+            # when a short-lived command connection opens.  Audio streaming
+            # and command framing do not require either modem-control line.
+            connection.dtr = False
+            connection.rts = False
+            connection.port = device
+            try:
+                connection.open()
+                connection.reset_input_buffer()
+            except (OSError, ValueError) as error:
+                last_error = error
+                connection.close()
+                continue
+            self.serial_connection = connection
+            print(
+                f"Jarvis: Đã kết nối cảm biến ESP32 tại {device}.",
+                flush=True,
+            )
+            return connection
+        if last_error is not None:
+            raise last_error
+        raise OSError("không tìm thấy cổng ESP32")
+
+    def _stop_serial(self):
+        connection = self.serial_connection
+        self.serial_connection = None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def send_serial_commands(self, commands):
+        """Send newline-framed commands to the ESP32 without sharing readers."""
+        payload = "".join(f"{str(command).strip()}\n" for command in commands)
+        if not payload.strip():
+            return
+        with self.serial_lock:
+            connection = self._start_serial()
+            connection.write(payload.encode("ascii"))
+            connection.flush()
+
+    def _read_serial_audio_frame(self):
+        """Read one A5 5A + uint16-length PCM frame from the ESP32."""
+        connection = self._start_serial()
+        while not self.stop_event.is_set():
+            buffer = self.serial_audio_buffer
+            marker = buffer.find(b"\xA5\x5A")
+            if marker < 0:
+                if len(buffer) > 1:
+                    del buffer[:-1]
+            elif marker:
+                del buffer[:marker]
+            if len(buffer) >= 4 and buffer[:2] == b"\xA5\x5A":
+                payload_length = buffer[2] | (buffer[3] << 8)
+                if (
+                    payload_length <= 0
+                    or payload_length > 2048
+                    or payload_length % 2
+                ):
+                    del buffer[0]
+                    continue
+                frame_length = 4 + payload_length
+                if len(buffer) >= frame_length:
+                    payload = bytes(buffer[4:frame_length])
+                    del buffer[:frame_length]
+                    return payload
+            chunk = connection.read(1024)
+            if chunk:
+                buffer.extend(chunk)
+        return b""
+
     def stop(self):
         self.stop_event.set()
         self._stop_capture()
+        self._stop_serial()
 
     def pause(self):
         self.paused_event.set()
@@ -284,6 +410,9 @@ class VoiceTriggerEngine:
         return not self.paused_event.is_set() or self.screen_wake_event.is_set()
 
     def wait_for_trigger(self):
+        if self.serial_port:
+            return self._wait_for_serial_trigger()
+
         while not self.stop_event.is_set():
             while not self._capture_allowed() and not self.stop_event.is_set():
                 self.stop_event.wait(0.1)
@@ -336,6 +465,43 @@ class VoiceTriggerEngine:
                 # Also recover from a transient PipeWire/parec disconnect.
                 self.stop_event.wait(0.2)
         return None
+
+    def _wait_for_serial_trigger(self):
+        """Wait for a clap event emitted by the ESP32 over USB serial."""
+        trigger_names = {
+            "CLAP": "double_clap",
+            "DOUBLE_CLAP": "double_clap",
+            "SINGLE_CLAP": "single_clap",
+            "SNAP": "snap",
+        }
+        while not self.stop_event.is_set():
+            if not self._capture_allowed():
+                self.stop_event.wait(0.1)
+                continue
+            try:
+                connection = self._start_serial()
+                line = connection.readline()
+            except (OSError, ValueError) as error:
+                self._stop_serial()
+                now = time.monotonic()
+                if now - self.serial_error_logged_at >= 5.0:
+                    self.serial_error_logged_at = now
+                    print(
+                        "Jarvis: Chưa thể đọc cảm biến ESP32 tại "
+                        f"{self.serial_port}: {error}",
+                        flush=True,
+                    )
+                self.stop_event.wait(0.5)
+                continue
+
+            text = line.decode("utf-8", errors="replace").strip().upper()
+            if not text:
+                continue
+            if text.startswith("EVENT "):
+                text = text[6:].strip()
+            trigger = trigger_names.get(text)
+            if trigger and not bool(self.suppression_callback()):
+                return trigger
 
     def capture_command(self, *, start_timeout=4.0, max_seconds=9.0):
         """Capture one utterance, ending after roughly one second of silence."""
@@ -428,6 +594,159 @@ class VoiceTriggerEngine:
             return ""
         return str(result.get("text", "")).strip()
 
+    def listen_for_exact_command(self, commands):
+        """Continuously listen and return only a phrase from the allowlist."""
+        allowed = {
+            str(command).strip().casefold() for command in commands
+            if str(command).strip()
+        }
+        if not allowed:
+            return None
+        recognition_phrases = {command: command for command in allowed}
+        for command in allowed:
+            if command.endswith(" thiết bị"):
+                # The small Vietnamese model often elides the unstressed
+                # syllable "thiết" on this INMP441 while still hearing the
+                # action word and the final noun syllable.
+                recognition_phrases[command.replace(" thiết bị", " bị")] = command
+        from vosk import KaldiRecognizer, Model, SetLogLevel
+
+        SetLogLevel(-1)
+        if self.model is None:
+            self.model = Model(str(self.model_path))
+        grammar = json.dumps(
+            sorted(recognition_phrases) + ["[unk]"], ensure_ascii=False
+        )
+        # Small Vosk models have a replaceable dynamic graph; the larger and
+        # more accurate Vietnamese model has a fixed HCLG graph.  Use grammar
+        # only where supported, while applying the same exact-phrase safety
+        # check to both recognizers below.
+        dynamic_graph = (
+            (self.model_path / "graph" / "HCLr.fst").is_file()
+            and (self.model_path / "graph" / "Gr.fst").is_file()
+        )
+
+        def make_recognizer():
+            instance = (
+                KaldiRecognizer(self.model, SAMPLE_RATE, grammar)
+                if dynamic_graph
+                else KaldiRecognizer(self.model, SAMPLE_RATE)
+            )
+            instance.SetWords(True)
+            return instance
+
+        recognizer = make_recognizer()
+        recognizer.SetWords(True)
+        window_samples = 0
+        window_max_rms = 0.0
+        window_peak = 0
+        process = None
+        if self.serial_audio:
+            connection = self._start_serial()
+            connection.reset_input_buffer()
+            self.serial_audio_buffer.clear()
+        else:
+            process = self._start_capture()
+        try:
+            while not self.stop_event.is_set() and not self.paused_event.is_set():
+                if self.serial_audio:
+                    data = self._read_serial_audio_frame()
+                else:
+                    data = process.stdout.read(FRAME_BYTES) if process.stdout else b""
+                if not data:
+                    if self.serial_audio:
+                        continue
+                    return None
+                if bool(self.suppression_callback()):
+                    recognizer.Reset()
+                    window_samples = 0
+                    window_max_rms = 0.0
+                    window_peak = 0
+                    continue
+                frame_rms, frame_peak, _frame_zcr = pcm_metrics(data)
+                window_max_rms = max(window_max_rms, frame_rms)
+                window_peak = max(window_peak, frame_peak)
+                window_samples += len(data) // 2
+                endpoint_detected = recognizer.AcceptWaveform(data)
+                forced_endpoint = window_samples >= SAMPLE_RATE * 4
+                if not endpoint_detected and not forced_endpoint:
+                    continue
+                try:
+                    result = json.loads(
+                        recognizer.Result()
+                        if endpoint_detected
+                        else recognizer.FinalResult()
+                    )
+                except (TypeError, ValueError):
+                    continue
+                window_samples = 0
+                completed_max_rms = window_max_rms
+                completed_peak = window_peak
+                window_max_rms = 0.0
+                window_peak = 0
+                if forced_endpoint and not endpoint_detected:
+                    recognizer = make_recognizer()
+                recognized = str(result.get("text", "")).strip().casefold()
+                words = result.get("result", [])
+                command, matched_phrase, matched_words = find_allowed_phrase(
+                    words, recognition_phrases
+                )
+                confidences = [
+                    float(word.get("conf", 0.0)) for word in words
+                    if isinstance(word, dict)
+                ]
+                spoken_words = " ".join(
+                    str(word.get("word", "")).strip().casefold()
+                    for word in words if isinstance(word, dict)
+                ).strip()
+                matched_confidences = [
+                    float(word.get("conf", 0.0)) for word in matched_words
+                    if isinstance(word, dict)
+                ]
+                duration = 0.0
+                if matched_words:
+                    duration = max(
+                        0.0,
+                        float(matched_words[-1].get("end", 0.0))
+                        - float(matched_words[0].get("start", 0.0)),
+                    )
+                min_confidence = (
+                    min(matched_confidences) if matched_confidences else 0.0
+                )
+                complete_exact_phrase = (
+                    command is not None
+                    and min_confidence >= 0.82
+                    and 0.45 <= duration <= 3.0
+                )
+                if command is not None:
+                    print(
+                        "Jarvis: VOICE candidate="
+                        f"{recognized} matched={matched_phrase} "
+                        f"canonical={command} "
+                        f"confidence={min_confidence:.2f} "
+                        f"duration={duration:.2f}s rms={completed_max_rms:.0f} "
+                        f"peak={completed_peak} "
+                        f"accepted={int(complete_exact_phrase)}",
+                        flush=True,
+                    )
+                elif recognized:
+                    print(
+                        f"Jarvis: VOICE heard={recognized} accepted=0",
+                        flush=True,
+                    )
+                elif forced_endpoint:
+                    print(
+                        "Jarvis: VOICE window=4.0s heard=<empty> accepted=0",
+                        f" rms={completed_max_rms:.0f} peak={completed_peak}",
+                        flush=True,
+                    )
+                if complete_exact_phrase:
+                    return command
+        finally:
+            if process is not None:
+                self._stop_capture()
+        return None
+
 
 def shutil_which(command):
     # Kept as a tiny seam so availability checks are deterministic in tests.
@@ -444,6 +763,7 @@ async def run_voice_trigger_loop(
     unrecognized_callback=None,
     trigger_callback=None,
     ready_sound="",
+    capture_commands=True,
 ):
     """Wait for wake sounds and dispatch one recognized command at a time."""
     if not engine.available():
@@ -452,12 +772,13 @@ async def run_voice_trigger_loop(
         trigger = await asyncio.to_thread(engine.wait_for_trigger)
         if not trigger or engine.stop_event.is_set():
             return
-        print(
-            f"Jarvis: VOICE_TRIGGER detected={trigger}; đang nghe lệnh...",
-            flush=True,
-        )
+        action = "đang nghe lệnh..." if capture_commands else "đã nhận từ ESP32."
+        print(f"Jarvis: VOICE_TRIGGER detected={trigger}; {action}", flush=True)
         if trigger_callback is not None and await trigger_callback(trigger):
             await asyncio.sleep(0.8)
+            continue
+        if not capture_commands:
+            await asyncio.sleep(0.2)
             continue
         if ready_callback is not None:
             await ready_callback(trigger)
@@ -498,3 +819,30 @@ async def run_voice_trigger_loop(
             if unrecognized_callback is not None:
                 await unrecognized_callback()
         await asyncio.sleep(0.8)
+
+
+async def run_exact_voice_command_loop(engine, command_callback, commands):
+    """Listen continuously and dispatch only exact allowlisted phrases."""
+    if not engine.available():
+        return
+    while not engine.stop_event.is_set():
+        try:
+            command = await asyncio.to_thread(
+                engine.listen_for_exact_command, commands
+            )
+        except (OSError, ValueError) as error:
+            engine._stop_serial()
+            print(f"Jarvis: Luồng âm thanh ESP32 bị gián đoạn: {error}", flush=True)
+            await asyncio.sleep(0.5)
+            continue
+        if engine.stop_event.is_set():
+            return
+        if not command:
+            await asyncio.sleep(0.2)
+            continue
+        print(f"Jarvis: VOICE_DEVICE_COMMAND exact={command}", flush=True)
+        await command_callback(command)
+        # Drop the remainder of the same utterance before accepting another
+        # device command.  This especially avoids a second PC shutdown attempt
+        # after the first one has already taken the machine offline.
+        await asyncio.sleep(8.0)

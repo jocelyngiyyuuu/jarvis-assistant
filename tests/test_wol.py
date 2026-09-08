@@ -36,6 +36,15 @@ class WakeOnLanTests(unittest.IsolatedAsyncioTestCase):
             client.sendto.call_args.args[1], ("192.168.2.255", 9)
         )
 
+    def test_reliable_sender_spreads_multiple_wol_bursts(self):
+        with patch.object(
+            jarvis, "send_wake_on_lan", return_value=3
+        ) as send, patch.object(jarvis.time, "sleep") as sleep:
+            count = jarvis.send_reliable_wake_on_lan(bursts=5, interval=1.0)
+        self.assertEqual(count, 15)
+        self.assertEqual(send.call_count, 5)
+        self.assertEqual(sleep.call_count, 4)
+
     async def test_bat_pc_routes_to_wol_sender(self):
         for command in ("bật PC", "bật máy tính", "đánh thức PC"):
             with self.subTest(command=command), patch.object(
@@ -76,6 +85,28 @@ class WakeOnLanTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         shutdown.assert_called_once_with()
         self.assertIn("Đã tắt PC", jarvis.last_command_response)
+
+    async def test_double_clap_wakes_pc_without_voice_capture(self):
+        async def inline_thread(function, *args):
+            return function(*args)
+
+        with patch.object(jarvis, "CLAP_PC_CONTROL_ENABLED", True), \
+             patch.object(jarvis.asyncio, "to_thread", side_effect=inline_thread), \
+             patch.object(
+                 jarvis, "send_reliable_wake_on_lan", return_value=15
+             ) as wake:
+            self.assertTrue(await jarvis.handle_device_clap_trigger("double_clap"))
+        wake.assert_called_once_with()
+
+    async def test_single_clap_shuts_down_pc_without_voice_capture(self):
+        async def inline_thread(function, *args):
+            return function(*args)
+
+        with patch.object(jarvis, "CLAP_PC_CONTROL_ENABLED", True), \
+             patch.object(jarvis.asyncio, "to_thread", side_effect=inline_thread), \
+             patch.object(jarvis, "shutdown_remote_pc", return_value=True) as shutdown:
+            self.assertTrue(await jarvis.handle_device_clap_trigger("single_clap"))
+        shutdown.assert_called_once_with()
 
 
 if __name__ == "__main__":

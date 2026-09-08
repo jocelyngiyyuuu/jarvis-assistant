@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 import jarvis
 from jarvis_core.voice_trigger import (
     ImpulsePatternDetector,
+    find_allowed_phrase,
     pcm_metrics,
     run_voice_trigger_loop,
 )
@@ -117,6 +118,44 @@ class VoiceCommandSafetyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         jarvis.last_command_response = None
 
+    def test_exact_device_phrase_can_be_found_inside_repeated_vosk_result(self):
+        words = [
+            {"word": "tắt", "conf": 0.95},
+            {"word": "bị", "conf": 0.91},
+            {"word": "tắt", "conf": 0.93},
+            {"word": "bị", "conf": 0.90},
+        ]
+        command, phrase, matched = find_allowed_phrase(
+            words,
+            {"bật thiết bị": "bật thiết bị", "tắt bị": "tắt thiết bị"},
+        )
+        self.assertEqual(command, "tắt thiết bị")
+        self.assertEqual(phrase, "tắt bị")
+        self.assertEqual([word["word"] for word in matched], ["tắt", "bị"])
+
+    def test_single_action_word_is_not_a_complete_device_phrase(self):
+        command, phrase, matched = find_allowed_phrase(
+            [{"word": "bật", "conf": 0.99}],
+            {"bật thiết bị": "bật thiết bị", "bật bị": "bật thiết bị"},
+        )
+        self.assertIsNone(command)
+        self.assertEqual(phrase, "")
+        self.assertEqual(matched, [])
+
+    def test_device_phrase_embedded_in_unrelated_words_is_rejected(self):
+        command, phrase, matched = find_allowed_phrase(
+            [
+                {"word": "thiết", "conf": 0.91},
+                {"word": "tắt", "conf": 0.94},
+                {"word": "thiết", "conf": 0.95},
+                {"word": "bị", "conf": 0.93},
+            ],
+            {"tắt thiết bị": "tắt thiết bị", "tắt bị": "tắt thiết bị"},
+        )
+        self.assertIsNone(command)
+        self.assertEqual(phrase, "")
+        self.assertEqual(matched, [])
+
     async def test_dangerous_voice_command_requires_another_interface(self):
         with patch.object(jarvis, "route_command", new=AsyncMock()) as route, \
              patch.object(jarvis, "speak") as speak:
@@ -141,7 +180,8 @@ class VoiceCommandSafetyTests(unittest.IsolatedAsyncioTestCase):
         engine.available.return_value = True
         engine.stop_event.is_set.return_value = False
         engine.is_paused.return_value = False
-        with patch.object(jarvis, "voice_trigger_engine", engine):
+        with patch.object(jarvis, "voice_trigger_engine", engine), \
+             patch.object(jarvis, "VOICE_TRIGGER_ENABLED", True):
             self.assertTrue(await jarvis.route_command(
                 "trạng thái cảm biến âm thanh", allow_local_ai=False
             ))
@@ -229,6 +269,60 @@ class VoiceCommandSafetyTests(unittest.IsolatedAsyncioTestCase):
                  side_effect=metrics,
              ):
             self.assertEqual(engine.wait_for_trigger(), "double_clap")
+
+    def test_serial_double_clap_event_replaces_desktop_wake_microphone(self):
+        from jarvis_core.voice_trigger import VoiceTriggerEngine
+
+        class SerialConnection:
+            def readline(self):
+                return b"EVENT DOUBLE_CLAP\n"
+
+            def close(self):
+                pass
+
+        engine = VoiceTriggerEngine(
+            "/tmp/missing-model", serial_port="/dev/ttyACM0"
+        )
+        engine.serial_connection = SerialConnection()
+        self.assertEqual(engine.wait_for_trigger(), "double_clap")
+
+    def test_serial_single_clap_event_is_available_for_device_shutdown(self):
+        from jarvis_core.voice_trigger import VoiceTriggerEngine
+
+        class SerialConnection:
+            def readline(self):
+                return b"EVENT SINGLE_CLAP\n"
+
+            def close(self):
+                pass
+
+        engine = VoiceTriggerEngine(
+            "/tmp/missing-model", serial_port="/dev/ttyACM0"
+        )
+        engine.serial_connection = SerialConnection()
+        self.assertEqual(engine.wait_for_trigger(), "single_clap")
+
+    def test_serial_audio_drains_buffer_before_reading_more(self):
+        from jarvis_core.voice_trigger import VoiceTriggerEngine
+
+        first = b"\x01\x00\x02\x00"
+        second = b"\x03\x00\x04\x00"
+        stream = (
+            b"\xA5\x5A\x04\x00" + first
+            + b"\xA5\x5A\x04\x00" + second
+        )
+        connection = unittest.mock.Mock()
+        connection.read.return_value = stream
+        engine = VoiceTriggerEngine(
+            "/tmp/missing-model",
+            serial_port="/dev/ttyACM0",
+            serial_audio=True,
+        )
+        engine.serial_connection = connection
+
+        self.assertEqual(engine._read_serial_audio_frame(), first)
+        self.assertEqual(engine._read_serial_audio_frame(), second)
+        connection.read.assert_called_once_with(1024)
 
     async def test_armed_audio_gesture_wakes_screen_without_listening(self):
         engine = unittest.mock.Mock()
@@ -381,6 +475,42 @@ class VoiceCommandSafetyTests(unittest.IsolatedAsyncioTestCase):
                 Engine(), AsyncMock(), unrecognized_callback=unrecognized
             )
         unrecognized.assert_awaited_once_with()
+
+    async def test_command_capture_can_be_disabled_for_esp32_clap_actions(self):
+        class StopEvent:
+            def is_set(self):
+                return False
+
+        class Engine:
+            def __init__(self):
+                self.stop_event = StopEvent()
+                self.calls = 0
+
+            def available(self):
+                return True
+
+            def wait_for_trigger(self):
+                self.calls += 1
+                return "double_clap" if self.calls == 1 else None
+
+            def capture_command(self):
+                raise AssertionError("desktop microphone must remain closed")
+
+        command = AsyncMock()
+
+        async def inline_thread(function, *args):
+            return function(*args)
+
+        with patch(
+            "jarvis_core.voice_trigger.asyncio.sleep", new=AsyncMock()
+        ), patch(
+            "jarvis_core.voice_trigger.asyncio.to_thread",
+            side_effect=inline_thread,
+        ):
+            await run_voice_trigger_loop(
+                Engine(), command, capture_commands=False
+            )
+        command.assert_not_awaited()
 
 
 if __name__ == "__main__":

@@ -22,7 +22,10 @@ class JarvisCore:
         self.file_index = FileIndex(
             base_dir / ".jarvis_data" / "file_index.sqlite3", [Path.home()]
         )
-        self.monitor = SystemMonitor(Path.home())
+        # The project is stored on the data drive on this installation. Passing
+        # both locations makes the system-status command report both physical
+        # filesystems; SystemMonitor de-duplicates them if they share one drive.
+        self.monitor = SystemMonitor(disk_paths=[Path.home(), base_dir])
         self.local_ai = LocalAI()
         self.conversation = ConversationStore(
             base_dir / ".jarvis_data" / "conversation.sqlite3"

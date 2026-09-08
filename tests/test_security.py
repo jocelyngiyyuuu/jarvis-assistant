@@ -15,6 +15,7 @@ class SecurityPolicyTests(unittest.TestCase):
         self.assertEqual(classify_remote_command("sleep sâu lúc 23:30"), "confirm")
         self.assertEqual(classify_remote_command("hủy sleep sâu"), "confirm")
         self.assertEqual(classify_remote_command("tắt PC"), "confirm")
+        self.assertEqual(classify_remote_command("tắt thiết bị"), "confirm")
         self.assertEqual(
             classify_remote_command("gửi tin nhắn cho Minh với nội dung test"),
             "confirm",
@@ -27,6 +28,15 @@ class SecurityPolicyTests(unittest.TestCase):
         self.assertEqual(classify_remote_command("xóa vĩnh viễn file"), "forbidden")
         self.assertEqual(classify_remote_command("tóm tắt gmail"), "sensitive")
         self.assertEqual(classify_remote_command("gmail mới"), "sensitive")
+        self.assertEqual(classify_remote_command("chụp màn hình"), "sensitive")
+        self.assertEqual(classify_remote_command("bấm chuột tại 100 200"), "normal")
+        self.assertEqual(classify_remote_command("nhấn nút Gửi"), "normal")
+        self.assertEqual(classify_remote_command("di chuột đến 100 200"), "normal")
+        self.assertEqual(classify_remote_command("cuộn xuống"), "normal")
+        # A pointer-style phrase must not bypass confirmations for an
+        # independently dangerous action.
+        self.assertEqual(classify_remote_command("nhấn nút tắt PC"), "confirm")
+        self.assertEqual(classify_remote_command("click xóa file"), "confirm")
         for command in (
             "đọc gmail", "gmail có gì", "tổng hợp gmail", "kiểm tra email",
             "tóm tắt mail", "tóm tắt thư điện tử",

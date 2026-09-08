@@ -623,7 +623,7 @@ class ChromeAutomationWindowTests(unittest.TestCase):
             self.assertFalse(manager.activate_automation_window(set(), 777, "youtube", timeout=0.01))
         focus.assert_not_called()
 
-    def test_single_new_window_must_match_requested_target(self):
+    def test_single_pid_owned_window_is_safe_while_title_is_loading(self):
         manager = ChromeWindowManager()
         windows = [
             {"id": "0x7", "class": "google-chrome", "title": "New Tab"},
@@ -632,8 +632,8 @@ class ChromeAutomationWindowTests(unittest.TestCase):
              patch.object(manager, "_window_pid", return_value=777), \
              patch.object(manager, "_active_window_id", return_value="0x1"), \
              patch.object(manager, "_focus_window") as focus:
-            self.assertFalse(manager.activate_automation_window(set(), 777, "zalo", timeout=0.01))
-        focus.assert_not_called()
+            self.assertTrue(manager.activate_automation_window(set(), 777, "zalo", timeout=0.01))
+        focus.assert_called_once_with("0x7")
 
     def test_previous_ids_are_canonicalized_before_new_window_detection(self):
         manager = ChromeWindowManager()

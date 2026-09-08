@@ -1,4 +1,5 @@
 import inspect
+import os
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -6,6 +7,38 @@ import jarvis
 
 
 class ChromeShortcutTests(unittest.TestCase):
+    def test_open_chrome_refreshes_desktop_environment_before_snapshot(self):
+        with patch("jarvis._refresh_graphical_environment") as refresh, patch.object(
+            jarvis.CHROME_WINDOWS, "snapshot_ids", return_value=None
+        ):
+            self.assertFalse(jarvis.open_chrome(
+                jarvis.STUDY_PROFILE, "https://github.com/"
+            ))
+        refresh.assert_called_once_with()
+
+    def test_missing_display_is_imported_from_user_systemd_environment(self):
+        environment = (
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\n"
+            "DISPLAY=:0\n"
+            "WAYLAND_DISPLAY=wayland-0\n"
+            "XDG_SESSION_TYPE=wayland\n"
+        )
+        completed = Mock(returncode=0, stdout=environment)
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "jarvis.subprocess.run", return_value=completed
+        ) as run:
+            self.assertTrue(jarvis._refresh_graphical_environment())
+            self.assertEqual(os.environ["DISPLAY"], ":0")
+            self.assertEqual(os.environ["WAYLAND_DISPLAY"], "wayland-0")
+            self.assertEqual(os.environ["XDG_SESSION_TYPE"], "wayland")
+        run.assert_called_once_with(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+
     def test_vscode_open_aborts_when_window_snapshot_is_unverifiable(self):
         with patch.object(
             jarvis.FILE_WINDOWS, "snapshot_ids", return_value=None
@@ -66,12 +99,22 @@ class ChromeShortcutTests(unittest.TestCase):
         self.assertEqual(jarvis.last_command_response, "✅ Đã mở Zalo.")
 
     def test_zalo_does_not_claim_opened_when_chrome_fails(self):
-        with patch("jarvis.open_chrome", return_value=False):
+        with patch("jarvis.open_chrome", return_value=False), patch(
+            "jarvis._managed_cdp_site_is_open", return_value=False
+        ):
             self.assertTrue(jarvis.handle_chrome_shortcut("mở zalo"))
         self.assertEqual(
             jarvis.last_command_response,
             "❌ Không thể mở Zalo lúc này.",
         )
+
+    def test_zalo_reports_open_when_exact_managed_tab_exists(self):
+        with patch("jarvis.open_chrome", return_value=False), patch(
+            "jarvis._managed_cdp_site_is_open", return_value=True
+        ) as verified:
+            self.assertTrue(jarvis.handle_chrome_shortcut("mở zalo"))
+        verified.assert_called_once_with("zalo")
+        self.assertEqual(jarvis.last_command_response, "✅ Đã mở Zalo.")
 
 
 class ChromeShortcutCloseTests(unittest.IsolatedAsyncioTestCase):

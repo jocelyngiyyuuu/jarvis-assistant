@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import json
+import numpy as np
+import os
 import sys
 
 from tts_playback import play_wav
-from tts_limits import max_new_frames_for_text
+from tts_limits import max_new_frames_for_text, split_text_for_tts
 
 
 # ==========================================================
@@ -34,7 +37,33 @@ OUTPUT_FILE = TTS_DIR / "output.wav"
 
 print("Jarvis TTS: Đang tải model...", flush=True)
 
-tts = Vieneu()
+def find_cached_onnx_model():
+    """Find a complete local VieNeu ONNX snapshot without contacting HF."""
+    hf_home = Path(os.getenv(
+        "HF_HOME", str(Path.home() / ".cache" / "huggingface")
+    )).expanduser()
+    snapshots = (
+        hf_home / "hub"
+        / "models--pnnbao-ump--VieNeu-TTS-v3-Turbo"
+        / "snapshots"
+    )
+    required = {
+        "config.json", "tokenizer.json", "vieneu_prefill.onnx",
+        "vieneu_decode_step.onnx", "vieneu_acoustic_cached.onnx",
+        "vieneu_backbone_shared.data", "vieneu_v3_heads.npz",
+    }
+    for candidate in sorted(snapshots.glob("*/onnx_int8"), reverse=True):
+        if all((candidate / filename).is_file() for filename in required):
+            return candidate
+    raise RuntimeError(
+        "Không tìm thấy snapshot VieNeu ONNX hoàn chỉnh trong cache local."
+    )
+
+
+tts = Vieneu(
+    backend="onnx",
+    onnx_dir=str(find_cached_onnx_model()),
+)
 
 print("Jarvis TTS: Model đã sẵn sàng.", flush=True)
 
@@ -43,7 +72,7 @@ print("Jarvis TTS: Model đã sẵn sàng.", flush=True)
 # SPEAK
 # ==========================================================
 
-def speak(text):
+def speak(text, *, play_local=True):
     text = str(text).strip()
 
     if not text:
@@ -52,22 +81,45 @@ def speak(text):
     print(f"Jarvis TTS: {text}", flush=True)
 
     try:
-        max_new_frames = max_new_frames_for_text(text)
-        audio = tts.infer(
-            text,
-            ref_audio=str(VOICE_FILE) if VOICE_FILE.exists() else None,
-            denoise=False,
-            use_ref_codes=False,
-            max_new_frames=max_new_frames,
-        )
+        chunks = split_text_for_tts(text)
+        rendered = []
+        frame_limits = []
+        for index, chunk in enumerate(chunks):
+            max_new_frames = max_new_frames_for_text(chunk)
+            frame_limits.append(max_new_frames)
+            rendered.append(np.asarray(tts.infer(
+                chunk,
+                ref_audio=(
+                    str(VOICE_FILE) if VOICE_FILE.exists() else None
+                ),
+                denoise=False,
+                use_ref_codes=False,
+                # Lấy mẫu ổn định hơn để hạn chế model tự nói thêm.
+                temperature=0.6,
+                top_k=20,
+                top_p=0.9,
+                repetition_penalty=1.3,
+                max_new_frames=max_new_frames,
+            )).reshape(-1))
+            if index + 1 < len(chunks):
+                # Preserve a short, audible boundary between forecast days
+                # after independently synthesized chunks are joined.
+                rendered.append(np.zeros(
+                    int(getattr(tts, "sample_rate", 48000) * 0.12),
+                    dtype=np.float32,
+                ))
+
+        audio = np.concatenate(rendered)
 
         tts.save(audio, str(OUTPUT_FILE))
         duration = len(audio) / getattr(tts, "sample_rate", 48000)
         print(
-            f"Jarvis TTS: {duration:.1f}s ({max_new_frames} frames)",
+            f"Jarvis TTS: {duration:.1f}s "
+            f"({len(chunks)} đoạn, {sum(frame_limits)} frames)",
             flush=True,
         )
-        play_wav(OUTPUT_FILE)
+        if play_local:
+            play_wav(OUTPUT_FILE)
 
     except Exception as error:
         print(f"Jarvis TTS ERROR: {error}", flush=True)
@@ -96,6 +148,7 @@ if __name__ == "__main__":
         try:
             for line in sys.stdin:
                 text = line.strip()
+                play_local = True
 
                 if not text:
                     continue
@@ -107,7 +160,15 @@ if __name__ == "__main__":
                     )
                     break
 
-                speak(text)
+                if text.startswith("{"):
+                    try:
+                        request = json.loads(text)
+                        text = str(request.get("text", "")).strip()
+                        play_local = bool(request.get("play_local", True))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+
+                speak(text, play_local=play_local)
 
         except KeyboardInterrupt:
             pass

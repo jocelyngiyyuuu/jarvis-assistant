@@ -36,7 +36,7 @@ def classify_remote_command(command):
         return "forbidden"
     dangerous = (
         "sleep sau", "ngu sau", "suspend", "huy sleep sau", "shutdown",
-        "tat may", "tat pc", "khoi dong lai", "reboot", "xoa file",
+        "tat may", "tat pc", "tat thiet bi", "khoi dong lai", "reboot", "xoa file",
         "dua vao thung rac",
     )
     if re.search(
@@ -46,6 +46,9 @@ def classify_remote_command(command):
         return "confirm"
     if any(pattern in plain for pattern in dangerous):
         return "confirm"
+    # Screen/pointer operations from the verified Discord owner execute
+    # immediately. Destructive or power-related words above still win and
+    # retain their confirmation requirement.
     sensitive = (
         "xem bo nho", "nho lai", "phan tich file", "tom tat gmail",
         "tom tat email", "gmail moi", "email moi", "kiem tra gmail",
@@ -58,6 +61,8 @@ def classify_remote_command(command):
         "tro giup gmail", "tro giup email", "tro giup mail", "tro giup thu dien tu",
         "tom tat thu rac", "doc thu rac", "kiem tra thu rac",
         "tom tat spam", "doc spam", "kiem tra spam",
+        "chup man hinh", "xem man hinh", "man hinh dang hien thi gi",
+        "cho toi xem man hinh",
     )
     if any(pattern in plain for pattern in sensitive):
         return "sensitive"

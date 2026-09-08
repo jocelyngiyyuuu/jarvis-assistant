@@ -3,6 +3,7 @@ import json
 import asyncio
 import heapq
 import mimetypes
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -15,7 +16,6 @@ import discord
 # ============================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-NINEROUTER_API_KEY = os.getenv("NINEROUTER_API_KEY", "")
 
 DISCORD_CHANNEL_ID = 1537845497526624347
 DISCORD_OWNER_ID = int(
@@ -29,11 +29,8 @@ PROJECT_ROOT = (
 ).resolve()
 READ_ROOT = Path.home().resolve()
 
-NINEROUTER_URL = (
-    "http://localhost:20128/v1/chat/completions"
-)
-
-NINEROUTER_MODEL = "AI"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-vl:4b")
 
 MAX_AGENT_TURNS = 15
 
@@ -45,8 +42,6 @@ MAX_AGENT_TURNS = 15
 def validate_config() -> None:
     if not DISCORD_TOKEN:
         raise RuntimeError("Thiếu DISCORD_TOKEN.")
-    if not NINEROUTER_API_KEY:
-        raise RuntimeError("Thiếu NINEROUTER_API_KEY.")
 
 
 # ============================================================
@@ -136,6 +131,18 @@ def display_path(path: Path) -> str:
         return str(path.relative_to(READ_ROOT)) or "."
     except ValueError:
         return str(path)
+
+
+def strip_qwen_thinking(content: str) -> str:
+    """Hide reasoning emitted by some Qwen templates despite think=false."""
+    content = str(content or "").strip()
+    content = re.sub(
+        r"^.*?</think>\s*", "", content, flags=re.DOTALL | re.IGNORECASE
+    )
+    content = re.sub(
+        r"<think>.*?</think>\s*", "", content, flags=re.DOTALL | re.IGNORECASE
+    )
+    return content.strip()
 
 
 # ============================================================
@@ -378,7 +385,7 @@ def tool_analyze_file(path: str) -> str:
 
 
 # ============================================================
-# OPENAI-COMPATIBLE TOOL DEFINITIONS
+# OLLAMA TOOL DEFINITIONS
 # ============================================================
 
 TOOLS = [
@@ -481,25 +488,21 @@ TOOLS = [
 
 
 # ============================================================
-# CALL 9ROUTER
+# CALL LOCAL OLLAMA
 # ============================================================
 
-async def call_9router(
+async def call_ollama(
     messages
 ):
-
-    headers = {
-        "Authorization": (
-            f"Bearer {NINEROUTER_API_KEY}"
-        ),
-        "Content-Type": "application/json",
-    }
-
     payload = {
-        "model": NINEROUTER_MODEL,
+        "model": OLLAMA_MODEL,
         "messages": messages,
         "tools": TOOLS,
-        "tool_choice": "auto",
+        "think": False,
+        "options": {
+            "temperature": 0.1,
+            "num_ctx": 8192,
+        },
         "stream": False,
     }
 
@@ -512,8 +515,8 @@ async def call_9router(
     ) as session:
 
         async with session.post(
-            NINEROUTER_URL,
-            headers=headers,
+            f"{OLLAMA_URL}/api/chat",
+            headers={"Content-Type": "application/json"},
             json=payload,
         ) as response:
 
@@ -521,7 +524,7 @@ async def call_9router(
 
             if response.status != 200:
                 raise RuntimeError(
-                    f"9Router HTTP "
+                    f"Ollama HTTP "
                     f"{response.status}: {text}"
                 )
 
@@ -530,7 +533,7 @@ async def call_9router(
 
             except json.JSONDecodeError:
                 raise RuntimeError(
-                    "9Router trả JSON không hợp lệ:\n"
+                    "Ollama trả JSON không hợp lệ:\n"
                     + text
                 )
 
@@ -652,18 +655,17 @@ async def run_agent(
             flush=True,
         )
 
-        data = await call_9router(
+        data = await call_ollama(
             messages
         )
 
         try:
-            message = (
-                data["choices"][0]["message"]
-            )
+            message = dict(data["message"])
+            message["content"] = strip_qwen_thinking(message.get("content", ""))
 
         except Exception:
             return (
-                "❌ Response 9Router "
+                "❌ Response Ollama "
                 "không đúng format:\n"
                 + json.dumps(
                     data,
@@ -743,9 +745,6 @@ async def run_agent(
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": (
-                        tool_call["id"]
-                    ),
                     "content": result,
                 }
             )
@@ -821,14 +820,14 @@ async def on_ready():
     )
 
     print(
-        f"✅ 9Router: "
-        f"{NINEROUTER_URL}",
+        f"✅ Ollama local: "
+        f"{OLLAMA_URL}",
         flush=True,
     )
 
     print(
         f"✅ Model: "
-        f"{NINEROUTER_MODEL}",
+        f"{OLLAMA_MODEL}",
         flush=True,
     )
 

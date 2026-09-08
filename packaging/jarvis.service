@@ -1,0 +1,17 @@
+[Unit]
+Description=Jarvis AI Assistant
+After=network-online.target
+
+[Service]
+Type=simple
+# /home/khoa/Projects may point at a removable or separately mounted volume.
+# Wait here instead of entering a rapid 203/EXEC restart loop during login.
+ExecStartPre=/bin/sh -c 'until test -x %h/Projects/jarvis/.venv/bin/python; do sleep 2; done'
+TimeoutStartSec=2min
+WorkingDirectory=%h/Projects/jarvis
+ExecStart=%h/Projects/jarvis/.venv/bin/python %h/Projects/jarvis/jarvis.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

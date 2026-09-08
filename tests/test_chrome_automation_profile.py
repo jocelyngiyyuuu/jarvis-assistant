@@ -48,9 +48,51 @@ class ChromeAutomationProfileTests(unittest.TestCase):
         response.__exit__.return_value = False
         response.read.return_value = __import__("json").dumps([page]).encode()
         jarvis.managed_cdp_targets["youtube"].clear()
-        with patch("jarvis.urlopen", return_value=response):
+        activated = MagicMock(status=200)
+        activated.__enter__.return_value = activated
+        activated.__exit__.return_value = False
+        with patch("jarvis.urlopen", side_effect=[response, activated]) as opened:
             self.assertTrue(jarvis._ensure_jarvis_chrome_tab("https://www.youtube.com/"))
         self.assertEqual(jarvis.managed_cdp_targets["youtube"], {"target-1"})
+        self.assertIn("/json/activate/target-1", opened.call_args_list[1].args[0])
+
+    def test_mcp_lookup_restores_unique_tab_after_service_restart(self):
+        page = {
+            "id": "target-1", "type": "page", "url": "https://www.youtube.com/",
+        }
+        session = AsyncMock()
+        session.call_tool.return_value = type("Result", (), {
+            "content": [type("Text", (), {
+                "text": "2: (39) YouTube (https://www.youtube.com/)",
+            })()],
+        })()
+        jarvis.managed_cdp_targets["youtube"].clear()
+
+        with patch("jarvis._cdp_pages", return_value=[page]), patch(
+            "jarvis._jarvis_chrome_ready", return_value=True
+        ):
+            import asyncio
+            page_id = asyncio.run(jarvis.find_youtube_page(session))
+
+        self.assertEqual(page_id, 2)
+        self.assertEqual(jarvis.managed_cdp_targets["youtube"], {"target-1"})
+
+    def test_mcp_lookup_does_not_reown_ambiguous_tabs(self):
+        pages = [
+            {"id": "one", "type": "page", "url": "https://www.youtube.com/"},
+            {"id": "two", "type": "page", "url": "https://www.youtube.com/feed"},
+        ]
+        session = AsyncMock()
+        jarvis.managed_cdp_targets["youtube"].clear()
+
+        with patch("jarvis._cdp_pages", return_value=pages), patch(
+            "jarvis._jarvis_chrome_ready", return_value=True
+        ):
+            import asyncio
+            page_id = asyncio.run(jarvis.find_youtube_page(session))
+
+        self.assertIsNone(page_id)
+        self.assertEqual(jarvis.managed_cdp_targets["youtube"], set())
 
     def test_new_cdp_tab_records_ownership_before_url_finishes_loading(self):
         pages = MagicMock()
@@ -73,6 +115,75 @@ class ChromeAutomationProfileTests(unittest.TestCase):
             "id": "youtube-new", "type": "page", "url": "about:blank",
         }]):
             self.assertTrue(jarvis._record_managed_cdp_target("youtube", set()))
+
+    def test_weather_reuses_exact_tab_and_closes_owned_duplicate(self):
+        target_url = "https://www.google.com/search?hl=vi&q=th%E1%BB%9Di+ti%E1%BA%BFt"
+        pages = MagicMock()
+        pages.__enter__.return_value = pages
+        pages.__exit__.return_value = False
+        pages.read.return_value = __import__("json").dumps([
+            {"id": "weather-current", "type": "page", "url": target_url},
+            {
+                "id": "weather-old", "type": "page",
+                "url": "https://www.google.com/search?hl=vi&q=thoi+tiet+tuan+toi",
+            },
+        ]).encode()
+        closed = MagicMock()
+        closed.__enter__.return_value = closed
+        closed.__exit__.return_value = False
+        activated = MagicMock(status=200)
+        activated.__enter__.return_value = activated
+        activated.__exit__.return_value = False
+        jarvis.managed_cdp_targets["weather"].update({
+            "weather-current", "weather-old",
+        })
+
+        with patch(
+            "jarvis.urlopen", side_effect=[pages, closed, activated]
+        ) as opened:
+            self.assertTrue(jarvis._ensure_jarvis_chrome_tab(target_url))
+
+        self.assertEqual(
+            jarvis.managed_cdp_targets["weather"], {"weather-current"}
+        )
+        self.assertIn(
+            "/json/close/weather-old", opened.call_args_list[1].args[0]
+        )
+        self.assertIn(
+            "/json/activate/weather-current", opened.call_args_list[2].args[0]
+        )
+
+    def test_weather_new_period_replaces_previous_owned_tab(self):
+        pages = MagicMock()
+        pages.__enter__.return_value = pages
+        pages.__exit__.return_value = False
+        pages.read.return_value = __import__("json").dumps([{
+            "id": "weather-old", "type": "page",
+            "url": "https://www.google.com/search?hl=vi&q=thoi+tiet",
+        }]).encode()
+        created = MagicMock()
+        created.__enter__.return_value = created
+        created.__exit__.return_value = False
+        created.read.return_value = b'{"id":"weather-new","type":"page"}'
+        closed = MagicMock()
+        closed.__enter__.return_value = closed
+        closed.__exit__.return_value = False
+        jarvis.managed_cdp_targets["weather"].add("weather-old")
+
+        with patch(
+            "jarvis.urlopen", side_effect=[pages, created, closed]
+        ) as opened:
+            self.assertTrue(jarvis._ensure_jarvis_chrome_tab(
+                "https://www.google.com/search?hl=vi&q=thoi+tiet+tuan+toi"
+            ))
+
+        self.assertEqual(
+            jarvis.managed_cdp_targets["weather"], {"weather-new"}
+        )
+        self.assertEqual(opened.call_args_list[1].args[0].get_method(), "PUT")
+        self.assertIn(
+            "/json/close/weather-old", opened.call_args_list[2].args[0]
+        )
 
     def test_changed_page_topology_forces_mcp_reconnect(self):
         jarvis.mcp_session = object()
@@ -215,6 +326,23 @@ class ChromeAutomationProfileTests(unittest.TestCase):
         self.assertTrue(result)
         ensure.assert_called_once_with("https://chat.zalo.me/")
 
+    def test_weather_uses_dedicated_automation_chrome(self):
+        url = "https://www.google.com/search?hl=vi&q=th%E1%BB%9Di+ti%E1%BA%BFt"
+        self.assertEqual(jarvis._automation_site_key(url), "weather")
+        with patch("jarvis.ensure_jarvis_chrome", return_value=True) as ensure, \
+             patch("jarvis._jarvis_debug_port_owner_pid", return_value=321), \
+             patch("jarvis._record_managed_cdp_target", return_value=True) as record, \
+             patch.object(jarvis.CHROME_WINDOWS, "snapshot_ids", return_value=set()), \
+             patch.object(
+                 jarvis.CHROME_WINDOWS, "activate_automation_window", return_value=True
+             ) as activate:
+            result = jarvis.open_chrome(jarvis.JARVIS_CHROME_PROFILE, url)
+
+        self.assertTrue(result)
+        ensure.assert_called_once_with(url)
+        record.assert_called_once_with("weather", set())
+        activate.assert_called_once_with(set(), 321, "thời tiết")
+
     def test_personal_zalo_does_not_use_study_automation_profile(self):
         with patch("jarvis.ensure_jarvis_chrome", return_value=True) as automation, patch(
             "jarvis._jarvis_debug_port_owner_pid", return_value=321
@@ -279,6 +407,33 @@ class ChromeAutomationProfileTests(unittest.TestCase):
         args = popen.call_args.args[0]
         self.assertIn("--profile-directory=Profile 1", args)
         self.assertNotIn("--remote-debugging-port=9223", args)
+
+    def test_wayland_chrome_forwarded_open_reports_success_without_ownership(self):
+        launcher = MagicMock()
+        launcher.wait.return_value = 0
+        with patch("jarvis.subprocess.Popen", return_value=launcher), patch.object(
+            jarvis.CHROME_WINDOWS, "snapshot_ids", return_value=set()
+        ), patch.object(
+            jarvis.CHROME_WINDOWS, "track_profile_window", return_value=False
+        ):
+            self.assertTrue(jarvis.open_chrome(
+                jarvis.STUDY_PROFILE, "https://github.com/"
+            ))
+        self.assertNotIn(
+            (jarvis.STUDY_PROFILE, "github"), jarvis.CHROME_WINDOWS.site_windows
+        )
+
+    def test_failed_untracked_chrome_launcher_still_reports_failure(self):
+        launcher = MagicMock()
+        launcher.wait.return_value = 1
+        with patch("jarvis.subprocess.Popen", return_value=launcher), patch.object(
+            jarvis.CHROME_WINDOWS, "snapshot_ids", return_value=set()
+        ), patch.object(
+            jarvis.CHROME_WINDOWS, "track_profile_window", return_value=False
+        ):
+            self.assertFalse(jarvis.open_chrome(
+                jarvis.STUDY_PROFILE, "https://github.com/"
+            ))
 
     def test_github_uses_dedicated_app_window_for_exact_tracking(self):
         with patch("jarvis.subprocess.Popen") as popen, patch.object(

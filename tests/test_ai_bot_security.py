@@ -109,5 +109,32 @@ class AiBotDiscordOwnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ai_bot.DISCORD_OWNER_ID, 884068521015930910)
 
 
+class AiBotLocalQwenTests(unittest.IsolatedAsyncioTestCase):
+    def test_only_local_ollama_qwen_is_configured(self):
+        self.assertEqual(ai_bot.OLLAMA_MODEL, "qwen3-vl:4b")
+        self.assertEqual(ai_bot.OLLAMA_URL, "http://127.0.0.1:11434")
+        self.assertFalse(hasattr(ai_bot, "NINEROUTER_API_KEY"))
+        self.assertFalse(hasattr(ai_bot, "NINEROUTER_URL"))
+
+    def test_qwen_reasoning_is_hidden(self):
+        response = "phân tích nội bộ\n</think>\nCâu trả lời cuối."
+        self.assertEqual(ai_bot.strip_qwen_thinking(response), "Câu trả lời cuối.")
+
+    async def test_agent_accepts_native_ollama_response(self):
+        response = {
+            "message": {
+                "role": "assistant",
+                "content": "suy luận\n</think>\nChỉ chạy local.",
+            }
+        }
+        with patch.object(
+            ai_bot, "call_ollama", new=AsyncMock(return_value=response)
+        ) as call_ollama:
+            answer = await ai_bot.run_agent("Bạn đang chạy ở đâu?")
+
+        self.assertEqual(answer, "Chỉ chạy local.")
+        call_ollama.assert_awaited_once()
+
+
 if __name__ == "__main__":
     unittest.main()
