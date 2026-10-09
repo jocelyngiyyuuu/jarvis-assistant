@@ -3,7 +3,21 @@ __pycache__/
 .env
 venv/
 .venv/
+.pio/
 
 mcp_errors.log
+mcp_errors.log.*
+.jarvis_data/
+backups/
 *_backup*.py
-test_*.py
+/test_*.py
+
+# Runtime-generated audio
+tts/output.wav
+tts/test_output.wav
+
+# Retired local implementations and entry points
+tts/OpenVoice/
+jarbis.py
+jarvis_before_discord.py
+jarvis_v1.0_discord.py

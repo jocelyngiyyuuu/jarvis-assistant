@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="950" viewBox="0 0 1500 950">
+  <defs>
+    <style>
+      .bg{fill:#f8fafc}.title{font:700 36px sans-serif;fill:#0f172a}.head{font:700 25px sans-serif;fill:#0f172a}.txt{font:21px sans-serif;fill:#1e293b}.small{font:18px sans-serif;fill:#475569}
+      .box{fill:#fff;stroke:#334155;stroke-width:4}.res{fill:#fff7ed;stroke:#c2410c;stroke-width:4}.mos{fill:#f0fdf4;stroke:#15803d;stroke-width:5}.note{fill:#fefce8;stroke:#ca8a04;stroke-width:3}
+      .sig{fill:none;stroke:#16a34a;stroke-width:8;stroke-linecap:round;stroke-linejoin:round}.gnd{fill:none;stroke:#2563eb;stroke-width:8;stroke-linecap:round}.wire{fill:none;stroke:#0f172a;stroke-width:6;stroke-linecap:round}.dot{fill:#111827;stroke:#fff;stroke-width:2}.num{fill:#dc2626;font:700 22px sans-serif}
+    </style>
+  </defs>
+  <rect class="bg" width="1500" height="950"/>
+  <text class="title" x="750" y="55" text-anchor="middle">PHÓNG LỚN CÁCH GẮN ĐIỆN TRỞ VÀO GATE MOSFET</text>
+  <text class="txt" x="750" y="92" text-anchor="middle">Điện trở không phân cực: xoay chiều nào cũng được</text>
+
+  <!-- GPIO block -->
+  <rect class="box" x="65" y="280" width="230" height="210" rx="22"/>
+  <text class="head" x="180" y="335" text-anchor="middle">ESP32-S3</text>
+  <text class="head" x="180" y="405" text-anchor="middle">GPIO8</text>
+  <circle class="dot" cx="295" cy="400" r="11"/>
+
+  <!-- split node -->
+  <path class="sig" d="M295 400 H390 M390 400 V290 H465 M390 400 V510 H465"/>
+  <circle class="dot" cx="390" cy="400" r="12"/>
+  <text class="num" x="366" y="380">①</text>
+  <text class="small" x="390" y="560" text-anchor="middle">Chập đầu trái của cả hai</text>
+  <text class="small" x="390" y="585" text-anchor="middle">điện trở, nối vào GPIO8</text>
+
+  <!-- parallel resistors -->
+  <rect class="res" x="465" y="250" width="260" height="80" rx="15"/>
+  <text class="head" x="595" y="300" text-anchor="middle">Điện trở 220Ω</text>
+  <rect class="res" x="465" y="470" width="260" height="80" rx="15"/>
+  <text class="head" x="595" y="520" text-anchor="middle">Điện trở 220Ω</text>
+  <path class="sig" d="M725 290 H805 V400 M725 510 H805 V400 H930"/>
+  <circle class="dot" cx="805" cy="400" r="13"/>
+  <text class="num" x="820" y="380">② NÚT GATE</text>
+  <text class="small" x="805" y="610" text-anchor="middle">Chập đầu phải của cả hai điện trở.</text>
+  <text class="small" x="805" y="635" text-anchor="middle">Điểm này nối Gate và điện trở 1kΩ thứ nhất.</text>
+
+  <!-- MOSFET -->
+  <rect class="mos" x="930" y="250" width="460" height="300" rx="25"/>
+  <text class="title" x="1160" y="310" text-anchor="middle">MOSFET N</text>
+  <circle class="dot" cx="930" cy="400" r="12"/>
+  <text class="head" x="970" y="392">G — GATE</text>
+  <text class="txt" x="970" y="430">Nhận tín hiệu từ nút ②</text>
+  <text class="txt" x="970" y="470">Drain → cathode các LED</text>
+  <text class="txt" x="970" y="505">Source → GND</text>
+
+  <!-- pulldown series branch -->
+  <path class="wire" d="M805 400 V675"/>
+  <rect class="res" x="735" y="675" width="140" height="70" rx="12"/>
+  <text class="head" x="805" y="720" text-anchor="middle">1kΩ</text>
+  <path class="wire" d="M805 745 V775"/>
+  <circle class="dot" cx="805" cy="760" r="9"/>
+  <text class="num" x="825" y="770">③ nối tiếp</text>
+  <rect class="res" x="735" y="775" width="140" height="70" rx="12"/>
+  <text class="head" x="805" y="820" text-anchor="middle">1kΩ</text>
+  <path class="gnd" d="M805 845 V890 H1280"/>
+  <text class="head" x="1280" y="900" text-anchor="end" fill="#2563eb">GND chung</text>
+
+  <!-- explicit instructions -->
+  <rect class="note" x="65" y="660" width="570" height="230" rx="18"/>
+  <text class="head" x="95" y="705">Làm theo đúng 4 bước:</text>
+  <text class="txt" x="95" y="748">1. Chập hai đầu của 2 điện trở 220Ω → GPIO8.</text>
+  <text class="txt" x="95" y="788">2. Chập hai đầu còn lại → nút Gate ②.</text>
+  <text class="txt" x="95" y="828">3. Từ nút Gate ② → 1kΩ → 1kΩ → GND.</text>
+  <text class="txt" x="95" y="868">4. Nút Gate ② nối trực tiếp chân G của MOSFET.</text>
+
+  <text class="small" x="750" y="935" text-anchor="middle">Hai điện trở 220Ω là SONG SONG (110Ω). Hai điện trở 1kΩ là NỐI TIẾP (2kΩ).</text>
+</svg>

@@ -1,0 +1,179 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .box { fill: #ffffff; stroke: #334155; stroke-width: 3; }
+      .wire { fill: none; stroke: #0f172a; stroke-width: 5; stroke-linecap: round; stroke-linejoin: round; }
+      .power { fill: none; stroke: #dc2626; stroke-width: 6; }
+      .ground { fill: none; stroke: #2563eb; stroke-width: 6; }
+      .signal { fill: none; stroke: #16a34a; stroke-width: 6; }
+      .component { fill: #fff7ed; stroke: #9a3412; stroke-width: 3; }
+      .mosfet { fill: #f0fdf4; stroke: #166534; stroke-width: 4; }
+      .cap { fill: #eff6ff; stroke: #1d4ed8; stroke-width: 3; }
+      .title { font: 700 34px sans-serif; fill: #0f172a; }
+      .subtitle { font: 600 23px sans-serif; fill: #334155; }
+      .label { font: 600 21px sans-serif; fill: #0f172a; }
+      .small { font: 18px sans-serif; fill: #334155; }
+      .tiny { font: 16px sans-serif; fill: #475569; }
+      .dot { fill: #0f172a; }
+      .note { fill: #fefce8; stroke: #ca8a04; stroke-width: 2; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1600" height="1100"/>
+  <text class="title" x="800" y="52" text-anchor="middle">SƠ ĐỒ 6 LED IR – ESP32-S3 + MOSFET N-CHANNEL</text>
+  <text class="subtitle" x="800" y="88" text-anchor="middle">Nguồn LED lấy từ chân 5V/VIN • Gate kéo xuống bằng 2 × 1kΩ nối tiếp</text>
+
+  <!-- Power and ground rails -->
+  <path class="power" d="M390 145 H1510"/>
+  <text class="label" x="400" y="132" fill="#dc2626">5V / VIN</text>
+  <path class="ground" d="M90 970 H1510"/>
+  <text class="label" x="100" y="1010" fill="#2563eb">GND chung</text>
+
+  <!-- ESP32 -->
+  <rect class="box" x="70" y="305" width="300" height="310" rx="22"/>
+  <text class="title" x="220" y="355" text-anchor="middle">ESP32-S3</text>
+  <circle class="dot" cx="370" cy="430" r="8"/>
+  <text class="label" x="345" y="418" text-anchor="end">GPIO8</text>
+  <circle class="dot" cx="220" cy="615" r="8"/>
+  <text class="label" x="220" y="580" text-anchor="middle">GND</text>
+  <path class="ground" d="M220 615 V970"/>
+  <path class="power" d="M270 305 V145"/>
+  <text class="small" x="280" y="282">chân 5V/VIN</text>
+
+  <!-- Parallel gate resistors -->
+  <path class="signal" d="M370 430 H435 M435 430 V390 H480 M435 430 V470 H480"/>
+  <rect class="component" x="480" y="365" width="185" height="48" rx="8"/>
+  <rect class="component" x="480" y="447" width="185" height="48" rx="8"/>
+  <text class="label" x="572" y="397" text-anchor="middle">220Ω</text>
+  <text class="label" x="572" y="479" text-anchor="middle">220Ω</text>
+  <path class="signal" d="M665 389 H710 V430 M665 471 H710 V430 H850"/>
+  <text class="small" x="570" y="530" text-anchor="middle">Hai điện trở mắc song song = 110Ω</text>
+  <circle class="dot" cx="710" cy="430" r="8"/>
+
+  <!-- Gate pulldown -->
+  <path class="wire" d="M710 430 V545"/>
+  <rect class="component" x="655" y="545" width="110" height="55" rx="8"/>
+  <text class="label" x="710" y="580" text-anchor="middle">1kΩ</text>
+  <path class="wire" d="M710 600 V625"/>
+  <rect class="component" x="655" y="625" width="110" height="55" rx="8"/>
+  <text class="label" x="710" y="660" text-anchor="middle">1kΩ</text>
+  <path class="ground" d="M710 680 V970"/>
+  <text class="small" x="620" y="720" text-anchor="middle">Nối tiếp = 2kΩ</text>
+  <text class="tiny" x="620" y="745" text-anchor="middle">Gate → 1kΩ → 1kΩ → GND</text>
+
+  <!-- MOSFET -->
+  <rect class="mosfet" x="850" y="350" width="285" height="380" rx="24"/>
+  <text class="title" x="992" y="400" text-anchor="middle">MOSFET N</text>
+  <text class="subtitle" x="992" y="438" text-anchor="middle">AO3400A / Si2302</text>
+  <circle class="dot" cx="850" cy="430" r="8"/>
+  <text class="label" x="880" y="468">G — Gate</text>
+  <circle class="dot" cx="992" cy="350" r="8"/>
+  <text class="label" x="1010" y="335">D — Drain</text>
+  <circle class="dot" cx="992" cy="730" r="8"/>
+  <text class="label" x="1010" y="715">S — Source</text>
+  <path class="ground" d="M992 730 V970"/>
+  <text class="small" x="992" y="770" text-anchor="middle">Source nối GND</text>
+
+  <!-- Common cathode / drain bus -->
+  <path class="wire" d="M470 285 H1470 M992 350 V285"/>
+  <text class="label" x="1160" y="270">Bus cathode LED → Drain</text>
+
+  <!-- Six LED branches -->
+  <g>
+    <path class="power" d="M470 145 V185"/>
+    <rect class="component" x="410" y="185" width="120" height="50" rx="8"/>
+    <text class="small" x="470" y="207" text-anchor="middle">4 × 220Ω</text>
+    <text class="tiny" x="470" y="228" text-anchor="middle">// = 55Ω</text>
+    <path class="wire" d="M470 235 V250"/>
+    <polygon points="450,250 490,250 470,278" fill="#ef4444" stroke="#7f1d1d" stroke-width="2"/>
+    <path class="wire" d="M445 280 H495 M470 280 V285"/>
+    <text class="tiny" x="470" y="318" text-anchor="middle">LED IR 1</text>
+  </g>
+  <g>
+    <path class="power" d="M650 145 V185"/>
+    <rect class="component" x="590" y="185" width="120" height="50" rx="8"/>
+    <text class="small" x="650" y="207" text-anchor="middle">4 × 220Ω</text>
+    <text class="tiny" x="650" y="228" text-anchor="middle">// = 55Ω</text>
+    <path class="wire" d="M650 235 V250"/>
+    <polygon points="630,250 670,250 650,278" fill="#ef4444" stroke="#7f1d1d" stroke-width="2"/>
+    <path class="wire" d="M625 280 H675 M650 280 V285"/>
+    <text class="tiny" x="650" y="318" text-anchor="middle">LED IR 2</text>
+  </g>
+  <g>
+    <path class="power" d="M830 145 V185"/>
+    <rect class="component" x="770" y="185" width="120" height="50" rx="8"/>
+    <text class="small" x="830" y="207" text-anchor="middle">4 × 220Ω</text>
+    <text class="tiny" x="830" y="228" text-anchor="middle">// = 55Ω</text>
+    <path class="wire" d="M830 235 V250"/>
+    <polygon points="810,250 850,250 830,278" fill="#ef4444" stroke="#7f1d1d" stroke-width="2"/>
+    <path class="wire" d="M805 280 H855 M830 280 V285"/>
+    <text class="tiny" x="830" y="318" text-anchor="middle">LED IR 3</text>
+  </g>
+  <g>
+    <path class="power" d="M1100 145 V185"/>
+    <rect class="component" x="1040" y="185" width="120" height="50" rx="8"/>
+    <text class="small" x="1100" y="207" text-anchor="middle">4 × 220Ω</text>
+    <text class="tiny" x="1100" y="228" text-anchor="middle">// = 55Ω</text>
+    <path class="wire" d="M1100 235 V250"/>
+    <polygon points="1080,250 1120,250 1100,278" fill="#ef4444" stroke="#7f1d1d" stroke-width="2"/>
+    <path class="wire" d="M1075 280 H1125 M1100 280 V285"/>
+    <text class="tiny" x="1100" y="318" text-anchor="middle">LED IR 4</text>
+  </g>
+  <g>
+    <path class="power" d="M1280 145 V185"/>
+    <rect class="component" x="1220" y="185" width="120" height="50" rx="8"/>
+    <text class="small" x="1280" y="207" text-anchor="middle">4 × 220Ω</text>
+    <text class="tiny" x="1280" y="228" text-anchor="middle">// = 55Ω</text>
+    <path class="wire" d="M1280 235 V250"/>
+    <polygon points="1260,250 1300,250 1280,278" fill="#ef4444" stroke="#7f1d1d" stroke-width="2"/>
+    <path class="wire" d="M1255 280 H1305 M1280 280 V285"/>
+    <text class="tiny" x="1280" y="318" text-anchor="middle">LED IR 5</text>
+  </g>
+  <g>
+    <path class="power" d="M1460 145 V185"/>
+    <rect class="component" x="1400" y="185" width="120" height="50" rx="8"/>
+    <text class="small" x="1460" y="207" text-anchor="middle">4 × 220Ω</text>
+    <text class="tiny" x="1460" y="228" text-anchor="middle">// = 55Ω</text>
+    <path class="wire" d="M1460 235 V250"/>
+    <polygon points="1440,250 1480,250 1460,278" fill="#ef4444" stroke="#7f1d1d" stroke-width="2"/>
+    <path class="wire" d="M1435 280 H1485 M1460 280 V285"/>
+    <text class="tiny" x="1460" y="318" text-anchor="middle">LED IR 6</text>
+  </g>
+
+  <!-- Decoupling capacitors -->
+  <rect class="cap" x="1190" y="520" width="155" height="170" rx="15"/>
+  <text class="label" x="1267" y="558" text-anchor="middle">Tụ gốm 104</text>
+  <text class="small" x="1267" y="588" text-anchor="middle">100 nF</text>
+  <path class="power" d="M1267 520 V145"/>
+  <path class="ground" d="M1267 690 V970"/>
+  <text class="tiny" x="1267" y="620" text-anchor="middle">không phân cực</text>
+  <text class="tiny" x="1267" y="646" text-anchor="middle">giữa 5V và GND</text>
+
+  <rect class="cap" x="1380" y="520" width="170" height="170" rx="15"/>
+  <text class="label" x="1465" y="555" text-anchor="middle">Tụ hóa</text>
+  <text class="small" x="1465" y="585" text-anchor="middle">470–1000 µF</text>
+  <text class="small" x="1465" y="615" text-anchor="middle">≥ 10 V</text>
+  <path class="power" d="M1435 520 V145"/>
+  <path class="ground" d="M1495 690 V970"/>
+  <text class="label" x="1418" y="510" fill="#dc2626">+</text>
+  <text class="label" x="1492" y="716" fill="#2563eb">−</text>
+  <text class="tiny" x="1465" y="652" text-anchor="middle">+ vào 5V</text>
+  <text class="tiny" x="1465" y="676" text-anchor="middle">− vào GND</text>
+
+  <!-- Notes -->
+  <rect class="note" x="70" y="795" width="800" height="125" rx="14"/>
+  <text class="label" x="95" y="832">Lưu ý đấu LED:</text>
+  <text class="small" x="95" y="865">• Mỗi LED có cụm 4 × 220Ω riêng. Chân dài (anode) hướng về 5V.</text>
+  <text class="small" x="95" y="895">• Chân ngắn/cạnh phẳng (cathode) nối chung về Drain MOSFET.</text>
+
+  <rect class="note" x="900" y="795" width="610" height="125" rx="14"/>
+  <text class="label" x="925" y="832">Quan trọng:</text>
+  <text class="small" x="925" y="865">Đối chiếu pin G/D/S theo datasheet đúng mã MOSFET.</text>
+  <text class="small" x="925" y="895">Không suy đoán pin chỉ theo hình dáng hoặc hướng chữ.</text>
+
+  <text class="small" x="800" y="1060" text-anchor="middle">Đặt tụ 104 và tụ hóa sát cụm LED/MOSFET; tất cả GND phải nối chung.</text>
+</svg>
