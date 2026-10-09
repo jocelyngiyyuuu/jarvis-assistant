@@ -17,6 +17,12 @@ class LocalAITests(unittest.TestCase):
             def read(self): return json.dumps(result).encode("utf-8")
         return FakeResponse()
 
+    def test_default_keeps_qwen3_vl_4b_instruct_for_text_and_vision(self):
+        with patch.dict(os.environ, {}, clear=True):
+            client = LocalAI()
+        self.assertEqual(client.model, "qwen3-vl:4b-instruct")
+        self.assertEqual(client.vision_model, "qwen3-vl:4b-instruct")
+
     def test_text_and_vision_models_can_be_configured_separately(self):
         with patch.dict(os.environ, {
             "OLLAMA_MODEL": "fallback",

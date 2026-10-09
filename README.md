@@ -61,7 +61,7 @@ lsof -v
   với model:
 
   ```text
-  qwen3-vl:4b
+  qwen3-vl:4b-instruct
   ```
 
   Đây là giá trị mặc định trong mã nguồn. Nếu `.env` đặt `OLLAMA_MODEL` hoặc
@@ -212,9 +212,9 @@ DISCORD_VOICE_CHANNEL_ID=thay_bang_voice_channel_id
 
 # Tùy chọn: AI cục bộ
 OLLAMA_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=qwen3-vl:4b
-OLLAMA_TEXT_MODEL=qwen3-vl:4b
-OLLAMA_VISION_MODEL=qwen3-vl:4b
+OLLAMA_MODEL=qwen3-vl:4b-instruct
+OLLAMA_TEXT_MODEL=qwen3-vl:4b-instruct
+OLLAMA_VISION_MODEL=qwen3-vl:4b-instruct
 OLLAMA_KEEP_ALIVE=-1
 OLLAMA_VISION_KEEP_ALIVE=10m
 
@@ -583,7 +583,7 @@ Jarvis lưu lịch nhưng vẫn yêu cầu xác nhận trong Discord trước kh
 Cài và chạy Ollama theo tài liệu chính thức, sau đó tải model mặc định:
 
 ```bash
-ollama pull qwen3-vl:4b
+ollama pull qwen3-vl:4b-instruct
 ollama pull embeddinggemma
 ollama serve
 ```
@@ -609,11 +609,13 @@ dẫn ngoài home/dự án không được công cụ đọc tài liệu mở.
 (`--quick` chạy 5 câu đại diện):
 
 ```bash
-.venv/bin/python scripts/eval_local_ai.py qwen3-vl:4b
+.venv/bin/python scripts/eval_local_ai.py qwen3-vl:4b-instruct
 ```
 
 Trên máy phát triển ngày 09/10/2026, bài đo chọn công cụ ở lượt đầu đạt
-`28/30` với `qwen3-vl:4b` và `20/30` với `qwen2.5:3b`. Đây là số liệu của bộ câu
+`30/30` với `qwen3-vl:4b-instruct`, `28/30` với `qwen3-vl:4b` và `20/30` với
+`qwen2.5:3b`. Bản Instruct vẫn là Qwen3-VL 4.4B, nhưng không sinh phần thinking
+ẩn nên phản hồi nhanh hơn trên máy này. Đây là số liệu của bộ câu
 hỏi nhỏ, không đo độ đúng của toàn bộ câu trả lời. Với câu hỏi rõ ràng về dữ
 liệu máy, Jarvis yêu cầu model gọi công cụ trước khi trả lời; nếu model bỏ qua,
 Jarvis nhắc lại một lần và không dùng câu trả lời thiếu dữ kiện.

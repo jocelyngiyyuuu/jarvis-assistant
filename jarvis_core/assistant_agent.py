@@ -1,6 +1,7 @@
 """Bounded local agent with explicit read-only Jarvis tools."""
 
 import json
+import re
 from pathlib import Path
 
 from .text import normalize_text
@@ -21,6 +22,12 @@ Mọi câu hỏi về lời nhắc, kể cả lời nhắc ngày mai hoặc tu�
 list_pending_reminders trước rồi lọc theo thời gian được trả về.
 Câu hỏi về file phải gọi search_files trước; câu hỏi về trạng thái máy phải gọi
 get_system_status trước. Câu hỏi kiến thức chung không cần công cụ.
+"""
+
+GENERAL_CHAT_PROMPT = """/no_think
+Bạn là Jarvis. Trả lời tiếng Việt rõ ràng, ngắn gọn và theo ngữ cảnh hội thoại.
+Không khẳng định đã kiểm tra máy, dữ liệu cá nhân hoặc thông tin thời gian thực.
+Nếu câu hỏi cần dữ liệu hiện tại mà bạn không có, hãy nói rõ giới hạn.
 """
 
 READ_ONLY_TOOLS = [
@@ -96,6 +103,32 @@ class ReadOnlyAgent:
                 return "get_system_status"
         return None
 
+    @staticmethod
+    def is_general_question(prompt):
+        """Use a short prompt only for clear questions that need no local data."""
+        plain = normalize_text(prompt)
+        local_terms = (
+            "bo nho", "ghi nho", "ban nho", "da luu", "loi nhac",
+            "lich nhac", "reminder", "tai lieu", "trang thai",
+            "tinh trang", "hien tai", "luc nay", "hom nay", "ngay mai",
+            "may cua toi", "trong may", "he thong", "o dia", "uptime",
+            "cua toi", "toi da", "toi co", "dang dung", "con lai",
+        )
+        if any(term in plain for term in local_terms) or re.search(
+            r"\b(?:file|tep|cpu|ram)\b.*\b(?:dang|hien|bao nhieu|kiem tra)\b",
+            plain,
+        ):
+            return False
+        if re.search(r"\b(?:file|tep|mo|dong|tat|bat|xoa|gui|hen|dat|chay|"
+                     r"bam|click|sleep|shutdown)\b", plain):
+            return False
+        return bool(re.search(
+            r"\b(?:la gi|tai sao|vi sao|giai thich|so sanh|khac nhau|"
+            r"nhu the nao|nghia la gi|ke chuyen|xin chao|chao jarvis|"
+            r"cong .+ bang may)\b",
+            plain,
+        ))
+
     def execute_tool(self, name, args):
         """Dispatch by exact allowlist; never execute a model-supplied command."""
         if not isinstance(args, dict):
@@ -152,13 +185,22 @@ class ReadOnlyAgent:
         return {"error": "Công cụ không được phép"}
 
     def answer(self, prompt, history=()):
-        messages = [{"role": "system", "content": AGENT_PROMPT}]
+        general_question = self.is_general_question(prompt)
+        messages = [{"role": "system", "content": (
+            GENERAL_CHAT_PROMPT if general_question else AGENT_PROMPT
+        )}]
         for item in list(history)[-8:]:
             if item.get("role") in {"user", "assistant"}:
                 messages.append({
                     "role": item["role"], "content": str(item.get("content", ""))[:1200]
                 })
         messages.append({"role": "user", "content": str(prompt)[:2000]})
+        if general_question:
+            response = self.core.local_ai.tool_chat(messages, [])
+            answer = response.get("content", "").strip()
+            if answer:
+                return answer, []
+            messages[0]["content"] = AGENT_PROMPT
         trace = []
         required = self.required_tool(prompt)
         retried_missing_tool = False

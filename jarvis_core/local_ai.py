@@ -88,7 +88,7 @@ class LocalAI:
     """Talk to Ollama without adding a third-party HTTP dependency."""
 
     def __init__(self, model=None, base_url=None, timeout=90, history_size=8):
-        default_model = os.getenv("OLLAMA_MODEL", "qwen3-vl:4b")
+        default_model = os.getenv("OLLAMA_MODEL", "qwen3-vl:4b-instruct")
         if model is not None:
             # Preserve the existing explicit-constructor behavior used by
             # tests and callers that intentionally select one model.

@@ -11,6 +11,45 @@ from jarvis_core.semantic_memory import SemanticMemory
 
 
 class ReadOnlyAgentTests(unittest.TestCase):
+    def test_general_question_keeps_history_without_loading_tools(self):
+        core = Mock()
+        core.local_ai.tool_chat.return_value = {"content": "RAM là bộ nhớ tạm."}
+        history = [{"role": "user", "content": "Đang nói về phần cứng."}]
+
+        answer, trace = ReadOnlyAgent(core).answer("Giải thích RAM là gì?", history)
+
+        self.assertEqual(answer, "RAM là bộ nhớ tạm.")
+        self.assertEqual(trace, [])
+        messages, tools = core.local_ai.tool_chat.call_args.args
+        self.assertEqual(tools, [])
+        self.assertIn("Đang nói về phần cứng.", [item["content"] for item in messages])
+        self.assertLess(len(messages[0]["content"]), 300)
+
+    def test_local_data_questions_still_use_tools(self):
+        agent = ReadOnlyAgent(Mock())
+        for question in (
+            "Bạn nhớ tôi thích môn gì?",
+            "Tôi có lời nhắc nào đang chờ?",
+            "Có tài liệu hướng dẫn API ở đâu?",
+            "Máy đang dùng bao nhiêu RAM?",
+            "Tắt PC lúc mấy giờ?",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(agent.is_general_question(question))
+
+    def test_empty_fast_answer_falls_back_to_existing_tool_agent(self):
+        core = Mock()
+        core.local_ai.tool_chat.side_effect = [
+            {"content": ""}, {"content": "Hai."},
+        ]
+
+        answer, trace = ReadOnlyAgent(core).answer("1 cộng 1 bằng mấy?")
+
+        self.assertEqual(answer, "Hai.")
+        self.assertEqual(trace, [])
+        self.assertEqual(core.local_ai.tool_chat.call_args_list[0].args[1], [])
+        self.assertTrue(core.local_ai.tool_chat.call_args_list[1].args[1])
+
     def test_tool_result_is_returned_to_model_for_final_answer(self):
         core = Mock()
         core.local_ai.tool_chat.side_effect = [
