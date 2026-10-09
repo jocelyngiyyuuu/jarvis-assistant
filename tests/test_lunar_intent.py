@@ -38,6 +38,11 @@ class LunarIntentTests(unittest.TestCase):
 
     def test_unrelated_command_is_not_claimed(self):
         self.assertIsNone(self.answer("mở youtube"))
+        self.assertIsNone(self.answer("Giải thích RAM là gì?"))
+        self.assertIsNone(self.answer("Máy đang dùng bao nhiêu RAM?"))
+
+    def test_unaccented_full_moon_with_calendar_context_still_works(self):
+        self.assertIn("Rằm", self.answer("ram thang nay"))
 
 
 class LunarRouteTests(unittest.IsolatedAsyncioTestCase):

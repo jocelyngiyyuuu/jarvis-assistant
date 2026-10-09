@@ -1118,6 +1118,8 @@ mcp_stdio_context = None
 mcp_session_context = None
 mcp_session = None
 mcp_errlog = None
+mcp_session_started_at = None
+MCP_SESSION_MAX_AGE_SECONDS = 30 * 60
 mcp_browser_pid = None
 mcp_page_topology_changed = False
 
@@ -1926,14 +1928,34 @@ async def evaluate_mcp_script(session, page_id, script):
 
 
 async def extract_videos_from_page(session, page_id, limit=10):
-    """Chỉ lấy link video thật (/watch?v=...), bỏ sidebar/kênh/menu."""
+    """Lấy video theo đúng vùng nội dung và thứ tự trên trang YouTube."""
     script = r'''() => {
         const videos = new Map();
-        const anchors = document.querySelectorAll('a[href*="/watch?v="]');
+        const path = location.pathname;
+        let cards;
+        if (path === '/watch') {
+            const playlist = document.querySelector('ytd-playlist-panel-renderer');
+            const playlistCards = playlist?.querySelectorAll('ytd-playlist-panel-video-renderer');
+            cards = playlistCards?.length
+                ? playlistCards
+                : document.querySelectorAll('ytd-watch-next-secondary-results-renderer ytd-compact-video-renderer');
+        } else if (path === '/results') {
+            cards = document.querySelectorAll('ytd-search ytd-video-renderer');
+        } else if (path.startsWith('/playlist')) {
+            cards = document.querySelectorAll('ytd-playlist-video-renderer');
+        } else {
+            cards = document.querySelectorAll('ytd-rich-grid-media');
+        }
 
-        for (const a of anchors) {
+        for (const card of cards) {
             try {
+                const a = card.querySelector(
+                    'a#video-title-link[href*="/watch"], a#video-title[href*="/watch"], a[href*="/watch?v="]'
+                );
+                if (!a) continue;
                 const u = new URL(a.href, location.href);
+                if (u.hostname !== 'www.youtube.com' && u.hostname !== 'youtube.com') continue;
+                if (u.pathname !== '/watch') continue;
                 const videoId = u.searchParams.get('v');
                 if (!videoId) continue;
 
@@ -1946,19 +1968,17 @@ async def extract_videos_from_page(session, page_id, limit=10):
                     if (value) target.searchParams.set(key, value);
                 }
                 const url = target.href;
+                const titleElement = card.querySelector('#video-title');
                 const title = (
+                    titleElement?.getAttribute('title') ||
+                    titleElement?.textContent ||
                     a.getAttribute('title') ||
                     a.textContent ||
-                    a.getAttribute('aria-label') ||
                     ''
                 ).replace(/\s+/g, ' ').trim();
 
                 if (!title || title.length < 2) continue;
-
-                const current = videos.get(url);
-                if (!current || title.length > current.title.length) {
-                    videos.set(url, {title, url});
-                }
+                if (!videos.has(videoId)) videos.set(videoId, {title, url});
             } catch (_) {
             }
         }
@@ -1982,10 +2002,16 @@ async def extract_videos_from_page(session, page_id, limit=10):
         title = clean_title(str(item.get("title", "")))
         url = str(item.get("url", "")).strip()
 
-        if not title or not url or "/watch?v=" not in url:
+        parsed = urlparse(url)
+        video_id = parse_qs(parsed.query).get("v", [""])[0]
+        if (
+            not title or not video_id or parsed.scheme != "https"
+            or parsed.hostname not in {"youtube.com", "www.youtube.com"}
+            or parsed.path != "/watch"
+        ):
             continue
 
-        key = url.lower()
+        key = video_id
         if key in seen:
             continue
 
@@ -2181,6 +2207,7 @@ async def get_mcp_session():
     global mcp_session_context
     global mcp_session
     global mcp_errlog
+    global mcp_session_started_at
     global mcp_browser_pid
     global mcp_page_topology_changed
 
@@ -2188,6 +2215,8 @@ async def get_mcp_session():
         if (
             not mcp_page_topology_changed
             and _mcp_browser_process_is_current(mcp_browser_pid)
+            and mcp_session_started_at is not None
+            and time.monotonic() - mcp_session_started_at < MCP_SESSION_MAX_AGE_SECONDS
         ):
             return mcp_session
         # Chrome automation có thể đã bị người dùng đóng rồi mở lại. MCP cũ
@@ -2223,6 +2252,7 @@ async def get_mcp_session():
         mcp_session_context = ClientSession(read, write)
         mcp_session = await mcp_session_context.__aenter__()
         await mcp_session.initialize()
+        mcp_session_started_at = time.monotonic()
         mcp_browser_pid = browser_pid
         mcp_page_topology_changed = False
 
@@ -2241,6 +2271,7 @@ async def close_mcp_session():
     global mcp_session_context
     global mcp_session
     global mcp_errlog
+    global mcp_session_started_at
     global mcp_browser_pid
 
     session_context = mcp_session_context
@@ -2251,6 +2282,7 @@ async def close_mcp_session():
     mcp_session_context = None
     mcp_stdio_context = None
     mcp_errlog = None
+    mcp_session_started_at = None
     mcp_browser_pid = None
 
     if session_context is not None:
@@ -5499,8 +5531,13 @@ def handle_filesystem_command(command):
         re.IGNORECASE,
     )
     if match:
+        keyword = re.sub(
+            r"\s+(?:(?:trong|trên|tren)\s+(?:máy(?:\s+tính)?|may(?:\s+tinh)?|home)"
+            r"|(?:ở|o)\s+đâu|o\s+dau)$",
+            "", match.group(1).strip(), flags=re.IGNORECASE,
+        )
         return search_and_maybe_open_path(
-            match.group(1).strip(),
+            keyword,
             item_type="file",
             open_when_unique=False,
         )
@@ -5993,6 +6030,8 @@ def handle_volume_command(command):
 
 deep_sleep_task = None
 deep_sleep_target = None
+remote_pc_shutdown_task = None
+remote_pc_shutdown_target = None
 
 
 def _power_log(event, **details):
@@ -6262,6 +6301,201 @@ async def handle_deep_sleep_timer_command(command):
         deep_sleep_target = datetime.now().astimezone() + timedelta(seconds=seconds)
         duration_text = format_deep_sleep_time(seconds)
         message = f"⏱️ Đã đặt lịch Sleep sâu sau {duration_text}."
+    print(f"Jarvis: {message}")
+    set_command_response(message)
+    return True
+
+
+def _remote_pc_shutdown_prefix():
+    """Regex dùng chung cho các biến thể lệnh hẹn tắt Windows PC."""
+    return r"(?:tat pc|tat may tinh(?: pc)?|shutdown pc)"
+
+
+def parse_remote_pc_shutdown_delay(command):
+    """Đọc khoảng chờ trong lệnh như ``tắt PC sau 30p``."""
+    command_clean = normalize_core_text(command)
+    match = re.fullmatch(
+        r"(?:(?:dat lich|dat|hen gio|hen)\s+)?"
+        + _remote_pc_shutdown_prefix()
+        + r"\s+(?:sau|after)\s+(.+)",
+        command_clean,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return parse_deep_sleep_delay(f"sleep sau sau {match.group(1)}")
+
+
+def parse_remote_pc_shutdown_clock(command, now=None):
+    """Đọc giờ local tiếp theo trong lệnh như ``tắt PC lúc 23:30``."""
+    command_clean = normalize_core_text(command)
+    match = re.fullmatch(
+        r"(?:(?:dat lich|dat|hen gio|hen)\s+)?"
+        + _remote_pc_shutdown_prefix()
+        + r"\s+(?:luc|vao luc)\s+(.+)",
+        command_clean,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return parse_deep_sleep_clock(f"sleep sau luc {match.group(1)}", now)
+
+
+async def remote_pc_shutdown_after_delay(seconds, target=None):
+    """Đợi đủ thời gian rồi tắt Windows PC đã cấu hình qua SSH."""
+    global remote_pc_shutdown_task, remote_pc_shutdown_target
+    current_task = asyncio.current_task()
+    try:
+        await asyncio.sleep(seconds)
+        if target is not None and not CORE.pc_shutdown_schedule.transition(
+            target, "pending", "running"
+        ):
+            return
+        if remote_pc_shutdown_task is current_task:
+            remote_pc_shutdown_task = None
+            remote_pc_shutdown_target = None
+        print("Jarvis: Đã đến giờ. Đang tắt PC qua SSH...")
+        await asyncio.to_thread(shutdown_remote_pc)
+        if target is not None:
+            CORE.pc_shutdown_schedule.transition(target, "running", "completed")
+        print("Jarvis: Đã gửi lệnh tắt PC theo lịch thành công.")
+    except asyncio.CancelledError:
+        raise
+    except (OSError, ValueError) as error:
+        if target is not None:
+            CORE.pc_shutdown_schedule.transition(
+                target, "running", "failed", str(error)
+            )
+        print(f"Jarvis: Không thể tắt PC theo lịch: {error}")
+    finally:
+        if remote_pc_shutdown_task is current_task:
+            remote_pc_shutdown_task = None
+            remote_pc_shutdown_target = None
+
+
+def restore_remote_pc_shutdown_schedule(now=None):
+    """Resume a future PC shutdown; record a missed or interrupted one."""
+    global remote_pc_shutdown_task, remote_pc_shutdown_target
+    row = CORE.pc_shutdown_schedule.get()
+    if not row:
+        return
+    target = datetime.fromisoformat(row["due_at"])
+    if row["status"] == "running":
+        CORE.pc_shutdown_schedule.transition(
+            target, "running", "failed", "Jarvis đã dừng khi đang gửi lệnh SSH"
+        )
+        print("Jarvis: Lịch tắt PC trước đó bị gián đoạn khi Jarvis dừng.")
+        return
+    if row["status"] != "pending":
+        return
+    current = now or datetime.now().astimezone()
+    seconds = (target - current).total_seconds()
+    if seconds <= 0:
+        CORE.pc_shutdown_schedule.transition(
+            target, "pending", "missed", "Jarvis không chạy tại thời điểm đã hẹn"
+        )
+        print("Jarvis: Đã bỏ qua lịch tắt PC quá hạn khi Jarvis khởi động lại.")
+        return
+    remote_pc_shutdown_target = target
+    remote_pc_shutdown_task = asyncio.create_task(
+        remote_pc_shutdown_after_delay(seconds, target)
+    )
+    print(f"Jarvis: Đã khôi phục lịch tắt PC lúc {target:%H:%M ngày %d/%m/%Y}.")
+
+
+async def handle_remote_pc_shutdown_timer_command(command):
+    """Đặt, xem hoặc hủy một lịch tắt Windows PC trong tiến trình Jarvis."""
+    global remote_pc_shutdown_task, remote_pc_shutdown_target
+    command_lower = normalize_core_text(command)
+    cancel_commands = {
+        "huy lich tat pc", "huy hen gio tat pc", "huy tat pc",
+        "huy shutdown pc", "cancel pc shutdown",
+    }
+    status_commands = {
+        "lich tat pc", "lich shutdown pc", "pc shutdown status",
+    }
+
+    if command_lower in cancel_commands:
+        if not CORE.pc_shutdown_schedule.cancel_pending():
+            message = "ℹ️ Hiện không có lịch tắt PC."
+        else:
+            if remote_pc_shutdown_task is not None and not remote_pc_shutdown_task.done():
+                remote_pc_shutdown_task.cancel()
+            remote_pc_shutdown_task = None
+            remote_pc_shutdown_target = None
+            message = "✅ Đã hủy lịch tắt PC."
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return True
+
+    if command_lower in status_commands:
+        row = CORE.pc_shutdown_schedule.get()
+        if not row or row["status"] == "cancelled":
+            message = "ℹ️ Hiện không có lịch tắt PC."
+        elif row["status"] == "pending":
+            target_text = datetime.fromisoformat(row["due_at"]).strftime(
+                "%H:%M ngày %d/%m/%Y"
+            )
+            message = f"⏱️ Lịch tắt PC: {target_text}."
+        else:
+            labels = {
+                "running": "đang gửi lệnh tắt PC",
+                "completed": "đã gửi lệnh tắt PC theo lịch thành công",
+                "failed": "tắt PC thất bại",
+                "missed": "đã bỏ lỡ lịch tắt PC",
+            }
+            message = f"ℹ️ {labels.get(row['status'], row['status'])}."
+            if row["detail"]:
+                message += f" {row['detail']}"
+        print(f"Jarvis: {message}")
+        set_command_response(message)
+        return True
+
+    clock_schedule = parse_remote_pc_shutdown_clock(command)
+    seconds = parse_remote_pc_shutdown_delay(command)
+    if clock_schedule is not None:
+        target, seconds = clock_schedule
+    if seconds is None:
+        incomplete_timer = re.fullmatch(
+            r"(?:(?:dat lich|dat|hen gio|hen)\s+)"
+            + _remote_pc_shutdown_prefix()
+            + r"(?:\s+(?:sau|after|luc|vao luc))?",
+            command_lower,
+        ) or re.match(
+            r"^" + _remote_pc_shutdown_prefix()
+            + r"\s+(?:sau|after|luc|vao luc)(?:\s|$)",
+            command_lower,
+        )
+        if incomplete_timer:
+            message = (
+                "ℹ️ Thời gian tắt PC chưa đầy đủ hoặc chưa hợp lệ. Ví dụ: "
+                "`tắt PC sau 30p`, `tắt PC sau 2h15` hoặc "
+                "`tắt PC lúc 23:30`."
+            )
+            print(f"Jarvis: {message}")
+            set_command_response(message)
+            return True
+        return False
+
+    if clock_schedule is not None:
+        new_target = target
+        message = (
+            f"⏱️ Đã đặt tắt PC lúc {target.strftime('%H:%M ngày %d/%m/%Y')} "
+            f"(còn {format_deep_sleep_time(seconds)})."
+        )
+    else:
+        new_target = (
+            datetime.now().astimezone() + timedelta(seconds=seconds)
+        )
+        message = f"⏱️ Đã đặt lịch tắt PC sau {format_deep_sleep_time(seconds)}."
+    if remote_pc_shutdown_task is not None and not remote_pc_shutdown_task.done():
+        remote_pc_shutdown_task.cancel()
+        await asyncio.gather(remote_pc_shutdown_task, return_exceptions=True)
+    CORE.pc_shutdown_schedule.set_pending(new_target)
+    remote_pc_shutdown_target = new_target
+    remote_pc_shutdown_task = asyncio.create_task(
+        remote_pc_shutdown_after_delay(seconds, new_target)
+    )
     print(f"Jarvis: {message}")
     set_command_response(message)
     return True
@@ -7348,6 +7582,10 @@ def _show_help_legacy():
     print("  sleep sâu sau 1h30  # tương đương 1 giờ 30 phút")
     print("  hủy sleep sâu")
     print("  lịch sleep sâu")
+    print("  tắt PC sau 30p")
+    print("  tắt PC lúc 23:30")
+    print("  lịch tắt PC")
+    print("  hủy lịch tắt PC")
     print("  tắt màn hình")
     print()
     print("  thoát")
@@ -7568,6 +7806,11 @@ COMMAND_SUGGESTION_CATALOG = (
     ("cancel sleep", "hủy sleep sâu"),
     ("lich sleep sau", "lịch sleep sâu"),
     ("sleep status", "lịch sleep sâu"),
+    ("tat pc sau", "tắt PC sau <thời gian>"),
+    ("hen gio tat pc", "hẹn giờ tắt PC sau <thời gian>"),
+    ("tat pc luc", "tắt PC lúc <giờ>"),
+    ("lich tat pc", "lịch tắt PC"),
+    ("huy lich tat pc", "hủy lịch tắt PC"),
     ("nhac toi sau", "nhắc tôi sau <thời gian> <nội dung>"),
     ("nhac toi luc", "nhắc tôi lúc <giờ> [ngày dd/mm/yyyy]: <nội dung>"),
     ("lich nhac", "lịch nhắc"),
@@ -7657,6 +7900,23 @@ def _suggest_known_command(command):
     if best_command is not None and best_score >= 0.74:
         return f"🤔 Có phải bạn muốn dùng lệnh `{best_command}`?"
     return None
+
+
+def _is_read_only_ai_request(command):
+    """Send open questions about data to tools before typo suggestions."""
+    plain = normalize_core_text(command)
+    if plain.startswith((
+        "mo ", "dong ", "tat ", "bat ", "xoa ", "gui ", "hen ",
+        "dat ", "chay ", "bam ", "click ", "sleep ", "shutdown ",
+    )):
+        return False
+    return bool(re.search(r"\b(?:file|tep|ram|cpu|uptime)\b", plain)) or any(
+        phrase in plain for phrase in (
+        "tai lieu", "bo nho", "ghi nho", "ban nho",
+        "loi nhac", "lich nhac", "se nhac", "o dia",
+        "giai thich", "la gi", "tai sao", "vi sao",
+        "nhu the nao",
+    ))
 
 
 DESKTOP_APP_ALIASES = {
@@ -8242,6 +8502,9 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         except (OSError, ValueError) as error:
             set_command_response(f"❌ Không thể tắt PC qua SSH: {error}.")
         print(f"Jarvis: {last_command_response}")
+        return True
+
+    if await handle_remote_pc_shutdown_timer_command(command):
         return True
 
     # ------------------------------------------------------
@@ -9146,7 +9409,8 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
 
     # Chỉ gợi ý sau khi toàn bộ lệnh chính xác đã được thử. Nếu đặt phần này
     # sớm hơn, lệnh đúng như "mở youtube cá nhân" sẽ bị hỏi lại thay vì chạy.
-    known_suggestion = _suggest_known_command(command)
+    read_only_ai_request = _is_read_only_ai_request(command)
+    known_suggestion = None if read_only_ai_request else _suggest_known_command(command)
     if known_suggestion:
         match = re.search(r"`([^`]+)`", known_suggestion)
         _remember_command_suggestion(source, match.group(1) if match else None)
@@ -9169,8 +9433,17 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
         return True
 
     print(f"Jarvis: AI local ({CORE.local_ai.model}) đang phân tích...")
+    ai_started_at = time.monotonic()
     try:
-        decision = await asyncio.to_thread(CORE.local_ai.decide, command)
+        if read_only_ai_request:
+            decision = {"action": "chat", "args": {}, "reply": ""}
+        else:
+            decision = await asyncio.wait_for(
+                asyncio.to_thread(CORE.local_ai.decide, command, defer_chat=True),
+                timeout=45,
+            )
+    except asyncio.TimeoutError:
+        local_answer = "⏳ AI định tuyến quá lâu. Hãy thử lại sau."
     except RuntimeError as error:
         local_answer = (
             f"❌ {error} "
@@ -9183,10 +9456,28 @@ async def route_command(command, *, allow_local_ai=True, source="terminal"):
             return await route_command(
                 routed_command, allow_local_ai=False, source=source
             )
-        local_answer = decision.get("reply") or _suggest_local_ai_command(decision) or (
-            "🤔 Tôi chưa hiểu rõ lệnh đó. Hãy viết lại cụ thể hơn hoặc gõ "
-            "`help` để xem các lệnh mẫu."
-        )
+        suggestion = _suggest_local_ai_command(decision)
+        router_reply = str(decision.get("reply") or "").strip()
+        if suggestion or router_reply.lower().startswith("có phải"):
+            local_answer = suggestion or router_reply
+        else:
+            history = CORE.conversation.recent_for_source(source, limit=9)
+            # IPC, Discord and Terminal add the current user message before routing.
+            # Avoid repeating it in the model's context.
+            if (history and history[-1]["role"] == "user"
+                    and normalize_core_text(history[-1]["content"]).rstrip("?!.,;:")
+                    == normalize_core_text(command).rstrip("?!.,;:")):
+                history = history[:-1]
+            try:
+                remaining = max(1, 110 - (time.monotonic() - ai_started_at))
+                local_answer, _trace = await asyncio.wait_for(
+                    asyncio.to_thread(CORE.agent.answer, command, history),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                local_answer = "⏳ AI xử lý quá lâu. Hãy thử yêu cầu ngắn hơn."
+            except RuntimeError as error:
+                local_answer = router_reply or f"❌ {error}"
     print(f"Jarvis: {local_answer}")
     suggestion_match = re.search(
         r"Có phải bạn muốn(?: dùng lệnh)? `([^`]+)`\?", local_answer
@@ -10027,6 +10318,7 @@ async def main():
     print()
     start_tts_worker()
     await start_ipc_server()
+    restore_remote_pc_shutdown_schedule()
 
     if interactive_terminal:
         jarvis_say('Sẵn sàng. Gõ "help" để xem lệnh.')

@@ -27,6 +27,11 @@ class HelpCatalogTests(unittest.TestCase):
         self.assertIn("nhớ lại", message)
         self.assertIn("quên mục", message)
 
+    def test_ai_help_shows_context_and_read_only_questions(self):
+        message = format_help_category("ai")
+        self.assertIn("ngữ cảnh", message)
+        self.assertIn("Bạn nhớ tôi thích gì?", message)
+
     def test_recent_updates_include_actionable_examples(self):
         message = format_recent_updates()
         self.assertIn("Sleep theo giờ", message)

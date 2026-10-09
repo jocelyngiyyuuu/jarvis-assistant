@@ -64,6 +64,10 @@ lsof -v
   qwen3-vl:4b
   ```
 
+  Đây là giá trị mặc định trong mã nguồn. Nếu `.env` đặt `OLLAMA_MODEL` hoặc
+  `OLLAMA_TEXT_MODEL`, Jarvis dùng model được cấu hình ở đó; log khởi động sẽ
+  in tên model thực tế đã nạp.
+
 - VieNeu-TTS cho giọng nói tiếng Việt. Đây là submodule có dependency và môi trường riêng; xem tài liệu trong `tts/VieNeu-TTS` trước khi cài vì yêu cầu CPU/GPU phụ thuộc máy.
 - Vosk và model tiếng Việt cho cảm biến vỗ/búng tay rồi nhận lệnh giọng nói.
 
@@ -317,6 +321,11 @@ nối LAN và giữ nguồn chờ cho card mạng. Dùng `tắt PC` để chạy
 không cần mật khẩu và host key phải có sẵn trong `known_hosts`. Lệnh tắt từ
 Discord luôn yêu cầu xác nhận trước khi thực hiện.
 
+Có thể hẹn giờ tắt Windows PC bằng `tắt PC sau 30p`, `tắt PC sau 2h15` hoặc
+`tắt PC lúc 23:30`. Dùng `lịch tắt PC` để xem thời điểm đã đặt và
+`hủy lịch tắt PC` để hủy. Jarvis lưu lịch này để khôi phục sau khi dịch vụ
+khởi động lại, miễn là thời điểm hẹn chưa qua.
+
 Jarvis cũng điều khiển âm lượng output mặc định của Windows qua Core Audio và
 SSH, không cần cài NirCmd. Lệnh phải có từ `PC` để không nhầm với âm lượng của
 Ubuntu: `âm lượng PC hiện tại`, `tăng âm lượng PC`, `giảm âm lượng PC 10`,
@@ -342,7 +351,7 @@ After=network-online.target
 Type=simple
 ExecStartPre=/bin/sh -c 'until test -x %h/Projects/jarvis/.venv/bin/python; do sleep 2; done'
 TimeoutStartSec=2min
-WorkingDirectory=%h/Projects/jarvis
+WorkingDirectory=-%h/Projects/jarvis
 ExecStart=%h/Projects/jarvis/.venv/bin/python %h/Projects/jarvis/jarvis.py
 Restart=on-failure
 RestartSec=5
@@ -352,8 +361,12 @@ WantedBy=default.target
 EOF
 ```
 
-`ExecStartPre` giúp Jarvis chờ ổ chứa repository được mount khi đăng nhập,
-thay vì lặp lỗi `203/EXEC` vì `.venv/bin/python` tạm thời chưa xuất hiện.
+`WorkingDirectory=-...` cho phép `ExecStartPre` chạy ngay cả khi ổ chứa repository
+chưa được mount. Bước này chờ Python xuất hiện trước khi Jarvis khởi động.
+
+Lịch `tắt PC sau ...` được lưu trong `.jarvis_data/pc_shutdown_schedule.sqlite3`.
+Jarvis khôi phục lịch còn ở tương lai sau khi restart. Lịch đã quá hạn trong lúc
+Jarvis không chạy được đánh dấu là bỏ lỡ để tránh tắt PC bất ngờ khi đăng nhập.
 
 Nếu repository nằm ở đường dẫn khác, sửa `WorkingDirectory` và `ExecStart` trước khi khởi động.
 
@@ -571,6 +584,7 @@ Cài và chạy Ollama theo tài liệu chính thức, sau đó tải model mặ
 
 ```bash
 ollama pull qwen3-vl:4b
+ollama pull embeddinggemma
 ollama serve
 ```
 
@@ -580,7 +594,29 @@ Kiểm tra:
 curl -fsS http://127.0.0.1:11434/api/tags
 ```
 
-Có thể đổi endpoint/model trong `.env` bằng `OLLAMA_URL` và `OLLAMA_MODEL`.
+Có thể đổi endpoint/model trong `.env` bằng `OLLAMA_URL`, `OLLAMA_MODEL`,
+`OLLAMA_TEXT_MODEL`, `OLLAMA_VISION_MODEL` và `OLLAMA_EMBED_MODEL`.
+`OLLAMA_TEXT_MODEL` quyết định model hội thoại thực tế nếu được đặt.
+
+Khi một yêu cầu chưa khớp lệnh cố định, AI có thể dùng công cụ chỉ đọc để xem
+trạng thái máy, tìm tên file, đọc tài liệu `.md`/`.txt`/`.rst` được phép, tìm
+bộ nhớ và xem lời nhắc đang chờ. Lịch sử hội thoại đưa vào AI được giới hạn theo
+Terminal, ứng dụng GTK hoặc Discord. Tìm bộ nhớ dùng embedding cục bộ; nếu
+Ollama embedding không sẵn sàng, Jarvis tìm theo từ khóa. File bí mật và đường
+dẫn ngoài home/dự án không được công cụ đọc tài liệu mở.
+
+Đo việc model chọn công cụ với 30 tình huống không gây tác động lên máy
+(`--quick` chạy 5 câu đại diện):
+
+```bash
+.venv/bin/python scripts/eval_local_ai.py qwen3-vl:4b
+```
+
+Trên máy phát triển ngày 09/10/2026, bài đo chọn công cụ ở lượt đầu đạt
+`28/30` với `qwen3-vl:4b` và `20/30` với `qwen2.5:3b`. Đây là số liệu của bộ câu
+hỏi nhỏ, không đo độ đúng của toàn bộ câu trả lời. Với câu hỏi rõ ràng về dữ
+liệu máy, Jarvis yêu cầu model gọi công cụ trước khi trả lời; nếu model bỏ qua,
+Jarvis nhắc lại một lần và không dùng câu trả lời thiếu dữ kiện.
 
 ## 12. Kiểm thử trước khi vận hành hoặc cập nhật
 

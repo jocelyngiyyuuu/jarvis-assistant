@@ -162,6 +162,17 @@ class MemoryStore:
                 )
         return [dict(row) for row in rows]
 
+    def active_for_search(self, limit=300):
+        """Return bounded, non-expired memories for local semantic indexing."""
+        with self._lock, self._transaction() as connection:
+            self._purge_expired(connection)
+            rows = connection.execute(
+                "SELECT id, content, category, updated_at FROM memories "
+                "ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def update(self, memory_id, content):
         content = str(content).strip()
         if not content:

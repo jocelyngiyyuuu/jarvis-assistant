@@ -68,6 +68,14 @@ class LocalAITests(unittest.TestCase):
         self.assertEqual(decision["reply"], "RAM là bộ nhớ tạm thời.")
         self.assertEqual(opened.call_count, 1)
 
+    def test_deferred_chat_leaves_answer_to_agent_without_second_request(self):
+        client = LocalAI(model="test")
+        with patch("jarvis_core.local_ai.urlopen") as opened:
+            decision = client.decide("RAM là gì?", defer_chat=True)
+        self.assertEqual(decision["action"], "chat")
+        self.assertEqual(decision["reply"], "")
+        opened.assert_not_called()
+
     def test_explicit_system_status_still_uses_safe_router(self):
         result = {"message": {"content": json.dumps({
             "action": "system_status",
@@ -101,6 +109,19 @@ class LocalAITests(unittest.TestCase):
 
         payload = json.loads(opened.call_args.args[0].data.decode("utf-8"))
         self.assertEqual(payload["options"]["num_predict"], 320)
+
+    def test_tool_chat_allows_vl_model_to_finish_after_thinking(self):
+        client = LocalAI(model="qwen3-vl:4b")
+        response = {"message": {"content": "Trả lời hoàn chỉnh."}}
+        with patch(
+            "jarvis_core.local_ai.urlopen",
+            return_value=self.fake_ollama_response(response),
+        ) as opened:
+            message = client.tool_chat([{"role": "user", "content": "Xin chào"}], [])
+
+        payload = json.loads(opened.call_args.args[0].data.decode("utf-8"))
+        self.assertGreaterEqual(payload["options"]["num_predict"], 800)
+        self.assertEqual(message["content"], "Trả lời hoàn chỉnh.")
 
     def test_zalo_summary_keeps_links_from_original_messages(self):
         client = LocalAI(model="test")

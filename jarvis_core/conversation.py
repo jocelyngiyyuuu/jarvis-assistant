@@ -62,6 +62,16 @@ class ConversationStore:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def recent_for_source(self, source, limit=8):
+        """Return one channel's history in conversation order."""
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT id, source, role, content, created_at FROM conversation_events "
+                "WHERE source = ? ORDER BY id DESC LIMIT ?",
+                (str(source), max(1, min(int(limit), 20))),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
     def latest_id(self):
         """Return the archive cursor without loading old messages into a new UI session."""
         with self._lock, closing(self._connect()) as connection:

@@ -1199,8 +1199,10 @@ class JarvisWindow(Gtk.ApplicationWindow):
     def _schedule_page(self):
         page = self._page("Lịch tác vụ", "Theo dõi lịch nguồn điện mà không làm gián đoạn Discord.")
         notice = self._card(
-            "Lịch sleep hiện đang thuộc tiến trình Jarvis chạy nền. Phiên bản đầu của giao diện chỉ hiển thị nguyên tắc an toàn; "
-            "hãy tiếp tục đặt hoặc hủy lịch bằng Discord để tránh tạo hai bộ hẹn giờ độc lập."
+            "Lịch Sleep và lịch tắt Windows PC hiện thuộc tiến trình Jarvis chạy nền. "
+            "Dùng “sleep sâu sau 30p” hoặc “tắt PC sau 30p” để đặt lịch; dùng "
+            "“lịch tắt PC” và “hủy lịch tắt PC” để xem hoặc hủy. Hãy tiếp tục "
+            "đặt lịch qua Chat/Discord để tránh tạo hai bộ hẹn giờ độc lập."
         )
         notice.add_css_class("assistant-card")
         page.append(notice)

@@ -187,6 +187,33 @@ class LocalAI:
         self.history.append({"role": "assistant", "content": answer})
         return answer
 
+    def tool_chat(self, messages, tools):
+        """One Ollama chat turn with a reviewed, read-only tool schema."""
+        payload = json.dumps({
+            "model": self.model,
+            "keep_alive": self.keep_alive,
+            "messages": messages,
+            "tools": tools,
+            "think": False,
+            "options": {"num_ctx": 4096, "num_predict": 1024, "temperature": 0.1},
+            "stream": False,
+        }, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            f"{self.base_url}/api/chat", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, OSError,
+                json.JSONDecodeError) as error:
+            raise RuntimeError(f"Không thể trò chuyện với Ollama: {error}") from error
+        message = result.get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError("Ollama trả về message không hợp lệ")
+        message["content"] = self._strip_thinking(message.get("content", ""))
+        return message
+
     @staticmethod
     def _is_direct_conversation(message):
         """Identify clear conversation so it needs only one Ollama call."""
@@ -489,13 +516,13 @@ Dữ liệu: {source[:30000]}
             raise RuntimeError("Ollama không tìm thấy email hợp lệ để tóm tắt.")
         return "\n\n".join(lines)[:5500]
 
-    def decide(self, message):
+    def decide(self, message, *, defer_chat=False):
         """Return a validated safe action decision, or a conversational reply."""
         if self._is_direct_conversation(message):
             return {
                 "action": "chat",
                 "args": {"site": "", "profile": ""},
-                "reply": self.chat(message),
+                "reply": "" if defer_chat else self.chat(message),
             }
         payload = json.dumps(
             {

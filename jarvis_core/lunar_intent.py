@@ -117,8 +117,16 @@ def _answer_monthly_observance(plain, today, current_lunar, lunar_day, label, ic
 def answer_lunar_calendar(command, *, today=None):
     """Return a deterministic answer, or ``None`` for unrelated commands."""
     plain = normalize_text(command)
-    lunar_terms = ("am lich", "lich am", "ram", "mung mot", "mung 1")
-    if not any(term in plain for term in lunar_terms):
+    # Normalization turns both "rằm" and computer "RAM" into "ram". Treat the
+    # unaccented spelling as lunar only when the surrounding words say so.
+    asks_full_moon = bool(re.search(r"rằm", str(command), re.IGNORECASE)) or (
+        bool(re.search(r"\bram\b", plain))
+        and any(term in plain for term in (
+            "thang", "am lich", "lich am", "ngay ram",
+        ))
+    )
+    lunar_terms = ("am lich", "lich am", "mung mot", "mung 1")
+    if not asks_full_moon and not any(term in plain for term in lunar_terms):
         return None
 
     today = today or date.today()
@@ -131,7 +139,7 @@ def answer_lunar_calendar(command, *, today=None):
     if converted is not None:
         return converted
 
-    if "ram" in plain:
+    if asks_full_moon:
         return _answer_monthly_observance(
             plain, today, current_lunar, 15, "Rằm", "🌕"
         )

@@ -4,6 +4,18 @@ from .text import normalize_text
 
 
 HELP_CATEGORIES = {
+    "ai": {
+        "title": "AI & hỏi đáp",
+        "icon": "💬",
+        "description": "Trả lời theo ngữ cảnh và dùng công cụ chỉ đọc để kiểm tra dữ liệu thật.",
+        "aliases": ("ai", "hoi dap", "tro ly ai"),
+        "commands": (
+            ("Hỏi theo ngữ cảnh", "Giải thích kỹ hơn câu trả lời trước"),
+            ("Hỏi bộ nhớ", "Bạn nhớ tôi thích gì?"),
+            ("Tìm tài liệu", "Có tài liệu hướng dẫn API ở đâu?"),
+            ("Xem lời nhắc", "Tôi có lời nhắc nào đang chờ?"),
+        ),
+    },
     "memory": {
         "title": "Bộ nhớ",
         "icon": "🧠",
@@ -188,6 +200,10 @@ HELP_CATEGORIES = {
         "commands": (
             ("Bật PC qua mạng", "bật PC"),
             ("Tắt PC qua SSH", "tắt PC"),
+            ("Hẹn tắt PC sau 30 phút", "tắt PC sau 30p"),
+            ("Hẹn tắt PC lúc 23:30", "tắt PC lúc 23:30"),
+            ("Xem lịch tắt PC", "lịch tắt PC"),
+            ("Hủy lịch tắt PC", "hủy lịch tắt PC"),
             ("Tắt màn hình", "sleep"),
             ("Đánh thức bằng vỗ/búng", "sleep rồi vỗ 2 lần hoặc búng 1 lần"),
             ("Sleep sâu", "sleep sâu"),

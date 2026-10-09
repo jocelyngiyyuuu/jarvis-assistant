@@ -11,13 +11,20 @@ from .memory import MemoryStore
 from .monitoring import SystemMonitor
 from .security import RemoteSecurity
 from .reminders import ReminderStore
+from .pc_shutdown_schedule import PcShutdownScheduleStore
+from .semantic_memory import SemanticMemory
+from .assistant_agent import ReadOnlyAgent
 
 
 class JarvisCore:
     def __init__(self, base_dir):
         base_dir = Path(base_dir)
+        self.base_dir = base_dir.resolve()
         self.brain = NaturalLanguageRouter()
         self.memory = MemoryStore(base_dir / ".jarvis_data" / "memory.sqlite3")
+        self.semantic_memory = SemanticMemory(
+            self.memory, base_dir / ".jarvis_data" / "memory_vectors.sqlite3"
+        )
         self.files = SmartFileManager([Path.home()])
         self.file_index = FileIndex(
             base_dir / ".jarvis_data" / "file_index.sqlite3", [Path.home()]
@@ -32,6 +39,10 @@ class JarvisCore:
         )
         self.security = RemoteSecurity(base_dir / ".jarvis_data")
         self.reminders = ReminderStore(base_dir / ".jarvis_data" / "reminders.sqlite3")
+        self.pc_shutdown_schedule = PcShutdownScheduleStore(
+            base_dir / ".jarvis_data" / "pc_shutdown_schedule.sqlite3"
+        )
+        self.agent = ReadOnlyAgent(self)
 
     def handle(self, command):
         intent = self.brain.detect(command)
